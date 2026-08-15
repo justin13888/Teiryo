@@ -1,0 +1,19 @@
+[package]
+name = "teiryo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Teiryo TUI: live dashboard for LLM subscription quotas"
+
+[dependencies]
+teiryo-core.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+crossterm.workspace = true
+directories.workspace = true
+futures.workspace = true
+ratatui.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

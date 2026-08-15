@@ -1,0 +1,21 @@
+[package]
+name = "teiryo-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Domain types, wire protocol, adapter traits, and storage for Teiryo"
+
+[dependencies]
+async-trait.workspace = true
+bincode.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+ulid.workspace = true

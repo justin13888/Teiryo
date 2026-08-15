@@ -1,0 +1,23 @@
+[package]
+name = "teiryod"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Teiryo daemon: polls LLM subscription quotas and serves them over a Unix socket"
+
+[dependencies]
+teiryo-core.workspace = true
+teiryo-providers.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+directories.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ulid.workspace = true
