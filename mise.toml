@@ -1,0 +1,41 @@
+[tools]
+rust = { version = "stable", components = "rustfmt,clippy" }
+hk = "latest"
+pkl = "latest"
+"ubi:convco/convco" = { version = "latest", exe = "convco" }
+
+[tasks.build]
+description = "Build the whole workspace"
+run = "cargo build --workspace"
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test --workspace"
+
+[tasks.fmt]
+description = "Format all code"
+run = "cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "Check formatting without modifying files"
+run = "cargo fmt --all --check"
+
+[tasks.lint]
+description = "Lint with clippy, warnings are errors"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks."lint:fix"]
+description = "Auto-fix clippy lints"
+run = "cargo clippy --workspace --all-targets --fix --allow-dirty --allow-staged"
+
+[tasks.check]
+description = "Full local gate: format check, lint, tests"
+depends = ["fmt:check", "lint", "test"]
+
+[tasks.daemon]
+description = "Run the teiryod daemon in the foreground"
+run = "cargo run -p teiryod"
+
+[tasks.tui]
+description = "Run the teiryo TUI"
+run = "cargo run -p teiryo"
