@@ -1,0 +1,48 @@
+amends "package://github.com/jdx/hk/releases/download/v1.53.0/hk@1.53.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v1.53.0/hk@1.53.0#/Builtins.pkl"
+
+local linters = new Mapping<String, Step> {
+    ["cargo-fmt"] = Builtins.cargo_fmt
+    ["cargo-clippy"] = Builtins.cargo_clippy
+}
+
+hooks {
+    ["pre-commit"] {
+        fix = true
+        stash = "git"
+        steps = linters
+    }
+    ["commit-msg"] {
+        steps {
+            ["conventional-commit"] {
+                check = "convco check --from-stdin < {{commit_msg_file}}"
+            }
+        }
+    }
+    ["pre-push"] {
+        steps {
+            ["fmt-check"] {
+                glob = "**/*.rs"
+                check = "cargo fmt --all --check"
+            }
+            ["clippy"] {
+                glob = "**/*.rs"
+                check = "cargo clippy --workspace --all-targets -- -D warnings"
+            }
+            ["test"] {
+                glob = "**/*.rs"
+                check = "cargo test --workspace"
+            }
+            ["conventional-commits"] {
+                check = "convco check origin/master..HEAD"
+            }
+        }
+    }
+    ["fix"] {
+        fix = true
+        steps = linters
+    }
+    ["check"] {
+        steps = linters
+    }
+}
