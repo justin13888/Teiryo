@@ -1574,6 +1574,7 @@ dependencies = [
  "bincode",
  "bytes",
  "chrono",
+ "futures",
  "rusqlite",
  "secrecy",
  "serde",
