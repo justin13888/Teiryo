@@ -11,9 +11,10 @@ teiryo-core.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 chrono.workspace = true
-crossterm.workspace = true
+crossterm = { workspace = true, features = ["event-stream"] }
 directories.workspace = true
 futures.workspace = true
+libc = "0.2"
 ratatui.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
