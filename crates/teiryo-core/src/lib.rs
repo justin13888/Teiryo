@@ -4,15 +4,20 @@
 //! model, the versioned Unix-socket wire protocol, the provider adapter
 //! traits, and the SQLite storage used by the daemon.
 
+pub mod adapter;
 pub mod domain;
 pub mod error;
 pub mod protocol;
 
+pub use adapter::{
+    Authenticator, BarStyle, Credential, Prober, ProviderAdapter, QuotaParser, RawResponse,
+    RenderHint, WindowPresenter,
+};
 pub use domain::{
     Account, AccountId, ClientKind, PollEvent, PollId, PollOutcome, PollTrigger, ProviderId,
     QuotaSnapshot, QuotaUnit, QuotaWindow, ResetKind, WindowId, WindowScope,
 };
-pub use error::{ErrorKind, HandshakeError, WireError};
+pub use error::{AuthError, ErrorKind, HandshakeError, ParseError, ProbeError, WireError};
 pub use protocol::codec::{
     decode_frame, encode_frame, framed, length_delimited_codec, MAX_FRAME_LEN,
 };
@@ -27,10 +32,12 @@ mod tests {
 
     #[test]
     fn poll_ids_are_time_ordered() {
+        // ULID ordering is only guaranteed across distinct milliseconds.
         let a = PollId::generate();
+        std::thread::sleep(std::time::Duration::from_millis(2));
         let b = PollId::generate();
         assert!(PollId::zero() < a);
-        assert!(a <= b);
+        assert!(a < b);
     }
 
     #[test]

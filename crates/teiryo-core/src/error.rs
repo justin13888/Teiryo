@@ -40,6 +40,48 @@ pub enum WireError {
     Decode(#[from] bincode::error::DecodeError),
 }
 
+/// Credential discovery/resolution failure.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum AuthError {
+    /// No local login/credential found for the provider.
+    #[error("not logged in: {0}")]
+    NotLoggedIn(String),
+    /// Credential exists but is expired or rejected.
+    #[error("credential expired or invalid: {0}")]
+    Expired(String),
+    /// Failure reading the credential store (keychain, config dir, ...).
+    #[error("credential store: {0}")]
+    Store(String),
+}
+
+/// Probe (transport-level) failure.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ProbeError {
+    /// Connection/transport failure.
+    #[error("network: {0}")]
+    Network(String),
+    /// Provider rejected the credential.
+    #[error("auth rejected: {0}")]
+    Auth(String),
+    /// Provider rate-limited the probe itself.
+    #[error("rate limited")]
+    RateLimited {
+        /// Provider-suggested retry delay, if any.
+        retry_after: Option<std::time::Duration>,
+    },
+    /// Provider returned an unexpected status or error payload.
+    #[error("provider error: {0}")]
+    Provider(String),
+}
+
+/// Parse failure: the response no longer matches the expected schema.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ParseError {
+    /// Payload structure changed out from under us.
+    #[error("schema drift: {0}")]
+    SchemaDrift(String),
+}
+
 /// Machine-readable error category carried in `Response::Err`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum ErrorKind {
