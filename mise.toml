@@ -38,4 +38,5 @@ run = "cargo run -p teiryod"
 
 [tasks.tui]
 description = "Run the teiryo TUI"
-run = "cargo run -p teiryo"
+# teiryod must be built first: the TUI spawns it as a sibling of its own binary.
+run = ["cargo build -p teiryod", "cargo run -p teiryo"]

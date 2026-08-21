@@ -5,11 +5,14 @@
 //! retries the connection.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use directories::ProjectDirs;
 use tokio::net::UnixStream;
+
+use crate::client::ClientError;
 
 /// Attempts made while waiting for a freshly spawned daemon to bind.
 const CONNECT_ATTEMPTS: u32 = 25;
@@ -30,29 +33,72 @@ fn uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-/// Locate the `teiryod` binary: next to the current executable first (the
-/// common cargo/packaging layout), then `$PATH`.
+/// Where `teiryod` sits next to the current executable — the common
+/// cargo/packaging layout.
+fn sibling_daemon() -> Option<PathBuf> {
+    Some(std::env::current_exe().ok()?.parent()?.join("teiryod"))
+}
+
+/// Locate the `teiryod` binary: next to the current executable first, then
+/// `$PATH`.
 fn daemon_binary() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sibling = dir.join("teiryod");
-            if sibling.is_file() {
-                return sibling;
-            }
-        }
+    match sibling_daemon() {
+        Some(sibling) if sibling.is_file() => sibling,
+        _ => PathBuf::from("teiryod"),
     }
-    PathBuf::from("teiryod")
+}
+
+/// The daemon's log file, `$XDG_DATA_HOME/teiryo/teiryo.log`. Must match
+/// `teiryod`'s own resolution.
+fn log_path() -> Option<PathBuf> {
+    Some(
+        ProjectDirs::from("", "", "teiryo")?
+            .data_dir()
+            .join("teiryo.log"),
+    )
+}
+
+/// Where the spawned daemon's stdout/stderr go: the log file, so that a
+/// failure *before* the daemon initialises `tracing` — a panic, a linker
+/// error — is still recoverable. Falls back to discarding output rather than
+/// refusing to start the daemon at all.
+fn daemon_output() -> Stdio {
+    let opened = log_path().and_then(|path| {
+        std::fs::create_dir_all(path.parent()?).ok()?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    });
+    opened.map_or_else(Stdio::null, Stdio::from)
+}
+
+/// Why the daemon could not even be launched. A missing binary is the common
+/// case and is actionable, so it gets its own wording.
+fn spawn_error(binary: &Path, e: &io::Error) -> ClientError {
+    if e.kind() != io::ErrorKind::NotFound {
+        return ClientError::DaemonStart(format!("cannot start {}: {e}", binary.display()));
+    }
+    let looked = sibling_daemon().map_or_else(
+        || "$PATH".to_owned(),
+        |p| format!("{} and $PATH", p.display()),
+    );
+    ClientError::DaemonStart(format!(
+        "cannot find the teiryod binary (looked in {looked}) — \
+         build it with `cargo build -p teiryod`"
+    ))
 }
 
 /// Spawn `teiryod` detached in its own session-like process group, stdio
-/// routed away from the TUI's terminal (the daemon logs to its own file).
-fn spawn_daemon() -> io::Result<()> {
+/// routed away from the TUI's terminal.
+fn spawn_daemon(binary: &Path) -> io::Result<()> {
     use std::os::unix::process::CommandExt;
 
-    let mut cmd = Command::new(daemon_binary());
+    let mut cmd = Command::new(binary);
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(daemon_output())
+        .stderr(daemon_output())
         .process_group(0);
     cmd.spawn().map(drop)
 }
@@ -61,12 +107,17 @@ fn spawn_daemon() -> io::Result<()> {
 ///
 /// A first straight connect is tried; on failure the daemon is spawned once
 /// and the connect retried with a short backoff until it binds.
-pub async fn connect_or_spawn() -> io::Result<UnixStream> {
+pub async fn connect_or_spawn() -> Result<UnixStream, ClientError> {
     let path = socket_path();
     if let Ok(stream) = UnixStream::connect(&path).await {
         return Ok(stream);
     }
-    spawn_daemon()?;
+
+    let binary = daemon_binary();
+    if let Err(e) = spawn_daemon(&binary) {
+        return Err(spawn_error(&binary, &e));
+    }
+
     let mut last_err = io::Error::new(io::ErrorKind::ConnectionRefused, "daemon did not start");
     for _ in 0..CONNECT_ATTEMPTS {
         tokio::time::sleep(CONNECT_BACKOFF).await;
@@ -75,7 +126,19 @@ pub async fn connect_or_spawn() -> io::Result<UnixStream> {
             Err(e) => last_err = e,
         }
     }
-    Err(last_err)
+    // The daemon was spawned but never bound: it died on startup, and its
+    // output went to the log file.
+    Err(ClientError::DaemonStart(match log_path() {
+        Some(log) => format!(
+            "teiryod started but never bound {} ({last_err}) — see {}",
+            path.display(),
+            log.display()
+        ),
+        None => format!(
+            "teiryod started but never bound {} ({last_err})",
+            path.display()
+        ),
+    }))
 }
 
 #[cfg(test)]

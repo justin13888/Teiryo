@@ -25,6 +25,10 @@ pub const AWAIT_TIMEOUT_MS: u32 = 25_000;
 pub enum ClientError {
     /// Socket-level failure (connect, read, write).
     Io(std::io::Error),
+    /// The daemon could not be started: its binary is missing, or it was
+    /// spawned and died before binding. Carries a message that already names
+    /// the log file, so it reads as a complete sentence to the user.
+    DaemonStart(String),
     /// Handshake failed; `VersionMismatch`-shaped rejections mean a stale
     /// daemon from a previous install is still running.
     Handshake(HandshakeError),
@@ -38,6 +42,7 @@ impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientError::Io(e) => write!(f, "socket error: {e}"),
+            ClientError::DaemonStart(message) => f.write_str(message),
             ClientError::Handshake(e) => write!(f, "handshake failed: {e}"),
             ClientError::Wire(e) => write!(f, "wire error: {e}"),
             ClientError::Closed => f.write_str("daemon closed the connection"),

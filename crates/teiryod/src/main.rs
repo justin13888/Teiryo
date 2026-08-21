@@ -35,7 +35,11 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     let local = tokio::task::LocalSet::new();
-    local.block_on(&runtime, async {
+    let served = local.block_on(&runtime, async {
+        // Registering the listener with the reactor must happen here, inside
+        // the runtime — `from_std` panics if there is none.
+        let listener = tokio::net::UnixListener::from_std(listener)
+            .context("registering the socket with the runtime")?;
         let serve = teiryod::run(listener, storage, adapters, config);
         tokio::pin!(serve);
         let daemon = tokio::select! {
@@ -48,11 +52,15 @@ fn main() -> anyhow::Result<()> {
         // If a signal interrupted serve, we have no handle — nothing more to
         // flush (storage writes are synchronous); just fall through.
         drop(daemon);
+        anyhow::Ok(())
     });
 
     std::fs::remove_file(&paths.socket).ok();
-    tracing::info!("teiryod stopped");
-    Ok(())
+    match &served {
+        Ok(()) => tracing::info!("teiryod stopped"),
+        Err(e) => tracing::error!(error = %e, "teiryod stopped on error"),
+    }
+    served
 }
 
 /// Resolves on SIGINT or SIGTERM.
