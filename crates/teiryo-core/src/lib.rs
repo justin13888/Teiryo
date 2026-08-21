@@ -8,6 +8,7 @@ pub mod adapter;
 pub mod domain;
 pub mod error;
 pub mod protocol;
+pub mod storage;
 
 pub use adapter::{
     Authenticator, BarStyle, Credential, Prober, ProviderAdapter, QuotaParser, RawResponse,
@@ -25,6 +26,7 @@ pub use protocol::handshake::{
     client_handshake, server_handshake, Hello, PROTOCOL_MAGIC, PROTOCOL_VERSION,
 };
 pub use protocol::wire::{AccountStatus, ProviderHealth, Request, Response};
+pub use storage::{Storage, StorageError};
 
 #[cfg(test)]
 mod tests {
