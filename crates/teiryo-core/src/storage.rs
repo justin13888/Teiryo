@@ -20,7 +20,7 @@ use crate::rollover::{RolloverKind, WindowRollover};
 
 /// Hard ceiling on the points [`Storage::history`] returns *per window*,
 /// applied even when the caller asks for no downsampling. Nothing prunes the
-/// tables, so at the default 60 s cadence a series grows by ~1 440 points a
+/// tables, so at the default 180 s cadence a series grows by ~480 points a
 /// day; without this cap a far-back `since` could produce a response too large
 /// for the 1 MiB frame limit.
 pub const MAX_HISTORY_POINTS: u32 = 2_000;

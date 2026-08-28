@@ -204,7 +204,7 @@ pub struct ConfigState {
 pub struct ConfigView {
     /// Global poll interval override; `None` means the compiled-in default.
     pub poll_interval_secs: Option<u32>,
-    /// The compiled-in default, so a client can render "60s (default)".
+    /// The compiled-in default, so a client can render "180s (default)".
     pub default_poll_interval_secs: u32,
     /// Smallest interval the daemon accepts, so a client can clamp before
     /// sending rather than round-tripping a rejection.

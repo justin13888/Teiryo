@@ -1,7 +1,7 @@
 //! Daemon configuration: `$XDG_CONFIG_HOME/teiryo/config.toml`.
 //!
 //! Absent file or absent keys mean defaults: every compiled-in provider
-//! enabled, 60-second poll interval (jittered per cycle, and stretched further
+//! enabled, 3-minute poll interval (jittered per cycle, and stretched further
 //! while a provider is rate limiting us — see [`crate::scheduler`]).
 //!
 //! The file is read every time it changes on disk, so parsing has to be
@@ -25,7 +25,13 @@ use teiryo_core::{ConfigEdit, ConfigView, ProviderId, ProviderSettings};
 use toml_edit::{DocumentMut, Item, Table};
 
 /// Default poll interval when no override is configured.
-pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
+///
+/// Quota figures move slowly enough that a minute of extra resolution buys
+/// nothing a user can act on, while costing three times the requests against
+/// an endpoint that rate limits — and a rate limit costs the readings
+/// themselves. Three minutes still puts several points inside the narrowest
+/// chart range.
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(180);
 
 /// Smallest accepted poll interval. Below this a typo would hammer a
 /// provider's usage endpoint hard enough to get the account rate limited,
@@ -461,7 +467,7 @@ mod tests {
             ok("poll_interval_secs = 120\n[providers.claude]\npoll_interval_secs = 30").config;
         let view = cfg.view(&["claude".to_owned(), "openai".to_owned()]);
         assert_eq!(view.poll_interval_secs, Some(120));
-        assert_eq!(view.default_poll_interval_secs, 60);
+        assert_eq!(view.default_poll_interval_secs, 180);
         assert_eq!(view.min_poll_interval_secs, 10);
 
         let claude = &view.providers[0];
