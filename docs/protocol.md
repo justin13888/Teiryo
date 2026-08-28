@@ -79,6 +79,7 @@ struct AccountStatus {
     last_success: Option<DateTime<Utc>>, // when the poll backing `windows` completed
     poll_interval_secs: u32,             // cadence in force now; jitters ±10%, stretches under backoff
 }
+
 struct AccountHealth {
     account: AccountId,
     consecutive_failures: u32,
@@ -158,10 +159,12 @@ enum ConfigEdit {
 | Change a setting | keypress in the overlay | `SetConfig(edit)` → `Config`, or `Err(BadRequest, why)` |
 | Someone edits `config.toml` | pushed | `AwaitUpdate` resolves with `Config` |
 | Manual poll (selected account or all) | keypress | `PollNow` → `PollAccepted`; result arrives via next `AwaitUpdate` resolution |
-| History/sparkline for one window | keypress on a window | `History { account, window, since, until, max_points }` → `HistoryPage` |
-| Recent activity / poll log | keypress | `RecentPolls { limit }` |
-| Provider/account health | on connect + on update | `Providers` |
+| Trend chart for the selected window | selection/range/pan change **and every update** | `History { account, window, since, until, max_points }` → `HistoryPage` |
+| Activity / poll log | tab active **and every update** | `RecentPolls { limit }` |
+| Provider/account health | tab active **and every update** | `Providers` |
 | Quit | keypress | close connection; daemon persists |
 | Stop the daemon | explicit only | `Shutdown` — never bound to a casual key; gated behind a confirm prompt |
 
 The TUI render loop is: connect → `Status` → render → loop `AwaitUpdate` → re-render on each `Update`/`NoUpdate`. **No polling timer on the TUI side**; the daemon's watch channel is the only clock.
+
+The TUI presents a **single view** — a quota dashboard with a tabbed detail pane (Trend / Activity / Health) and three overlays drawn over it. The pane's data is refetched on every `Update` alongside `Status`, so detail content is live rather than a snapshot frozen when a tab was opened.
