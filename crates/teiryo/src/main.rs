@@ -67,7 +67,14 @@ async fn start_update_loop(
     tx: mpsc::UnboundedSender<NetEvent>,
 ) -> Option<JoinHandle<()>> {
     match Client::connect().await {
-        Ok(client) => Some(spawn_update_loop(client, newest_poll_id(&app.statuses), tx)),
+        // This client does not surface settings yet, so it starts from
+        // generation 0 and simply refreshes when the daemon reloads.
+        Ok(client) => Some(spawn_update_loop(
+            client,
+            newest_poll_id(&app.statuses),
+            0,
+            tx,
+        )),
         Err(e) => {
             let _ = tx.send(NetEvent::Disconnected(e.to_string()));
             None
@@ -146,6 +153,15 @@ async fn event_loop(
                 NetEvent::Update(event) => {
                     app.last_update = Some(event.ts);
                     app.disconnected = false;
+                    refresh_status(command, app).await;
+                }
+                NetEvent::Config(state) => {
+                    // The daemon reloaded config.toml. The cadence it reports
+                    // may have changed, so re-read status — and if the file was
+                    // rejected, say so rather than leaving the user to wonder
+                    // why their edit did nothing.
+                    app.disconnected = false;
+                    app.error = state.error.clone();
                     refresh_status(command, app).await;
                 }
                 NetEvent::Disconnected(message) => {

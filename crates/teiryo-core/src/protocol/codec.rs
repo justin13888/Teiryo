@@ -56,7 +56,8 @@ mod tests {
     use crate::domain::*;
     use crate::error::ErrorKind;
     use crate::protocol::wire::{
-        AccountHealth, AccountStatus, HistoryPage, ProviderHealth, Request, Response, WindowView,
+        AccountHealth, AccountStatus, ConfigEdit, ConfigState, ConfigView, HistoryPage,
+        ProviderHealth, ProviderSettings, Request, Response, WindowView,
     };
     use crate::rollover::{RolloverKind, WindowRollover};
 
@@ -106,6 +107,7 @@ mod tests {
             },
             Request::AwaitUpdate {
                 since: PollId::zero(),
+                config_gen: 0,
                 timeout_ms: 30_000,
             },
             Request::History {
@@ -125,6 +127,17 @@ mod tests {
             Request::RecentPolls { limit: 50 },
             Request::Providers,
             Request::Shutdown,
+            Request::GetConfig,
+            Request::SetConfig(ConfigEdit::GlobalPollInterval(Some(120))),
+            Request::SetConfig(ConfigEdit::GlobalPollInterval(None)),
+            Request::SetConfig(ConfigEdit::ProviderPollInterval {
+                provider: "claude".into(),
+                secs: Some(30),
+            }),
+            Request::SetConfig(ConfigEdit::ProviderEnabled {
+                provider: "claude".into(),
+                enabled: false,
+            }),
         ];
         for request in &requests {
             roundtrip(request);
@@ -210,6 +223,24 @@ mod tests {
             }]),
             Response::Ack,
             Response::Err(ErrorKind::UnknownProvider, "no such provider".into()),
+            Response::Config(ConfigState {
+                path: "/home/u/.config/teiryo/config.toml".into(),
+                generation: 7,
+                effective: ConfigView {
+                    poll_interval_secs: Some(120),
+                    default_poll_interval_secs: 60,
+                    min_poll_interval_secs: 10,
+                    providers: vec![ProviderSettings {
+                        provider: "claude".into(),
+                        enabled: true,
+                        poll_interval_secs: Some(30),
+                        effective_poll_interval_secs: 30,
+                    }],
+                },
+                loaded_at: Utc::now(),
+                warnings: vec!["unknown key `retrys` — ignored".into()],
+                error: Some("poll_interval_secs must be at least 10".into()),
+            }),
         ];
         for response in &responses {
             roundtrip(response);

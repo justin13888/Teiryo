@@ -3,11 +3,12 @@
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use teiryo_core::{
-    decode_frame, encode_frame, framed, server_handshake, AccountId, ClientKind, ErrorKind,
-    HistoryPage, PollEvent, PollId, PollTrigger, Request, Response,
+    decode_frame, encode_frame, framed, server_handshake, AccountId, ClientKind, ConfigEdit,
+    ErrorKind, HistoryPage, PollEvent, PollId, PollTrigger, Request, Response,
 };
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::config;
 use crate::state::Daemon;
 
 /// Accept connections until shutdown. Must run inside a `LocalSet`.
@@ -72,7 +73,11 @@ async fn handle_request(request: Request, daemon: &Daemon) -> Response {
             Response::Status(daemon.status(provider.as_ref(), account.as_ref()))
         }
         Request::PollNow { provider, account } => poll_now(daemon, &provider, account.as_ref()),
-        Request::AwaitUpdate { since, timeout_ms } => await_update(daemon, since, timeout_ms).await,
+        Request::AwaitUpdate {
+            since,
+            config_gen,
+            timeout_ms,
+        } => await_update(daemon, since, config_gen, timeout_ms).await,
         Request::History {
             account,
             window,
@@ -119,6 +124,39 @@ async fn handle_request(request: Request, daemon: &Daemon) -> Response {
         }
         Request::Providers => Response::Providers(daemon.provider_health()),
         Request::Shutdown => Response::Ack,
+        Request::GetConfig => Response::Config(daemon.config_state()),
+        Request::SetConfig(edit) => set_config(daemon, &edit),
+    }
+}
+
+/// Write one settings change to `config.toml` and apply it.
+///
+/// The daemon writes the file rather than the client so that validation, the
+/// write, and the apply happen in one place — and so the client learns about a
+/// rejection as a reply rather than having to notice it later.
+fn set_config(daemon: &Daemon, edit: &ConfigEdit) -> Response {
+    let path = std::path::PathBuf::from(&daemon.config_state().path);
+    let text = match config::write_edit(&path, edit) {
+        Ok(text) => text,
+        Err(e) => return Response::Err(ErrorKind::BadRequest, e.to_string()),
+    };
+    // Apply straight away instead of leaving it to the watcher: the reply
+    // should describe settings that are already in effect, not ones that will
+    // be a filesystem event later.
+    match config::parse(&text) {
+        Ok(loaded) => {
+            for warning in &loaded.warnings {
+                tracing::warn!(config = %path.display(), "{warning}");
+            }
+            daemon.apply_config(loaded);
+            Response::Config(daemon.config_state())
+        }
+        // Only reachable if the file was already invalid for a reason the edit
+        // did not touch, since `write_edit` validates what it writes.
+        Err(e) => {
+            daemon.reject_config(e.to_string());
+            Response::Err(ErrorKind::BadRequest, e.to_string())
+        }
     }
 }
 
@@ -136,11 +174,21 @@ fn poll_now(daemon: &Daemon, provider: &str, account: Option<&AccountId>) -> Res
         .map(|(_, tx)| tx.clone())
         .collect();
     let provider_known = st.pollers.keys().any(|(p, _)| p == provider);
+    let enabled = st.config.provider_enabled(provider);
     drop(st);
     if !provider_known {
         return Response::Err(
             ErrorKind::UnknownProvider,
             format!("no provider {provider:?}"),
+        );
+    }
+    // A disabled provider's poll tasks are parked, so a trigger sent now would
+    // sit in the channel until it was re-enabled and then fire as a surprise.
+    // Refusing says what actually happened.
+    if !enabled {
+        return Response::Err(
+            ErrorKind::BadRequest,
+            format!("provider {provider:?} is disabled in config"),
         );
     }
     if targets.is_empty() {
@@ -159,10 +207,21 @@ fn poll_now(daemon: &Daemon, provider: &str, account: Option<&AccountId>) -> Res
     }
 }
 
-/// Resolve immediately if a poll newer than `since` is already published,
-/// otherwise wait for the next one, bounded by `timeout_ms`.
-async fn await_update(daemon: &Daemon, since: PollId, timeout_ms: u32) -> Response {
+/// Resolve immediately if a poll newer than `since` or a config load newer
+/// than `config_gen` is already published, otherwise wait for whichever comes
+/// first, bounded by `timeout_ms`.
+///
+/// Both of the daemon's clocks share one long-poll so the client needs neither
+/// a third connection nor a timer of its own — the daemon stays the only clock
+/// that matters.
+async fn await_update(
+    daemon: &Daemon,
+    since: PollId,
+    config_gen: u64,
+    timeout_ms: u32,
+) -> Response {
     let mut rx = daemon.watch_tx.subscribe();
+    let mut config_rx = daemon.config_tx.subscribe();
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.into());
     loop {
@@ -174,7 +233,17 @@ async fn await_update(daemon: &Daemon, since: PollId, timeout_ms: u32) -> Respon
         if let Some(event) = newer {
             return Response::Update(event);
         }
-        match tokio::time::timeout_at(deadline, rx.changed()).await {
+        if *config_rx.borrow_and_update() > config_gen {
+            return Response::Config(daemon.config_state());
+        }
+        let woken = tokio::time::timeout_at(deadline, async {
+            tokio::select! {
+                r = rx.changed() => r,
+                r = config_rx.changed() => r,
+            }
+        })
+        .await;
+        match woken {
             Ok(Ok(())) => continue,
             _ => return Response::NoUpdate, // timeout or daemon dropped
         }

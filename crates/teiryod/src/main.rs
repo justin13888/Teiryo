@@ -6,7 +6,6 @@ use std::rc::Rc;
 use anyhow::Context;
 use teiryo_core::{ProviderAdapter, Storage};
 use teiryod::paths::{bind_socket, BindOutcome, Paths};
-use teiryod::Config;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -15,7 +14,9 @@ fn main() -> anyhow::Result<()> {
     let paths = Paths::resolve().context("resolving XDG paths")?;
     init_logging(&paths)?;
 
-    let config = Config::load(&paths.config).context("loading config.toml")?;
+    // Config is loaded inside `run`, not here: a malformed config.toml must
+    // not stop the daemon from binding, or the user would have no client to
+    // see the error in and no way to fix it short of reading the log.
     let listener = match bind_socket(&paths.socket).context("binding socket")? {
         BindOutcome::Bound(l) => l,
         BindOutcome::AlreadyRunning => {
@@ -40,7 +41,7 @@ fn main() -> anyhow::Result<()> {
         // the runtime — `from_std` panics if there is none.
         let listener = tokio::net::UnixListener::from_std(listener)
             .context("registering the socket with the runtime")?;
-        let serve = teiryod::run(listener, storage, adapters, config);
+        let serve = teiryod::run(listener, storage, adapters, paths.config.clone());
         tokio::pin!(serve);
         let daemon = tokio::select! {
             daemon = &mut serve => Some(daemon),
