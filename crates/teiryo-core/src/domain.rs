@@ -129,6 +129,35 @@ pub struct QuotaWindow {
     pub reset_at: Option<DateTime<Utc>>,
 }
 
+impl QuotaWindow {
+    /// Utilization ratio in `0.0..=1.0`, when computable from the window's own
+    /// fields.
+    ///
+    /// `Percent` windows are self-describing; anything else needs a published
+    /// limit, which not every provider gives (see `docs/providers.md`).
+    pub fn utilization(&self) -> Option<f64> {
+        match (self.unit, self.limit) {
+            (QuotaUnit::Percent, _) => Some((self.used / 100.0).clamp(0.0, 1.0)),
+            (_, Some(limit)) if limit > 0.0 => Some((self.used / limit).clamp(0.0, 1.0)),
+            _ => None,
+        }
+    }
+
+    /// How long the window rolls over, as a `chrono` duration.
+    pub fn span(&self) -> Option<chrono::Duration> {
+        match self.reset_kind {
+            ResetKind::Rolling(d) => chrono::Duration::from_std(d).ok(),
+        }
+    }
+
+    /// When the current window began: `reset_at` less its own length. `None`
+    /// when the provider did not publish `reset_at`, since without it the
+    /// window's start is unknowable.
+    pub fn started_at(&self) -> Option<DateTime<Utc>> {
+        Some(self.reset_at? - self.span()?)
+    }
+}
+
 /// What caused a poll.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PollTrigger {

@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use teiryo_core::{
-    Account, AccountId, AccountStatus, PollEvent, PollOutcome, PollTrigger, ProviderHealth,
-    ProviderId, Storage,
+    rollover, Account, AccountId, AccountStatus, PollEvent, PollOutcome, PollTrigger,
+    ProviderHealth, ProviderId, QuotaWindow, Storage,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -34,6 +34,16 @@ pub struct SharedState {
     pub health: HashMap<(ProviderId, AccountId), AccountHealth>,
     /// Manual-trigger senders into each poll task.
     pub pollers: HashMap<(ProviderId, AccountId), mpsc::UnboundedSender<PollTrigger>>,
+}
+
+/// The windows a previous poll reported, or none when it was a failure — a
+/// failed poll carries no windows, and treating that as "everything vanished"
+/// would manufacture rollovers out of an outage.
+fn previous_windows(event: Option<&PollEvent>) -> &[QuotaWindow] {
+    match event.map(|e| &e.outcome) {
+        Some(PollOutcome::Success { windows }) => windows,
+        _ => &[],
+    }
 }
 
 /// Cheap-to-clone handle bundling state and the daemon-wide channels.
@@ -73,7 +83,26 @@ impl Daemon {
             PollOutcome::Success { windows } => windows.clone(),
             _ => Vec::new(),
         };
-        if let Err(e) = st.storage.record_poll(event, &windows) {
+        // Detect against the last *successful* poll, not the last poll: a run
+        // of failures in between leaves the windows untouched, and comparing
+        // against an empty failure payload would invent a rollover. This runs
+        // before `latest_success` is replaced below.
+        let rollovers = rollover::detect(
+            &event.account,
+            previous_windows(st.latest_success.get(&event.account)),
+            &windows,
+            event.id,
+            event.ts,
+        );
+        for r in rollovers.iter().filter(|r| r.kind.is_surprise()) {
+            tracing::info!(
+                account = %r.account, window = %r.window, kind = r.kind.as_str(),
+                prev_reset_at = ?r.prev_reset_at, new_reset_at = ?r.new_reset_at,
+                prev_used = r.prev_used, new_used = r.new_used,
+                "quota window reset unexpectedly"
+            );
+        }
+        if let Err(e) = st.storage.record_poll(event, &windows, &rollovers) {
             tracing::error!(error = %e, poll = %event.id, "failed to persist poll event");
         }
         let key = (event.provider.clone(), event.account.clone());

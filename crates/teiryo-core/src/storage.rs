@@ -16,6 +16,7 @@ use crate::domain::{
     Account, AccountId, PollEvent, PollId, PollOutcome, PollTrigger, QuotaSnapshot, QuotaUnit,
     QuotaWindow, WindowId,
 };
+use crate::rollover::{RolloverKind, WindowRollover};
 
 /// Storage failure.
 #[derive(Debug, thiserror::Error)]
@@ -54,7 +55,23 @@ CREATE TABLE IF NOT EXISTS quota_snapshot (
     used REAL NOT NULL, limit_val REAL, reset_at INTEGER,
     PRIMARY KEY (poll_id, window_id)
 );
+-- Observed window rollovers. Keyed like `quota_snapshot`, and written in the
+-- same transaction as the poll that revealed them, so a boundary can never
+-- outlive its evidence. Unlike snapshots these are sparse and are never
+-- downsampled: a rollover's instant is the whole point of recording it.
+CREATE TABLE IF NOT EXISTS window_rollover (
+    poll_id TEXT NOT NULL REFERENCES poll_event(id),
+    window_id TEXT NOT NULL,
+    account_id TEXT NOT NULL REFERENCES account(id),
+    observed_at INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    prev_reset_at INTEGER, new_reset_at INTEGER,
+    prev_used REAL NOT NULL, new_used REAL NOT NULL,
+    PRIMARY KEY (poll_id, window_id)
+);
 CREATE INDEX IF NOT EXISTS idx_poll_lookup ON poll_event(provider, account_id, ts);
+CREATE INDEX IF NOT EXISTS idx_rollover_lookup
+    ON window_rollover(account_id, window_id, observed_at);
 ";
 
 fn ts_to_millis(ts: DateTime<Utc>) -> i64 {
@@ -129,13 +146,15 @@ impl Storage {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Persist one poll event and its snapshot batch atomically. The
-    /// snapshots are FK'd to the event so trigger, timestamp, and latency are
-    /// never separated from the data they produced.
+    /// Persist one poll event, its snapshot batch, and any rollovers the poll
+    /// revealed, atomically. All three are FK'd to the event so trigger,
+    /// timestamp, and latency are never separated from the data they produced
+    /// — and so a recorded boundary always has the reading that justifies it.
     pub fn record_poll(
         &mut self,
         event: &PollEvent,
         windows: &[QuotaWindow],
+        rollovers: &[WindowRollover],
     ) -> Result<(), StorageError> {
         let trigger_json = serde_json::to_string(&event.trigger)?;
         let outcome_json = serde_json::to_string(&event.outcome)?;
@@ -169,8 +188,102 @@ impl Storage {
                 ],
             )?;
         }
+        for rollover in rollovers {
+            tx.execute(
+                "INSERT INTO window_rollover
+                     (poll_id, window_id, account_id, observed_at, kind,
+                      prev_reset_at, new_reset_at, prev_used, new_used)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    rollover.poll.to_string(),
+                    rollover.window.0,
+                    rollover.account.0,
+                    ts_to_millis(rollover.observed_at),
+                    rollover.kind.as_str(),
+                    rollover.prev_reset_at.map(ts_to_millis),
+                    rollover.new_reset_at.map(ts_to_millis),
+                    rollover.prev_used,
+                    rollover.new_used,
+                ],
+            )?;
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Rollovers observed for one account (optionally one window) within
+    /// `since..=until`, oldest first.
+    ///
+    /// Deliberately not downsampled, unlike [`Storage::history`]: rollovers are
+    /// sparse by construction, and their exact instants are the reason they are
+    /// stored at all. Bucketing them would move the very boundaries a caller
+    /// asked for.
+    pub fn rollovers(
+        &self,
+        account: &AccountId,
+        window: Option<&WindowId>,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<WindowRollover>, StorageError> {
+        let mut sql = String::from(
+            "SELECT poll_id, window_id, observed_at, kind,
+                    prev_reset_at, new_reset_at, prev_used, new_used
+             FROM window_rollover
+             WHERE account_id = ?1 AND observed_at >= ?2 AND observed_at <= ?3",
+        );
+        if window.is_some() {
+            sql.push_str(" AND window_id = ?4");
+        }
+        sql.push_str(" ORDER BY observed_at ASC");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<RolloverRow> {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        };
+        let (from, to) = (ts_to_millis(since), ts_to_millis(until));
+        let raw: Vec<RolloverRow> = if let Some(w) = window {
+            stmt.query_map(params![account.0, from, to, w.0], map_row)?
+                .collect::<Result<_, _>>()?
+        } else {
+            stmt.query_map(params![account.0, from, to], map_row)?
+                .collect::<Result<_, _>>()?
+        };
+        raw.into_iter()
+            .map(
+                |(
+                    poll,
+                    window_id,
+                    observed_at,
+                    kind,
+                    prev_reset,
+                    new_reset,
+                    prev_used,
+                    new_used,
+                )| {
+                    Ok(WindowRollover {
+                        account: account.clone(),
+                        window: WindowId(window_id),
+                        poll: parse_poll_id(&poll)?,
+                        observed_at: millis_to_ts(observed_at),
+                        kind: RolloverKind::from_column(&kind).ok_or_else(|| {
+                            StorageError::Corrupt(format!("unknown rollover kind {kind:?}"))
+                        })?,
+                        prev_reset_at: prev_reset.map(millis_to_ts),
+                        new_reset_at: new_reset.map(millis_to_ts),
+                        prev_used,
+                        new_used,
+                    })
+                },
+            )
+            .collect()
     }
 
     /// Snapshots for one account (optionally one window) at or after `since`,
@@ -290,6 +403,16 @@ type SnapshotRow = (
     Option<f64>,
     Option<i64>,
 );
+type RolloverRow = (
+    String,
+    String,
+    i64,
+    String,
+    Option<i64>,
+    Option<i64>,
+    f64,
+    f64,
+);
 
 fn row_to_event(row: EventRow) -> Result<PollEvent, StorageError> {
     let (id, ts, provider, account_id, trigger_json, outcome_json, latency_ms) = row;
@@ -351,6 +474,108 @@ mod tests {
     }
 
     #[test]
+    fn rollovers_roundtrip_and_honor_their_interval() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        storage.upsert_account(&account()).unwrap();
+        // Whole seconds: the columns are unix millis, so a `Utc::now()` with
+        // microsecond precision would not compare equal after a round trip.
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let windows = vec![window("session_5h", 3.0)];
+        let poll = event(PollOutcome::Success {
+            windows: windows.clone(),
+        });
+
+        let rollover = |window_id: &str, kind, minutes_ago: i64| WindowRollover {
+            account: account().id,
+            window: WindowId::from(window_id),
+            poll: poll.id,
+            observed_at: now - chrono::Duration::minutes(minutes_ago),
+            kind,
+            prev_reset_at: Some(now - chrono::Duration::minutes(minutes_ago)),
+            new_reset_at: Some(now + chrono::Duration::hours(5)),
+            prev_used: 91.5,
+            new_used: 3.0,
+        };
+        // Two windows on one poll — the composite key must keep both.
+        let written = vec![
+            rollover("session_5h", RolloverKind::Early, 30),
+            rollover("weekly", RolloverKind::Scheduled, 90),
+        ];
+        storage.record_poll(&poll, &windows, &written).unwrap();
+
+        let id = account().id;
+        let all = storage
+            .rollovers(&id, None, now - chrono::Duration::hours(2), now)
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        // Oldest first, and every field survives the trip.
+        assert_eq!(all[0].window, WindowId::from("weekly"));
+        assert_eq!(all[1], written[0]);
+
+        // Filtered to one window.
+        let one = storage
+            .rollovers(
+                &id,
+                Some(&WindowId::from("session_5h")),
+                now - chrono::Duration::hours(2),
+                now,
+            )
+            .unwrap();
+        assert_eq!(one, vec![written[0].clone()]);
+
+        // The interval is inclusive of neither end beyond its bounds: a 1-hour
+        // window excludes the 90-minute-old row.
+        let recent = storage
+            .rollovers(&id, None, now - chrono::Duration::hours(1), now)
+            .unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].kind, RolloverKind::Early);
+
+        // Another account's history is never mixed in.
+        assert!(storage
+            .rollovers(
+                &AccountId::from("nope"),
+                None,
+                now - chrono::Duration::hours(2),
+                now
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A rollover is only meaningful next to the reading that justified it, so
+    /// it must never outlive a poll insert that failed.
+    #[test]
+    fn a_failed_poll_insert_takes_its_rollovers_with_it() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        storage.upsert_account(&account()).unwrap();
+        let now = Utc::now();
+        let windows = vec![window("session_5h", 3.0)];
+        let poll = event(PollOutcome::Success {
+            windows: windows.clone(),
+        });
+        let rollovers = vec![WindowRollover {
+            account: account().id,
+            window: WindowId::from("session_5h"),
+            poll: poll.id,
+            observed_at: now,
+            kind: RolloverKind::Early,
+            prev_reset_at: None,
+            new_reset_at: None,
+            prev_used: 90.0,
+            new_used: 1.0,
+        }];
+        storage.record_poll(&poll, &windows, &rollovers).unwrap();
+        // Re-recording the same poll violates the primary key and rolls back.
+        assert!(storage.record_poll(&poll, &windows, &rollovers).is_err());
+
+        let stored = storage
+            .rollovers(&account().id, None, now - chrono::Duration::hours(1), now)
+            .unwrap();
+        assert_eq!(stored.len(), 1, "the retry must not have added a duplicate");
+    }
+
+    #[test]
     fn record_and_query_roundtrip() {
         let mut storage = Storage::open_in_memory().unwrap();
         storage.upsert_account(&account()).unwrap();
@@ -360,13 +585,13 @@ mod tests {
         let ok = event(PollOutcome::Success {
             windows: windows.clone(),
         });
-        storage.record_poll(&ok, &windows).unwrap();
+        storage.record_poll(&ok, &windows, &[]).unwrap();
 
         // ULID ordering (and thus recent_polls order) is only guaranteed
         // across distinct milliseconds.
         std::thread::sleep(std::time::Duration::from_millis(2));
         let failed = event(PollOutcome::AuthError("expired".into()));
-        storage.record_poll(&failed, &[]).unwrap();
+        storage.record_poll(&failed, &[], &[]).unwrap();
 
         // History: both windows, then filtered to one.
         let since = Utc::now() - chrono::Duration::hours(1);
@@ -417,7 +642,7 @@ mod tests {
             let mut storage = Storage::open(&path).unwrap();
             storage.upsert_account(&account()).unwrap();
             let e = event(PollOutcome::Success { windows: vec![] });
-            storage.record_poll(&e, &[]).unwrap();
+            storage.record_poll(&e, &[], &[]).unwrap();
         }
         let reopened = Storage::open(&path).unwrap();
         assert_eq!(reopened.accounts().unwrap().len(), 1);

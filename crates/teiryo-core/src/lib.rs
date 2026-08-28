@@ -8,6 +8,7 @@ pub mod adapter;
 pub mod domain;
 pub mod error;
 pub mod protocol;
+pub mod rollover;
 pub mod storage;
 
 pub use adapter::{
@@ -26,6 +27,7 @@ pub use protocol::handshake::{
     client_handshake, server_handshake, Hello, PROTOCOL_MAGIC, PROTOCOL_VERSION,
 };
 pub use protocol::wire::{AccountStatus, ProviderHealth, Request, Response};
+pub use rollover::{RolloverKind, WindowRollover, RESET_TOLERANCE};
 pub use storage::{Storage, StorageError};
 
 #[cfg(test)]
