@@ -25,6 +25,12 @@ use crate::domain::{AccountId, PollId, QuotaWindow, WindowId};
 /// Tolerance absorbing clock skew between our poll timestamp and the
 /// provider's published reset instant, plus provider-side rounding. Below this
 /// a difference is noise, not a decision.
+///
+/// Applied to `reset_at` moves in **both** directions. Providers recompute the
+/// instant per request, so a window that has not rolled at all still reports a
+/// `reset_at` that drifts by a fraction of a second between polls; without the
+/// tolerance on the forward comparison, every poll of such a provider looks
+/// like a rollover.
 pub const RESET_TOLERANCE: Duration = Duration::seconds(120);
 
 /// Utilization drop that counts as an unannounced reset rather than a
@@ -150,7 +156,7 @@ fn classify(
     observed_at: DateTime<Utc>,
 ) -> Option<RolloverKind> {
     match (before.reset_at, after.reset_at) {
-        (Some(prev), Some(new)) if new > prev => {
+        (Some(prev), Some(new)) if new > prev + RESET_TOLERANCE => {
             // The old window was still supposed to be running when the new one
             // appeared, so the provider rolled it early.
             if prev > observed_at + RESET_TOLERANCE {
@@ -234,6 +240,35 @@ mod tests {
         let before = window(88.0, Some(now() + Duration::minutes(1)));
         let after = window(3.0, Some(now() + Duration::hours(5)));
         assert_eq!(detected(before, after), Some(RolloverKind::Scheduled));
+    }
+
+    /// Providers recompute `reset_at` per request, so an unmoved window still
+    /// reports an instant that drifts sub-second between polls. Without a
+    /// tolerance on the forward comparison every single poll is a rollover.
+    #[test]
+    fn sub_tolerance_forward_drift_is_not_a_rollover() {
+        let reset = now() + Duration::hours(16);
+        let before = window(77.0, Some(reset));
+        let after = window(77.0, Some(reset + Duration::milliseconds(686)));
+        assert_eq!(detected(before, after), None);
+    }
+
+    /// The tolerance is symmetric: the same drift backwards is also noise.
+    #[test]
+    fn sub_tolerance_backward_drift_is_not_a_rollover() {
+        let reset = now() + Duration::hours(16);
+        let before = window(77.0, Some(reset));
+        let after = window(77.0, Some(reset - Duration::milliseconds(686)));
+        assert_eq!(detected(before, after), None);
+    }
+
+    /// Drift must not mask a real reset the provider failed to announce.
+    #[test]
+    fn a_collapse_under_drift_is_still_unannounced() {
+        let reset = now() + Duration::hours(16);
+        let before = window(77.0, Some(reset));
+        let after = window(2.0, Some(reset + Duration::milliseconds(686)));
+        assert_eq!(detected(before, after), Some(RolloverKind::Unannounced));
     }
 
     #[test]
