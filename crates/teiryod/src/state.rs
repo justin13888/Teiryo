@@ -12,6 +12,8 @@ use teiryo_core::{
 };
 use tokio::sync::{mpsc, watch};
 
+use crate::scheduler::Schedule;
+
 /// Rolling health counters for one (provider, account) poll task. The
 /// wire-facing view is [`teiryo_core::AccountHealth`], assembled in
 /// [`Daemon::provider_health`].
@@ -38,8 +40,12 @@ pub struct SharedState {
     pub health: HashMap<(ProviderId, AccountId), HealthCounters>,
     /// Manual-trigger senders into each poll task.
     pub pollers: HashMap<(ProviderId, AccountId), mpsc::UnboundedSender<PollTrigger>>,
+    /// Live schedule senders into each poll task. A settings change publishes
+    /// here rather than respawning tasks.
+    pub schedules: HashMap<(ProviderId, AccountId), watch::Sender<Schedule>>,
     /// Effective scheduler cadence per account, so clients can show how long
-    /// until the next poll without knowing the daemon's config.
+    /// until the next poll without knowing the daemon's config. Zero when the
+    /// account's provider is disabled — there is no next poll to count down to.
     pub poll_intervals: HashMap<AccountId, Duration>,
     /// Adapters kept for their [`teiryo_core::WindowPresenter`] impl: `Status`
     /// attaches each window's render hint so the TUI never hardcodes
@@ -47,10 +53,21 @@ pub struct SharedState {
     pub presenters: HashMap<ProviderId, Rc<dyn ProviderAdapter>>,
 }
 
-/// Cadence in whole seconds. `0` means "no next poll to expect", which is
-/// what a client needs to draw no countdown.
+/// Cadence in whole seconds. `0` means "no next poll to expect": either the
+/// account has no poller registered, or its provider is disabled in config.
+/// Clients already treat `0` as "draw no countdown", which is exactly right
+/// for a paused provider.
 fn interval_secs(interval: Option<&Duration>) -> u32 {
     interval.map_or(0, |d| d.as_secs().min(u64::from(u32::MAX)) as u32)
+}
+
+/// The cadence to report to clients: zero while disabled, per [`interval_secs`].
+fn reported(schedule: Schedule) -> Duration {
+    if schedule.enabled {
+        schedule.interval
+    } else {
+        Duration::ZERO
+    }
 }
 
 /// Fallback for an account whose adapter is not registered — it cannot happen
@@ -98,6 +115,7 @@ impl Daemon {
                 latest_success: HashMap::new(),
                 health: HashMap::new(),
                 pollers: HashMap::new(),
+                schedules: HashMap::new(),
                 poll_intervals: HashMap::new(),
                 presenters: HashMap::new(),
             })),
@@ -274,6 +292,33 @@ impl Daemon {
         let mut list: Vec<_> = by_provider.into_values().collect();
         list.sort_by(|a, b| a.provider.cmp(&b.provider));
         list
+    }
+
+    /// Register a poll task for `account`: open its live schedule channel,
+    /// record the cadence clients see, and keep the adapter for its presenter.
+    /// Returns the receiver to hand to [`crate::scheduler::spawn_poller`].
+    pub fn register_poller(
+        &self,
+        account: &Account,
+        adapter: Rc<dyn ProviderAdapter>,
+        initial: Schedule,
+    ) -> watch::Receiver<Schedule> {
+        let mut st = self.state.borrow_mut();
+        let (tx, rx) = watch::channel(initial);
+        st.schedules
+            .insert((account.provider.clone(), account.id.clone()), tx);
+        st.poll_intervals
+            .insert(account.id.clone(), reported(initial));
+        st.presenters.insert(account.provider.clone(), adapter);
+        rx
+    }
+
+    /// Record the cadence a poll task is *actually* running at.
+    pub fn set_reported_interval(&self, account: &AccountId, interval: Duration) {
+        self.state
+            .borrow_mut()
+            .poll_intervals
+            .insert(account.clone(), interval);
     }
 
     /// The newest poll id published so far (zero if none yet).

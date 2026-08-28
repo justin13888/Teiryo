@@ -8,9 +8,20 @@ use chrono::Utc;
 use teiryo_core::{
     Account, PollEvent, PollId, PollOutcome, PollTrigger, ProbeError, ProviderAdapter,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::state::Daemon;
+
+/// What the config currently says about one account's polling. Delivered over
+/// a `watch` rather than captured by value, so a `config.toml` edit reaches a
+/// running task instead of waiting for a daemon restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Schedule {
+    /// Whether this account's provider is polled at all.
+    pub enabled: bool,
+    /// Base cadence; actual polls jitter ±10% around it.
+    pub interval: Duration,
+}
 
 /// Spawn the poll task for one (provider, account). Returns the manual
 /// trigger sender; the task itself runs until shutdown. Must be called from
@@ -19,15 +30,34 @@ pub fn spawn_poller(
     daemon: &Daemon,
     adapter: Rc<dyn ProviderAdapter>,
     account: Account,
-    base_interval: Duration,
+    mut schedule_rx: watch::Receiver<Schedule>,
 ) -> mpsc::UnboundedSender<PollTrigger> {
     let (tx, mut rx) = mpsc::unbounded_channel::<PollTrigger>();
     let daemon = daemon.clone();
     let mut shutdown_rx = daemon.shutdown_tx.subscribe();
     tokio::task::spawn_local(async move {
-        poll_once(&daemon, adapter.as_ref(), &account, PollTrigger::Startup).await;
+        // Tracked rather than assumed: a provider disabled in config.toml must
+        // not poll at startup, and re-enabling one should show a reading
+        // immediately rather than after a full interval of nothing.
+        let mut was_enabled = false;
         loop {
-            let sleep = tokio::time::sleep(jittered(base_interval));
+            let schedule = *schedule_rx.borrow_and_update();
+            if !schedule.enabled {
+                was_enabled = false;
+                tokio::select! {
+                    _ = schedule_rx.changed() => continue,
+                    _ = shutdown_rx.changed() => break,
+                }
+            }
+            if !was_enabled {
+                was_enabled = true;
+                poll_once(&daemon, adapter.as_ref(), &account, PollTrigger::Startup).await;
+                continue;
+            }
+            let interval = schedule.interval;
+            // Clients count down to the next poll from this.
+            daemon.set_reported_interval(&account.id, interval);
+            let sleep = tokio::time::sleep(jittered(interval));
             tokio::select! {
                 _ = sleep => {
                     poll_once(&daemon, adapter.as_ref(), &account, PollTrigger::Scheduled).await;
@@ -35,6 +65,10 @@ pub fn spawn_poller(
                 Some(trigger) = rx.recv() => {
                     poll_once(&daemon, adapter.as_ref(), &account, trigger).await;
                 }
+                // Re-arms the sleep against the new cadence. A shortened
+                // interval therefore takes effect now, not after the old
+                // (possibly hour-long) one finally elapses.
+                _ = schedule_rx.changed() => {}
                 _ = shutdown_rx.changed() => break,
             }
         }
