@@ -70,7 +70,7 @@ struct AccountStatus {
     windows: Vec<WindowView>,
     last_poll: Option<PollEvent>,       // any outcome, may be a failure
     last_success: Option<DateTime<Utc>>, // when the poll backing `windows` completed
-    poll_interval_secs: u32,             // cadence in force now; jitters ±10%
+    poll_interval_secs: u32,             // cadence in force now; jitters ±10%, stretches under backoff
 }
 struct AccountHealth {
     account: AccountId,
