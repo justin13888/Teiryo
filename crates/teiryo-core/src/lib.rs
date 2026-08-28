@@ -8,6 +8,7 @@ pub mod adapter;
 pub mod domain;
 pub mod error;
 pub mod protocol;
+pub mod rollover;
 pub mod storage;
 
 pub use adapter::{
@@ -25,8 +26,12 @@ pub use protocol::codec::{
 pub use protocol::handshake::{
     client_handshake, server_handshake, Hello, PROTOCOL_MAGIC, PROTOCOL_VERSION,
 };
-pub use protocol::wire::{AccountStatus, ProviderHealth, Request, Response};
-pub use storage::{Storage, StorageError};
+pub use protocol::wire::{
+    AccountHealth, AccountStatus, ConfigEdit, ConfigState, ConfigView, HistoryPage, ProviderHealth,
+    ProviderSettings, Request, Response, WindowView,
+};
+pub use rollover::{RolloverKind, WindowRollover, RESET_TOLERANCE};
+pub use storage::{Storage, StorageError, MAX_HISTORY_POINTS};
 
 #[cfg(test)]
 mod tests {

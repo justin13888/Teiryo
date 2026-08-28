@@ -52,9 +52,14 @@ mod tests {
     use futures::{SinkExt, StreamExt};
 
     use super::*;
+    use crate::adapter::{BarStyle, RenderHint};
     use crate::domain::*;
     use crate::error::ErrorKind;
-    use crate::protocol::wire::{AccountStatus, ProviderHealth, Request, Response};
+    use crate::protocol::wire::{
+        AccountHealth, AccountStatus, ConfigEdit, ConfigState, ConfigView, HistoryPage,
+        ProviderHealth, ProviderSettings, Request, Response, WindowView,
+    };
+    use crate::rollover::{RolloverKind, WindowRollover};
 
     fn sample_window() -> QuotaWindow {
         QuotaWindow {
@@ -102,16 +107,37 @@ mod tests {
             },
             Request::AwaitUpdate {
                 since: PollId::zero(),
+                config_gen: 0,
                 timeout_ms: 30_000,
             },
             Request::History {
                 account: AccountId::from("claude:personal"),
                 window: Some(WindowId::from("weekly_all")),
                 since: Utc::now(),
+                until: Some(Utc::now()),
+                max_points: Some(240),
+            },
+            Request::History {
+                account: AccountId::from("claude:personal"),
+                window: None,
+                since: Utc::now(),
+                until: None,
+                max_points: None,
             },
             Request::RecentPolls { limit: 50 },
             Request::Providers,
             Request::Shutdown,
+            Request::GetConfig,
+            Request::SetConfig(ConfigEdit::GlobalPollInterval(Some(120))),
+            Request::SetConfig(ConfigEdit::GlobalPollInterval(None)),
+            Request::SetConfig(ConfigEdit::ProviderPollInterval {
+                provider: "claude".into(),
+                secs: Some(30),
+            }),
+            Request::SetConfig(ConfigEdit::ProviderEnabled {
+                provider: "claude".into(),
+                enabled: false,
+            }),
         ];
         for request in &requests {
             roundtrip(request);
@@ -127,10 +153,20 @@ mod tests {
                     provider: "claude".into(),
                     label: "personal".into(),
                 },
-                windows: vec![sample_window()],
+                windows: vec![WindowView {
+                    window: sample_window(),
+                    hint: RenderHint {
+                        style: BarStyle::Percent,
+                        warn_threshold: 0.8,
+                        critical_threshold: 0.95,
+                        note: Some("blocks entirely at cap".into()),
+                    },
+                }],
                 last_poll: Some(sample_event(PollOutcome::Success {
                     windows: vec![sample_window()],
                 })),
+                last_success: Some(Utc::now()),
+                poll_interval_secs: 60,
             }]),
             Response::PollAccepted {
                 poll_id: PollId::generate(),
@@ -139,16 +175,35 @@ mod tests {
                 retry_after: Some(Duration::from_secs(60)),
             })),
             Response::NoUpdate,
-            Response::History(vec![QuotaSnapshot {
-                poll_id: PollId::generate(),
-                ts: Utc::now(),
-                window: WindowId::from("session_5h_opus"),
-                label: "Opus — 5 hour".into(),
-                unit: QuotaUnit::Percent,
-                used: 61.0,
-                limit: None,
-                reset_at: None,
-            }]),
+            Response::History(HistoryPage {
+                snapshots: vec![QuotaSnapshot {
+                    poll_id: PollId::generate(),
+                    ts: Utc::now(),
+                    window: WindowId::from("session_5h_opus"),
+                    label: "Opus — 5 hour".into(),
+                    unit: QuotaUnit::Percent,
+                    used: 61.0,
+                    limit: None,
+                    reset_at: None,
+                }],
+                earliest: Some(Utc::now()),
+                rollovers: vec![WindowRollover {
+                    account: AccountId::from("claude:personal"),
+                    window: WindowId::from("session_5h_opus"),
+                    poll: PollId::generate(),
+                    observed_at: Utc::now(),
+                    kind: RolloverKind::Early,
+                    prev_reset_at: Some(Utc::now()),
+                    new_reset_at: Some(Utc::now()),
+                    prev_used: 88.0,
+                    new_used: 1.0,
+                }],
+            }),
+            Response::History(HistoryPage {
+                snapshots: Vec::new(),
+                earliest: None,
+                rollovers: Vec::new(),
+            }),
             Response::RecentPolls(vec![
                 sample_event(PollOutcome::AuthError("token expired".into())),
                 sample_event(PollOutcome::NetworkError("connection refused".into())),
@@ -156,12 +211,36 @@ mod tests {
             ]),
             Response::Providers(vec![ProviderHealth {
                 provider: "claude".into(),
-                accounts: vec![AccountId::from("claude:personal")],
+                accounts: vec![AccountHealth {
+                    account: AccountId::from("claude:personal"),
+                    consecutive_failures: 3,
+                    last_error: Some("rate limited".into()),
+                    last_poll_ts: Some(Utc::now()),
+                    poll_interval_secs: 60,
+                }],
                 consecutive_failures: 3,
                 last_error: Some("rate limited".into()),
             }]),
             Response::Ack,
             Response::Err(ErrorKind::UnknownProvider, "no such provider".into()),
+            Response::Config(ConfigState {
+                path: "/home/u/.config/teiryo/config.toml".into(),
+                generation: 7,
+                effective: ConfigView {
+                    poll_interval_secs: Some(120),
+                    default_poll_interval_secs: 60,
+                    min_poll_interval_secs: 10,
+                    providers: vec![ProviderSettings {
+                        provider: "claude".into(),
+                        enabled: true,
+                        poll_interval_secs: Some(30),
+                        effective_poll_interval_secs: 30,
+                    }],
+                },
+                loaded_at: Utc::now(),
+                warnings: vec!["unknown key `retrys` — ignored".into()],
+                error: Some("poll_interval_secs must be at least 10".into()),
+            }),
         ];
         for response in &responses {
             roundtrip(response);

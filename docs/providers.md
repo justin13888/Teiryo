@@ -37,6 +37,8 @@ struct RenderHint {
 }
 ```
 
+`RenderHint` **crosses the wire**: `Status` pairs every window with its hint inside `WindowView` (see [protocol.md](protocol.md)). This is what keeps the TUI provider-agnostic in practice rather than only in principle — gauge colors come from the adapter's own `warn_threshold`/`critical_threshold`, and `note` is displayed verbatim. "80% is fine" and "what happens at 100%" are provider-specific claims; the client must not invent either.
+
 ## Credentials
 
 `Credential` is a core-defined enum (`OAuthToken`, `ApiKey`, `CookieJar`), each variant wrapping `secrecy::SecretString` — no `Debug`/`Display` leakage, zeroized on drop.

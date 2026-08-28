@@ -5,12 +5,13 @@
 - `teiryod` + `teiryo` + the Claude adapter — single provider, but the account/window model is multi-provider and multi-account from the first line of code.
 - SQLite storage and the **full** `Request`/`Response` set — it is the same complexity whether one or five accounts use it.
 - Single auto-discovered account is enough to prove the model.
+- One TUI view: a live quota dashboard with a tabbed Trend/Activity/Health detail pane and three overlays (help, shutdown confirmation, settings). No screen stack.
+- Settings are readable and editable from the TUI over the protocol, and `config.toml` hot-reloads — see [architecture.md](architecture.md).
 
 ## Deferred (post-MVP)
 
 - Second provider adapter (ChatGPT).
 - Config-file `[[account]]` entries for providers that cannot be auto-discovered.
-- `RecentPolls` UI polish.
 - `ResetKind` fixed-calendar variant — add only when a provider actually needs it.
 - Exact TLS-stack fingerprint (JA3) match — accepted gap in v1.
 - Protocol backward-compatibility negotiation — the v1 handshake only fails loudly on mismatch.

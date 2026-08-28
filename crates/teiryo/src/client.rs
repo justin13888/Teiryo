@@ -13,7 +13,9 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use teiryo_core::protocol::codec::{decode_frame, encode_frame, framed};
 use teiryo_core::protocol::handshake::client_handshake;
-use teiryo_core::{AccountStatus, HandshakeError, PollEvent, PollId, Request, Response, WireError};
+use teiryo_core::{
+    AccountStatus, ConfigState, HandshakeError, PollEvent, PollId, Request, Response, WireError,
+};
 
 use crate::spawn::connect_or_spawn;
 
@@ -104,6 +106,9 @@ impl Client {
 pub enum NetEvent {
     /// A poll completed daemon-side; refresh status.
     Update(PollEvent),
+    /// The daemon reloaded `config.toml` — from a `SetConfig` of ours or from
+    /// someone editing the file — and the settings may have changed.
+    Config(Box<ConfigState>),
     /// The update connection died; the TUI should reconnect.
     Disconnected(String),
 }
@@ -119,22 +124,35 @@ pub fn newest_poll_id(statuses: &[AccountStatus]) -> PollId {
 }
 
 /// Run the long-poll loop on a dedicated connection: each `Update` advances
-/// `since` and is forwarded; `NoUpdate` just re-arms.
+/// `since`, each `Config` advances `config_gen`, and both are forwarded;
+/// `NoUpdate` just re-arms.
+///
+/// One request covers both of the daemon's clocks, so a `config.toml` edit
+/// reaches the TUI as promptly as a completed poll does — without a third
+/// connection or a polling timer on this side.
 pub fn spawn_update_loop(
     mut client: Client,
     mut since: PollId,
+    mut config_gen: u64,
     tx: mpsc::UnboundedSender<NetEvent>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let req = Request::AwaitUpdate {
                 since,
+                config_gen,
                 timeout_ms: AWAIT_TIMEOUT_MS,
             };
             match client.request(&req).await {
                 Ok(Response::Update(event)) => {
                     since = since.max(event.id);
                     if tx.send(NetEvent::Update(event)).is_err() {
+                        return; // TUI is gone
+                    }
+                }
+                Ok(Response::Config(state)) => {
+                    config_gen = config_gen.max(state.generation);
+                    if tx.send(NetEvent::Config(Box::new(state))).is_err() {
                         return; // TUI is gone
                     }
                 }
@@ -179,6 +197,8 @@ mod tests {
                 outcome: PollOutcome::Success { windows: vec![] },
                 latency_ms: 1,
             }),
+            last_success: None,
+            poll_interval_secs: 60,
         }
     }
 
