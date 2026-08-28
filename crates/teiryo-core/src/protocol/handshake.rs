@@ -11,7 +11,7 @@ use crate::error::HandshakeError;
 /// Magic bytes opening every connection.
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"TEIR";
 /// Current wire protocol version (little-endian u16 on the wire).
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 /// Daemon reply: handshake accepted, bincode frames may follow.
 pub const HELLO_ACCEPTED: u8 = 0x00;
 /// Daemon reply: protocol version mismatch, connection will be closed.

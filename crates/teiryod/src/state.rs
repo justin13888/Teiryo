@@ -6,14 +6,17 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use teiryo_core::{
-    rollover, Account, AccountId, AccountStatus, BarStyle, PollEvent, PollOutcome, PollTrigger,
-    ProviderAdapter, ProviderHealth, ProviderId, QuotaWindow, RenderHint, Storage, WindowView,
+    rollover, Account, AccountHealth, AccountId, AccountStatus, BarStyle, PollEvent, PollOutcome,
+    PollTrigger, ProviderAdapter, ProviderHealth, ProviderId, QuotaWindow, RenderHint, Storage,
+    WindowView,
 };
 use tokio::sync::{mpsc, watch};
 
-/// Rolling health of one (provider, account) poll task.
+/// Rolling health counters for one (provider, account) poll task. The
+/// wire-facing view is [`teiryo_core::AccountHealth`], assembled in
+/// [`Daemon::provider_health`].
 #[derive(Debug, Default, Clone)]
-pub struct AccountHealth {
+pub struct HealthCounters {
     /// Consecutive failed polls (0 = healthy).
     pub consecutive_failures: u32,
     /// Most recent error message, if the last poll failed.
@@ -32,7 +35,7 @@ pub struct SharedState {
     /// Latest *successful* poll per account — the windows `Status` serves.
     pub latest_success: HashMap<AccountId, PollEvent>,
     /// Health per (provider, account).
-    pub health: HashMap<(ProviderId, AccountId), AccountHealth>,
+    pub health: HashMap<(ProviderId, AccountId), HealthCounters>,
     /// Manual-trigger senders into each poll task.
     pub pollers: HashMap<(ProviderId, AccountId), mpsc::UnboundedSender<PollTrigger>>,
     /// Effective scheduler cadence per account, so clients can show how long
@@ -249,16 +252,24 @@ impl Daemon {
                     consecutive_failures: 0,
                     last_error: None,
                 });
-            entry.accounts.push(account.id.clone());
-            if let Some(h) = st
+            let counters = st
                 .health
                 .get(&(account.provider.clone(), account.id.clone()))
-            {
-                entry.consecutive_failures = entry.consecutive_failures.max(h.consecutive_failures);
-                if entry.last_error.is_none() {
-                    entry.last_error = h.last_error.clone();
-                }
+                .cloned()
+                .unwrap_or_default();
+            entry.consecutive_failures = entry
+                .consecutive_failures
+                .max(counters.consecutive_failures);
+            if entry.last_error.is_none() {
+                entry.last_error = counters.last_error.clone();
             }
+            entry.accounts.push(AccountHealth {
+                account: account.id.clone(),
+                consecutive_failures: counters.consecutive_failures,
+                last_error: counters.last_error,
+                last_poll_ts: st.latest_poll.get(&account.id).map(|e| e.ts),
+                poll_interval_secs: interval_secs(st.poll_intervals.get(&account.id)),
+            });
         }
         let mut list: Vec<_> = by_provider.into_values().collect();
         list.sort_by(|a, b| a.provider.cmp(&b.provider));

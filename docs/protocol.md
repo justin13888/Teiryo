@@ -19,7 +19,7 @@ A hand-decoded, **never-changing** preamble runs before any bincode bytes:
 
 ```rust
 // First 6 bytes on every connection, raw — not bincode, so it can never itself go stale
-struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 3 */ }
+struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 4 */ }
 ```
 
 - Client sends the 6-byte Hello. Daemon replies with **one raw byte**: `0x00` accepted, `0x01` version mismatch — then closes the connection on mismatch without ever attempting to decode a `Request`.
@@ -72,7 +72,19 @@ struct AccountStatus {
     last_success: Option<DateTime<Utc>>, // when the poll backing `windows` completed
     poll_interval_secs: u32,             // cadence in force now; jitters ±10%
 }
-struct ProviderHealth { provider: ProviderId, accounts: Vec<AccountId>, consecutive_failures: u32, last_error: Option<String> }
+struct AccountHealth {
+    account: AccountId,
+    consecutive_failures: u32,
+    last_error: Option<String>,
+    last_poll_ts: Option<DateTime<Utc>>,
+    poll_interval_secs: u32,
+}
+struct ProviderHealth {
+    provider: ProviderId,
+    accounts: Vec<AccountHealth>,        // per-account, not just ids
+    consecutive_failures: u32,           // worst across the provider's accounts
+    last_error: Option<String>,
+}
 ```
 
 **Windows carry their render hint.** `WindowView` pairs each `QuotaWindow` with the `RenderHint` its adapter produced, so warn/critical thresholds and the provider caveat (`"blocks entirely at cap"` vs. `"auto-downgrades, doesn't block"`) reach the client instead of being hardcoded there. Pairing them in one struct rather than parallel `Vec`s makes it impossible for the two to drift apart. See [providers.md](providers.md).

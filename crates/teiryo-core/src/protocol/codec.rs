@@ -56,7 +56,7 @@ mod tests {
     use crate::domain::*;
     use crate::error::ErrorKind;
     use crate::protocol::wire::{
-        AccountStatus, HistoryPage, ProviderHealth, Request, Response, WindowView,
+        AccountHealth, AccountStatus, HistoryPage, ProviderHealth, Request, Response, WindowView,
     };
     use crate::rollover::{RolloverKind, WindowRollover};
 
@@ -198,7 +198,13 @@ mod tests {
             ]),
             Response::Providers(vec![ProviderHealth {
                 provider: "claude".into(),
-                accounts: vec![AccountId::from("claude:personal")],
+                accounts: vec![AccountHealth {
+                    account: AccountId::from("claude:personal"),
+                    consecutive_failures: 3,
+                    last_error: Some("rate limited".into()),
+                    last_poll_ts: Some(Utc::now()),
+                    poll_interval_secs: 60,
+                }],
                 consecutive_failures: 3,
                 last_error: Some("rate limited".into()),
             }]),

@@ -141,13 +141,28 @@ pub struct AccountStatus {
     pub poll_interval_secs: u32,
 }
 
+/// Health of one account's poll task.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountHealth {
+    /// The account.
+    pub account: AccountId,
+    /// Consecutive failed polls (0 = healthy).
+    pub consecutive_failures: u32,
+    /// Most recent error message, if the last poll failed.
+    pub last_error: Option<String>,
+    /// When the last poll of any outcome completed.
+    pub last_poll_ts: Option<DateTime<Utc>>,
+    /// Scheduler cadence for this account.
+    pub poll_interval_secs: u32,
+}
+
 /// Health of one provider across its accounts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderHealth {
     /// The provider.
     pub provider: ProviderId,
-    /// Accounts discovered for it.
-    pub accounts: Vec<AccountId>,
+    /// Per-account health, in registry order.
+    pub accounts: Vec<AccountHealth>,
     /// Consecutive failed polls (0 = healthy).
     pub consecutive_failures: u32,
     /// Most recent error message, if the last poll failed.

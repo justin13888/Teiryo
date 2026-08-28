@@ -289,6 +289,14 @@ fn full_ipc_roundtrip() {
                 assert_eq!(health.len(), 1);
                 assert_eq!(health[0].provider, "stub");
                 assert_eq!(health[0].consecutive_failures, 0);
+                // Per-account rows, not just the provider-wide rollup.
+                assert_eq!(health[0].accounts.len(), 1);
+                let account = &health[0].accounts[0];
+                assert_eq!(account.account, stub_account().id);
+                assert_eq!(account.consecutive_failures, 0);
+                assert_eq!(account.last_error, None);
+                assert_eq!(account.poll_interval_secs, 3600);
+                assert!(account.last_poll_ts.is_some());
             }
             other => panic!("expected Providers, got {other:?}"),
         }
