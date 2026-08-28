@@ -106,10 +106,16 @@ async fn event_loop(
                     }
                     Action::OpenHistory { account, window, title } => {
                         let since = Utc::now() - chrono::Duration::hours(24);
-                        let request = Request::History { account, window: Some(window), since };
+                        let request = Request::History {
+                            account,
+                            window: Some(window),
+                            since,
+                            until: None,
+                            max_points: None,
+                        };
                         match command.request(&request).await {
-                            Ok(Response::History(snapshots)) => {
-                                app.view = View::History { title, snapshots };
+                            Ok(Response::History(page)) => {
+                                app.view = View::History { title, snapshots: page.snapshots };
                             }
                             other => note_unexpected(app, other),
                         }

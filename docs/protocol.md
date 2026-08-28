@@ -19,7 +19,7 @@ A hand-decoded, **never-changing** preamble runs before any bincode bytes:
 
 ```rust
 // First 6 bytes on every connection, raw — not bincode, so it can never itself go stale
-struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 1 */ }
+struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 2 */ }
 ```
 
 - Client sends the 6-byte Hello. Daemon replies with **one raw byte**: `0x00` accepted, `0x01` version mismatch — then closes the connection on mismatch without ever attempting to decode a `Request`.
@@ -33,7 +33,13 @@ enum Request {
     Status { provider: Option<ProviderId>, account: Option<AccountId> }, // None = all
     PollNow { provider: ProviderId, account: Option<AccountId> },        // None = all accounts on that provider
     AwaitUpdate { since: PollId, timeout_ms: u32 },                      // long-poll
-    History { account: AccountId, window: Option<WindowId>, since: DateTime<Utc> },
+    History {                                                            // bounded, see below
+        account: AccountId,
+        window: Option<WindowId>,
+        since: DateTime<Utc>,
+        until: Option<DateTime<Utc>>,   // None = now
+        max_points: Option<u32>,        // per window; daemon downsamples
+    },
     RecentPolls { limit: u32 },
     Providers,
     Shutdown,
@@ -44,16 +50,28 @@ enum Response {
     PollAccepted { poll_id: PollId },
     Update(PollEvent),       // AwaitUpdate resolved with new data
     NoUpdate,                // AwaitUpdate timed out, nothing new
-    History(Vec<QuotaSnapshot>),
+    History(HistoryPage),      // snapshots + the rollovers over the same interval
     RecentPolls(Vec<PollEvent>),
     Providers(Vec<ProviderHealth>),
     Ack,
     Err(ErrorKind, String),
 }
 
+struct HistoryPage {
+    snapshots: Vec<QuotaSnapshot>,      // the requested interval, oldest first, downsampled
+    earliest: Option<DateTime<Utc>>,    // start of the *stored* series, whatever was asked for
+    rollovers: Vec<WindowRollover>,     // boundaries over the same interval, never downsampled
+}
+
 struct AccountStatus { account: Account, windows: Vec<QuotaWindow>, last_poll: Option<PollEvent> }
 struct ProviderHealth { provider: ProviderId, accounts: Vec<AccountId>, consecutive_failures: u32, last_error: Option<String> }
 ```
+
+**Bounded `History`.** Nothing prunes `quota_snapshot`, so an unbounded `since` could exceed the 1 MiB frame cap. `until` bounds the far end; `max_points` downsamples each window's series independently. The daemon applies `MAX_HISTORY_POINTS` (2 000 per window) even when `max_points` is `None` — see [domain.md](domain.md).
+
+**`HistoryPage.rollovers` rides with the series rather than behind its own request.** The chart's boundary rules and the points they annotate describe one interval; two requests could straddle a poll and disagree about it. Rollovers are also the one thing in a page that must *not* be downsampled — `Storage::history` keeps the peak per bucket, which at the `7d` range is a ~21-minute smear, and a boundary read back off that could be placed anywhere inside it. Recording them at poll time and shipping them whole is what makes the instants exact. See [domain.md](domain.md#window-rollovers).
+
+**`HistoryPage.earliest` bounds a scroll, not a page.** A page that begins at its own `since` looks identical whether that is the start of the history or merely the start of the query, so a client scrolling a chart backwards through time cannot tell when to stop — it would have to probe blindly, one empty page at a time, and a gap in the history would look like the end of it. `earliest` is a separate `MIN(ts)` over the stored series for that account and window, unaffected by `since`, `until`, or `max_points`. With it a client clips the scroll to the data: the oldest point lands on the left edge and no further, and a history narrower than the visible range pins the view to the right edge, where it keeps following the clock.
 
 `AwaitUpdate` semantics: if the daemon's latest published `PollId` is already newer than `since`, respond `Update` immediately; otherwise wait for the next publish or reply `NoUpdate` at `timeout_ms`.
 
@@ -63,7 +81,7 @@ struct ProviderHealth { provider: ProviderId, accounts: Vec<AccountId>, consecut
 | --- | --- | --- |
 | Live dashboard, all accounts | on connect, then pushed | `Status` once, then loop on `AwaitUpdate { since }` |
 | Manual poll (selected account or all) | keypress | `PollNow` → `PollAccepted`; result arrives via next `AwaitUpdate` resolution |
-| History/sparkline for one window | keypress on a window | `History { account, window, since }` |
+| History/sparkline for one window | keypress on a window | `History { account, window, since, until, max_points }` → `HistoryPage` |
 | Recent activity / poll log | keypress | `RecentPolls { limit }` |
 | Provider/account health | on connect + on update | `Providers` |
 | Quit | keypress | close connection; daemon persists |

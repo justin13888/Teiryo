@@ -54,7 +54,8 @@ mod tests {
     use super::*;
     use crate::domain::*;
     use crate::error::ErrorKind;
-    use crate::protocol::wire::{AccountStatus, ProviderHealth, Request, Response};
+    use crate::protocol::wire::{AccountStatus, HistoryPage, ProviderHealth, Request, Response};
+    use crate::rollover::{RolloverKind, WindowRollover};
 
     fn sample_window() -> QuotaWindow {
         QuotaWindow {
@@ -108,6 +109,15 @@ mod tests {
                 account: AccountId::from("claude:personal"),
                 window: Some(WindowId::from("weekly_all")),
                 since: Utc::now(),
+                until: Some(Utc::now()),
+                max_points: Some(240),
+            },
+            Request::History {
+                account: AccountId::from("claude:personal"),
+                window: None,
+                since: Utc::now(),
+                until: None,
+                max_points: None,
             },
             Request::RecentPolls { limit: 50 },
             Request::Providers,
@@ -139,16 +149,35 @@ mod tests {
                 retry_after: Some(Duration::from_secs(60)),
             })),
             Response::NoUpdate,
-            Response::History(vec![QuotaSnapshot {
-                poll_id: PollId::generate(),
-                ts: Utc::now(),
-                window: WindowId::from("session_5h_opus"),
-                label: "Opus — 5 hour".into(),
-                unit: QuotaUnit::Percent,
-                used: 61.0,
-                limit: None,
-                reset_at: None,
-            }]),
+            Response::History(HistoryPage {
+                snapshots: vec![QuotaSnapshot {
+                    poll_id: PollId::generate(),
+                    ts: Utc::now(),
+                    window: WindowId::from("session_5h_opus"),
+                    label: "Opus — 5 hour".into(),
+                    unit: QuotaUnit::Percent,
+                    used: 61.0,
+                    limit: None,
+                    reset_at: None,
+                }],
+                earliest: Some(Utc::now()),
+                rollovers: vec![WindowRollover {
+                    account: AccountId::from("claude:personal"),
+                    window: WindowId::from("session_5h_opus"),
+                    poll: PollId::generate(),
+                    observed_at: Utc::now(),
+                    kind: RolloverKind::Early,
+                    prev_reset_at: Some(Utc::now()),
+                    new_reset_at: Some(Utc::now()),
+                    prev_used: 88.0,
+                    new_used: 1.0,
+                }],
+            }),
+            Response::History(HistoryPage {
+                snapshots: Vec::new(),
+                earliest: None,
+                rollovers: Vec::new(),
+            }),
             Response::RecentPolls(vec![
                 sample_event(PollOutcome::AuthError("token expired".into())),
                 sample_event(PollOutcome::NetworkError("connection refused".into())),

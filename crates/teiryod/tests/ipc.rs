@@ -226,12 +226,44 @@ fn full_ipc_roundtrip() {
                 account: stub_account().id,
                 window: None,
                 since: chrono::Utc::now() - chrono::Duration::hours(1),
+                until: None,
+                max_points: None,
             },
         )
         .await;
         match recv_response(&mut source).await {
-            Response::History(snapshots) => assert!(snapshots.len() >= 2),
+            Response::History(page) => {
+                assert!(page.snapshots.len() >= 2);
+                // The page also says where the whole series starts, which is
+                // what lets a client stop scrolling at the end of the data
+                // rather than probing for it.
+                let earliest = page.earliest.expect("stored snapshots have a start");
+                assert!(page.snapshots.iter().all(|s| s.ts >= earliest));
+            }
             other => panic!("expected History, got {other:?}"),
+        }
+
+        // The same query, downsampled: at most one point per window, and it
+        // must be the newest reading rather than an arbitrary bucket peak.
+        send_request(
+            &mut sink,
+            &Request::History {
+                account: stub_account().id,
+                window: Some(WindowId::from("session")),
+                since: chrono::Utc::now() - chrono::Duration::hours(1),
+                until: None,
+                max_points: Some(1),
+            },
+        )
+        .await;
+        match recv_response(&mut source).await {
+            Response::History(page) => {
+                assert_eq!(page.snapshots.len(), 1);
+                assert_eq!(page.snapshots[0].window, WindowId::from("session"));
+                // Downsampling bounds the page, never the reported extent.
+                assert!(page.earliest.is_some());
+            }
+            other => panic!("expected bounded History, got {other:?}"),
         }
         send_request(&mut sink, &Request::RecentPolls { limit: 10 }).await;
         match recv_response(&mut source).await {

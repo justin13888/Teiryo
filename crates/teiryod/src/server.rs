@@ -1,9 +1,10 @@
 //! IPC server: handshake-gated, length-delimited bincode frames over UDS.
 
+use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use teiryo_core::{
     decode_frame, encode_frame, framed, server_handshake, AccountId, ClientKind, ErrorKind,
-    PollEvent, PollId, PollTrigger, Request, Response,
+    HistoryPage, PollEvent, PollId, PollTrigger, Request, Response,
 };
 use tokio::net::{UnixListener, UnixStream};
 
@@ -76,10 +77,36 @@ async fn handle_request(request: Request, daemon: &Daemon) -> Response {
             account,
             window,
             since,
+            until,
+            max_points,
         } => {
             let st = daemon.state.borrow();
-            match st.storage.history(&account, window.as_ref(), since) {
-                Ok(snapshots) => Response::History(snapshots),
+            let page = st
+                .storage
+                .history(&account, window.as_ref(), since, until, max_points)
+                .and_then(|snapshots| {
+                    // Where the series starts is a property of the stored
+                    // history, not of the slice asked for, so it is queried
+                    // separately — a client scrolling back through time has no
+                    // other way to know when to stop.
+                    let earliest = st.storage.earliest_snapshot(&account, window.as_ref())?;
+                    // The same interval the series covers, resolving `until:
+                    // None` the way `history` already did, so the boundaries
+                    // and the points they annotate can never disagree.
+                    let rollovers = st.storage.rollovers(
+                        &account,
+                        window.as_ref(),
+                        since,
+                        until.unwrap_or_else(Utc::now),
+                    )?;
+                    Ok(HistoryPage {
+                        snapshots,
+                        earliest,
+                        rollovers,
+                    })
+                });
+            match page {
+                Ok(page) => Response::History(page),
                 Err(e) => Response::Err(ErrorKind::Storage, e.to_string()),
             }
         }

@@ -8,6 +8,7 @@ use crate::domain::{
     Account, AccountId, PollEvent, PollId, ProviderId, QuotaSnapshot, QuotaWindow, WindowId,
 };
 use crate::error::ErrorKind;
+use crate::rollover::WindowRollover;
 
 /// Client → daemon request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,6 +42,12 @@ pub enum Request {
         window: Option<WindowId>,
         /// Only snapshots at or after this instant.
         since: DateTime<Utc>,
+        /// Only snapshots at or before this instant; `None` means "now".
+        until: Option<DateTime<Utc>>,
+        /// Downsample each window's series to at most this many points.
+        /// `None` still applies the daemon's own cap — see
+        /// [`crate::storage::MAX_HISTORY_POINTS`].
+        max_points: Option<u32>,
     },
     /// The most recent poll events, newest first.
     RecentPolls {
@@ -69,7 +76,7 @@ pub enum Response {
     /// `AwaitUpdate` timed out with nothing new.
     NoUpdate,
     /// Reply to `History`.
-    History(Vec<QuotaSnapshot>),
+    History(HistoryPage),
     /// Reply to `RecentPolls`.
     RecentPolls(Vec<PollEvent>),
     /// Reply to `Providers`.
@@ -78,6 +85,31 @@ pub enum Response {
     Ack,
     /// Request failed.
     Err(ErrorKind, String),
+}
+
+/// One page of history: the slice that was asked for, plus where the stored
+/// series actually starts.
+///
+/// The slice alone can never say whether anything lies before it — a page that
+/// begins at its own `since` looks identical whether that is the start of the
+/// history or merely the start of the query — so a client scrolling backwards
+/// through time would have to probe blindly to find the far end. `earliest` is
+/// what lets it clamp the scroll to the data instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryPage {
+    /// Snapshots inside the requested interval, oldest first, downsampled to
+    /// the requested budget.
+    pub snapshots: Vec<QuotaSnapshot>,
+    /// Timestamp of the oldest snapshot stored for the queried account and
+    /// window, regardless of the interval asked for. `None` when the query
+    /// matches nothing at all.
+    pub earliest: Option<DateTime<Utc>>,
+    /// Window rollovers observed inside the same interval, oldest first.
+    ///
+    /// Carried here rather than behind their own request so a chart's
+    /// boundaries can never describe a different interval from its series.
+    /// Never downsampled — see [`crate::storage::Storage::rollovers`].
+    pub rollovers: Vec<WindowRollover>,
 }
 
 /// Live status of one account: its windows and the poll that produced them.

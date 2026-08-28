@@ -18,6 +18,13 @@ use crate::domain::{
 };
 use crate::rollover::{RolloverKind, WindowRollover};
 
+/// Hard ceiling on the points [`Storage::history`] returns *per window*,
+/// applied even when the caller asks for no downsampling. Nothing prunes the
+/// tables, so at the default 60 s cadence a series grows by ~1 440 points a
+/// day; without this cap a far-back `since` could produce a response too large
+/// for the 1 MiB frame limit.
+pub const MAX_HISTORY_POINTS: u32 = 2_000;
+
 /// Storage failure.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -70,6 +77,9 @@ CREATE TABLE IF NOT EXISTS window_rollover (
     PRIMARY KEY (poll_id, window_id)
 );
 CREATE INDEX IF NOT EXISTS idx_poll_lookup ON poll_event(provider, account_id, ts);
+-- Every history query filters on the account alone, which the index above
+-- cannot serve: `provider` leads it.
+CREATE INDEX IF NOT EXISTS idx_poll_account_ts ON poll_event(account_id, ts);
 CREATE INDEX IF NOT EXISTS idx_rollover_lookup
     ON window_rollover(account_id, window_id, observed_at);
 ";
@@ -286,21 +296,28 @@ impl Storage {
             .collect()
     }
 
-    /// Snapshots for one account (optionally one window) at or after `since`,
-    /// oldest first.
+    /// Snapshots for one account (optionally one window) within
+    /// `since..=until`, oldest first. `until` of `None` means "now".
+    ///
+    /// Each window's series is independently downsampled to at most
+    /// `max_points` (capped by [`MAX_HISTORY_POINTS`]) — see
+    /// [`downsample`] for why peaks rather than averages survive.
     pub fn history(
         &self,
         account: &AccountId,
         window: Option<&WindowId>,
         since: DateTime<Utc>,
+        until: Option<DateTime<Utc>>,
+        max_points: Option<u32>,
     ) -> Result<Vec<QuotaSnapshot>, StorageError> {
+        let until = until.unwrap_or_else(Utc::now);
         let mut sql = String::from(
             "SELECT s.poll_id, e.ts, s.window_id, s.label, s.unit, s.used, s.limit_val, s.reset_at
              FROM quota_snapshot s JOIN poll_event e ON e.id = s.poll_id
-             WHERE e.account_id = ?1 AND e.ts >= ?2",
+             WHERE e.account_id = ?1 AND e.ts >= ?2 AND e.ts <= ?3",
         );
         if window.is_some() {
-            sql.push_str(" AND s.window_id = ?3");
+            sql.push_str(" AND s.window_id = ?4");
         }
         sql.push_str(" ORDER BY e.ts ASC");
         let mut stmt = self.conn.prepare(&sql)?;
@@ -316,14 +333,16 @@ impl Storage {
                 row.get(7)?,
             ))
         };
+        let (from, to) = (ts_to_millis(since), ts_to_millis(until));
         let raw: Vec<_> = if let Some(w) = window {
-            stmt.query_map(params![account.0, ts_to_millis(since), w.0], map_row)?
+            stmt.query_map(params![account.0, from, to, w.0], map_row)?
                 .collect::<Result<_, _>>()?
         } else {
-            stmt.query_map(params![account.0, ts_to_millis(since)], map_row)?
+            stmt.query_map(params![account.0, from, to], map_row)?
                 .collect::<Result<_, _>>()?
         };
-        raw.into_iter()
+        let snapshots: Vec<QuotaSnapshot> = raw
+            .into_iter()
             .map(
                 |(poll_id, ts, window_id, label, unit, used, limit, reset_at)| {
                     Ok(QuotaSnapshot {
@@ -338,7 +357,40 @@ impl Storage {
                     })
                 },
             )
-            .collect()
+            .collect::<Result<_, StorageError>>()?;
+        let budget = max_points
+            .unwrap_or(MAX_HISTORY_POINTS)
+            .clamp(1, MAX_HISTORY_POINTS);
+        Ok(downsample(snapshots, since, until, budget))
+    }
+
+    /// When the oldest stored snapshot for `account` was taken, optionally
+    /// restricted to one window.
+    ///
+    /// Answers "how far back does this series reach?" without reading the
+    /// series: a client panning through time needs the far end, and finding it
+    /// by widening a [`Storage::history`] query would mean fetching everything
+    /// just to learn where to stop.
+    pub fn earliest_snapshot(
+        &self,
+        account: &AccountId,
+        window: Option<&WindowId>,
+    ) -> Result<Option<DateTime<Utc>>, StorageError> {
+        let mut sql = String::from(
+            "SELECT MIN(e.ts) FROM quota_snapshot s JOIN poll_event e ON e.id = s.poll_id
+             WHERE e.account_id = ?1",
+        );
+        if window.is_some() {
+            sql.push_str(" AND s.window_id = ?2");
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        // `MIN` over no rows is one NULL row, not zero rows, so this always
+        // yields exactly one value to unwrap.
+        let millis: Option<i64> = match window {
+            Some(w) => stmt.query_row(params![account.0, w.0], |row| row.get(0))?,
+            None => stmt.query_row(params![account.0], |row| row.get(0))?,
+        };
+        Ok(millis.map(millis_to_ts))
     }
 
     /// The most recent poll events across all accounts, newest first.
@@ -390,6 +442,80 @@ fn parse_poll_id(s: &str) -> Result<PollId, StorageError> {
     s.parse::<ulid::Ulid>()
         .map(PollId)
         .map_err(|e| StorageError::Corrupt(format!("bad poll id {s:?}: {e}")))
+}
+
+/// Reduce each window's series in `snapshots` to at most `budget` points.
+///
+/// Windows are reduced independently, so a multi-window query keeps every
+/// series intact rather than interleaving them into one budget. Input and
+/// output are both oldest-first.
+fn downsample(
+    snapshots: Vec<QuotaSnapshot>,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    budget: u32,
+) -> Vec<QuotaSnapshot> {
+    let span = (until - since).num_milliseconds();
+    if span <= 0 {
+        return snapshots;
+    }
+    // Group by window, first-seen order, so output is deterministic without
+    // needing a hash map — providers expose a handful of windows at most.
+    let mut series: Vec<(WindowId, Vec<QuotaSnapshot>)> = Vec::new();
+    for snapshot in snapshots {
+        match series.iter_mut().find(|(id, _)| *id == snapshot.window) {
+            Some((_, rows)) => rows.push(snapshot),
+            None => series.push((snapshot.window.clone(), vec![snapshot])),
+        }
+    }
+    let mut out = Vec::new();
+    for (_, rows) in series {
+        out.extend(reduce_series(rows, since, span, budget));
+    }
+    out.sort_by_key(|s| s.ts);
+    out
+}
+
+/// Reduce one window's oldest-first series to at most `budget` points.
+///
+/// `since..since + span` is cut into `budget` equal buckets and the row with
+/// the **highest** `used` in each survives. Peaks rather than averages,
+/// because a quota chart exists to show how close to the cap you came —
+/// averaging would smooth away exactly the spike worth seeing. The final
+/// bucket yields its newest row instead of its peak, so the series always
+/// ends on the true current reading.
+fn reduce_series(
+    rows: Vec<QuotaSnapshot>,
+    since: DateTime<Utc>,
+    span: i64,
+    budget: u32,
+) -> Vec<QuotaSnapshot> {
+    if rows.len() <= budget as usize {
+        return rows;
+    }
+    let bucket_of = |snapshot: &QuotaSnapshot| -> i128 {
+        let offset = (snapshot.ts - since).num_milliseconds().max(0);
+        (i128::from(offset) * i128::from(budget) / i128::from(span)).min(i128::from(budget) - 1)
+    };
+    let mut picks = Vec::with_capacity(budget as usize);
+    let mut current: Option<i128> = None;
+    let mut peak = 0usize;
+    for (i, row) in rows.iter().enumerate() {
+        let bucket = bucket_of(row);
+        if current != Some(bucket) {
+            if current.is_some() {
+                picks.push(rows[peak].clone());
+            }
+            current = Some(bucket);
+            peak = i;
+        } else if row.used > rows[peak].used {
+            peak = i;
+        }
+    }
+    if current.is_some() {
+        picks.push(rows[rows.len() - 1].clone());
+    }
+    picks
 }
 
 type EventRow = (String, i64, String, String, String, String, u32);
@@ -595,10 +721,18 @@ mod tests {
 
         // History: both windows, then filtered to one.
         let since = Utc::now() - chrono::Duration::hours(1);
-        let all = storage.history(&account().id, None, since).unwrap();
+        let all = storage
+            .history(&account().id, None, since, None, None)
+            .unwrap();
         assert_eq!(all.len(), 2);
         let one = storage
-            .history(&account().id, Some(&WindowId::from("weekly")), since)
+            .history(
+                &account().id,
+                Some(&WindowId::from("weekly")),
+                since,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].used, 12.5);
@@ -648,5 +782,156 @@ mod tests {
         assert_eq!(reopened.accounts().unwrap().len(), 1);
         assert_eq!(reopened.recent_polls(5).unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Build a synthetic series for `window` at one-minute spacing.
+    fn snapshots(window: &str, start: DateTime<Utc>, used: &[f64]) -> Vec<QuotaSnapshot> {
+        used.iter()
+            .enumerate()
+            .map(|(i, &used)| QuotaSnapshot {
+                poll_id: PollId::generate(),
+                ts: start + chrono::Duration::minutes(i as i64),
+                window: WindowId::from(window),
+                label: window.to_owned(),
+                unit: QuotaUnit::Percent,
+                used,
+                limit: Some(100.0),
+                reset_at: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn downsample_keeps_peaks_and_the_newest_point() {
+        let start = Utc::now() - chrono::Duration::minutes(60);
+        let until = start + chrono::Duration::minutes(59);
+        let mut used: Vec<f64> = (0..60).map(|i| f64::from(i % 10)).collect();
+        used[17] = 99.0; // a spike an averaging reducer would erase
+        let series = snapshots("w", start, &used);
+        let newest = series.last().unwrap().clone();
+
+        let out = downsample(series, start, until, 6);
+
+        assert!(out.len() <= 6, "budget exceeded: {}", out.len());
+        assert!(out.iter().any(|s| s.used == 99.0), "peak was lost");
+        let last = out.last().unwrap();
+        assert_eq!(last.ts, newest.ts, "series must end on the current reading");
+        assert_eq!(last.used, newest.used);
+        assert!(
+            out.windows(2).all(|w| w[0].ts <= w[1].ts),
+            "not oldest-first"
+        );
+    }
+
+    #[test]
+    fn downsample_reduces_each_window_independently() {
+        let start = Utc::now() - chrono::Duration::minutes(40);
+        let until = start + chrono::Duration::minutes(39);
+        let mut series = snapshots("session_5h", start, &vec![10.0; 40]);
+        series.extend(snapshots("weekly", start, &vec![20.0; 40]));
+
+        let out = downsample(series, start, until, 4);
+
+        for id in ["session_5h", "weekly"] {
+            let kept = out.iter().filter(|s| s.window.0 == id).count();
+            assert!(kept > 0 && kept <= 4, "{id} kept {kept}");
+        }
+    }
+
+    #[test]
+    fn short_series_pass_through_untouched() {
+        let start = Utc::now() - chrono::Duration::minutes(3);
+        let series = snapshots("w", start, &[1.0, 2.0, 3.0]);
+        let out = downsample(series.clone(), start, Utc::now(), 100);
+        assert_eq!(out.len(), series.len());
+    }
+
+    #[test]
+    fn history_honors_until_and_max_points() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        storage.upsert_account(&account()).unwrap();
+        for used in [10.0, 20.0, 30.0] {
+            let windows = vec![window("session_5h", used)];
+            let e = event(PollOutcome::Success {
+                windows: windows.clone(),
+            });
+            storage.record_poll(&e, &windows, &[]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let since = Utc::now() - chrono::Duration::hours(1);
+
+        // `until` in the past excludes everything recorded just now.
+        let excluded = storage
+            .history(
+                &account().id,
+                None,
+                since,
+                Some(Utc::now() - chrono::Duration::minutes(30)),
+                None,
+            )
+            .unwrap();
+        assert!(excluded.is_empty());
+
+        // A max_points of 1 still returns the newest reading.
+        let capped = storage
+            .history(&account().id, None, since, None, Some(1))
+            .unwrap();
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].used, 30.0);
+    }
+
+    /// The extent is a property of the stored series, not of any query:
+    /// a client that panned a chart back would otherwise have to fetch
+    /// everything just to learn where the data stops.
+    #[test]
+    fn earliest_snapshot_reports_the_start_of_each_series() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        storage.upsert_account(&account()).unwrap();
+        assert_eq!(
+            storage.earliest_snapshot(&account().id, None).unwrap(),
+            None,
+            "nothing recorded has no beginning"
+        );
+
+        // The 5h window starts first; the weekly one appears a poll later.
+        let first = vec![window("session_5h", 10.0)];
+        let e = event(PollOutcome::Success {
+            windows: first.clone(),
+        });
+        storage.record_poll(&e, &first, &[]).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        let both = vec![window("session_5h", 20.0), window("weekly", 5.0)];
+        let e = event(PollOutcome::Success {
+            windows: both.clone(),
+        });
+        storage.record_poll(&e, &both, &[]).unwrap();
+
+        let account_start = storage
+            .earliest_snapshot(&account().id, None)
+            .unwrap()
+            .expect("two polls recorded");
+        let weekly_start = storage
+            .earliest_snapshot(&account().id, Some(&WindowId::from("weekly")))
+            .unwrap()
+            .expect("the weekly window was recorded once");
+        assert!(
+            weekly_start > account_start,
+            "a window that started later has its own, later start"
+        );
+
+        // A window that was never recorded, and an account that does not
+        // exist, both simply have no history rather than erroring.
+        assert_eq!(
+            storage
+                .earliest_snapshot(&account().id, Some(&WindowId::from("nope")))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            storage
+                .earliest_snapshot(&AccountId::from("claude:other"), None)
+                .unwrap(),
+            None
+        );
     }
 }
