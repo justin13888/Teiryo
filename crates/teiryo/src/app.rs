@@ -207,8 +207,8 @@ impl App {
                     let win = &status.windows[wi];
                     Action::OpenHistory {
                         account: status.account.id.clone(),
-                        window: win.id.clone(),
-                        title: format!("{} — {}", status.account.label, win.label),
+                        window: win.window.id.clone(),
+                        title: format!("{} — {}", status.account.label, win.window.label),
                     }
                 }
                 _ => Action::None,
@@ -225,7 +225,7 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     use teiryo_core::domain::{QuotaUnit, QuotaWindow, ResetKind, WindowScope};
-    use teiryo_core::Account;
+    use teiryo_core::{Account, BarStyle, RenderHint, WindowView};
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -251,7 +251,19 @@ mod tests {
                 provider: provider.into(),
                 label: label.into(),
             },
-            windows: (0..windows).map(|i| window(&format!("w{i}"))).collect(),
+            windows: (0..windows)
+                .map(|i| WindowView {
+                    window: window(&format!("w{i}")),
+                    hint: RenderHint {
+                        style: BarStyle::Percent,
+                        warn_threshold: 0.8,
+                        critical_threshold: 0.95,
+                        note: None,
+                    },
+                })
+                .collect(),
+            last_success: None,
+            poll_interval_secs: 60,
             last_poll: None,
         }
     }

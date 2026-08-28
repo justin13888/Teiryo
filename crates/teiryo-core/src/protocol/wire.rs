@@ -4,6 +4,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::adapter::RenderHint;
 use crate::domain::{
     Account, AccountId, PollEvent, PollId, ProviderId, QuotaSnapshot, QuotaWindow, WindowId,
 };
@@ -112,15 +113,32 @@ pub struct HistoryPage {
     pub rollovers: Vec<WindowRollover>,
 }
 
+/// One quota window paired with the provider's rendering rules for it.
+/// Bundling them keeps the two from drifting apart the way parallel `Vec`s
+/// would, and keeps the TUI free of provider-specific thresholds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowView {
+    /// The window's current reading.
+    pub window: QuotaWindow,
+    /// How the provider wants it drawn.
+    pub hint: RenderHint,
+}
+
 /// Live status of one account: its windows and the poll that produced them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountStatus {
     /// The account.
     pub account: Account,
-    /// Latest known windows for the account.
-    pub windows: Vec<QuotaWindow>,
-    /// The poll those windows came from, if any poll has completed yet.
+    /// Latest known windows for the account, each with its render hint.
+    pub windows: Vec<WindowView>,
+    /// The most recent poll of any outcome, which may be a failure.
     pub last_poll: Option<PollEvent>,
+    /// When the *successful* poll backing `windows` completed. Distinct from
+    /// `last_poll.ts`: a later failure leaves the windows stale but valid, and
+    /// only this field says how stale.
+    pub last_success: Option<DateTime<Utc>>,
+    /// Scheduler cadence for this account. Actual polls jitter ±10% around it.
+    pub poll_interval_secs: u32,
 }
 
 /// Health of one provider across its accounts.

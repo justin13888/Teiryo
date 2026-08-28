@@ -417,10 +417,48 @@ impl Storage {
 
     /// The most recent poll event for one account, if any.
     pub fn latest_poll_for(&self, account: &AccountId) -> Result<Option<PollEvent>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, ts, provider, account_id, trigger, outcome, latency_ms
-             FROM poll_event WHERE account_id = ?1 ORDER BY id DESC LIMIT 1",
+        self.latest_event(account, "")
+    }
+
+    /// The most recent *successful* poll event for one account, if any.
+    ///
+    /// This is what a restarting daemon serves as `Status` until its own
+    /// first poll lands: without it an account whose next poll is rate
+    /// limited would report zero windows despite a database full of history.
+    pub fn latest_success_for(
+        &self,
+        account: &AccountId,
+    ) -> Result<Option<PollEvent>, StorageError> {
+        self.latest_event(account, " AND error IS NULL")
+    }
+
+    /// Failed polls since the last success — the `consecutive_failures`
+    /// counter, recomputed after a restart. Poll ids are ULIDs, so id order
+    /// is time order and the last success can be used as the cut-off.
+    pub fn consecutive_failures_for(&self, account: &AccountId) -> Result<u32, StorageError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM poll_event
+             WHERE account_id = ?1 AND error IS NOT NULL
+               AND id > COALESCE(
+                   (SELECT MAX(id) FROM poll_event
+                    WHERE account_id = ?1 AND error IS NULL), '')",
+            params![account.0],
+            |row| row.get(0),
         )?;
+        Ok(count.clamp(0, i64::from(u32::MAX)) as u32)
+    }
+
+    /// Newest poll event for `account` matching an optional extra predicate.
+    fn latest_event(
+        &self,
+        account: &AccountId,
+        extra_where: &str,
+    ) -> Result<Option<PollEvent>, StorageError> {
+        let sql = format!(
+            "SELECT id, ts, provider, account_id, trigger, outcome, latency_ms
+             FROM poll_event WHERE account_id = ?1{extra_where} ORDER BY id DESC LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let raw = stmt
             .query_row(params![account.0], |row| {
                 Ok((
@@ -753,6 +791,50 @@ mod tests {
             .latest_poll_for(&AccountId::from("nope"))
             .unwrap()
             .is_none());
+    }
+
+    /// A restarting daemon rebuilds its caches from these two queries, so the
+    /// last success has to survive any number of failures stacked on top.
+    #[test]
+    fn latest_success_survives_later_failures() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        storage.upsert_account(&account()).unwrap();
+        let id = account().id;
+        assert!(storage.latest_success_for(&id).unwrap().is_none());
+        assert_eq!(storage.consecutive_failures_for(&id).unwrap(), 0);
+
+        let windows = vec![window("session_5h", 40.0)];
+        let ok = event(PollOutcome::Success {
+            windows: windows.clone(),
+        });
+        storage.record_poll(&ok, &windows, &[]).unwrap();
+        // ULID ordering is only guaranteed across distinct milliseconds.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        for _ in 0..3 {
+            storage
+                .record_poll(
+                    &event(PollOutcome::RateLimited { retry_after: None }),
+                    &[],
+                    &[],
+                )
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let restored = storage.latest_success_for(&id).unwrap().unwrap();
+        assert_eq!(restored.id, ok.id);
+        assert_eq!(restored.outcome, ok.outcome);
+        assert_eq!(storage.consecutive_failures_for(&id).unwrap(), 3);
+
+        // A fresh success resets the counter.
+        storage.record_poll(&ok2(&windows), &windows, &[]).unwrap();
+        assert_eq!(storage.consecutive_failures_for(&id).unwrap(), 0);
+    }
+
+    fn ok2(windows: &[QuotaWindow]) -> PollEvent {
+        event(PollOutcome::Success {
+            windows: windows.to_vec(),
+        })
     }
 
     #[test]

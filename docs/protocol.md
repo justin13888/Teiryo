@@ -19,7 +19,7 @@ A hand-decoded, **never-changing** preamble runs before any bincode bytes:
 
 ```rust
 // First 6 bytes on every connection, raw — not bincode, so it can never itself go stale
-struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 2 */ }
+struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 3 */ }
 ```
 
 - Client sends the 6-byte Hello. Daemon replies with **one raw byte**: `0x00` accepted, `0x01` version mismatch — then closes the connection on mismatch without ever attempting to decode a `Request`.
@@ -63,9 +63,21 @@ struct HistoryPage {
     rollovers: Vec<WindowRollover>,     // boundaries over the same interval, never downsampled
 }
 
-struct AccountStatus { account: Account, windows: Vec<QuotaWindow>, last_poll: Option<PollEvent> }
+struct WindowView { window: QuotaWindow, hint: RenderHint }
+
+struct AccountStatus {
+    account: Account,
+    windows: Vec<WindowView>,
+    last_poll: Option<PollEvent>,       // any outcome, may be a failure
+    last_success: Option<DateTime<Utc>>, // when the poll backing `windows` completed
+    poll_interval_secs: u32,             // cadence in force now; jitters ±10%
+}
 struct ProviderHealth { provider: ProviderId, accounts: Vec<AccountId>, consecutive_failures: u32, last_error: Option<String> }
 ```
+
+**Windows carry their render hint.** `WindowView` pairs each `QuotaWindow` with the `RenderHint` its adapter produced, so warn/critical thresholds and the provider caveat (`"blocks entirely at cap"` vs. `"auto-downgrades, doesn't block"`) reach the client instead of being hardcoded there. Pairing them in one struct rather than parallel `Vec`s makes it impossible for the two to drift apart. See [providers.md](providers.md).
+
+**`last_poll` vs. `last_success`.** `windows` is served from the latest *successful* poll while `last_poll` is the latest poll of any outcome. After a failure the two diverge, and only `last_success` says how stale the displayed windows are — a client that reports staleness from `last_poll` would claim fresh data it does not have.
 
 **Bounded `History`.** Nothing prunes `quota_snapshot`, so an unbounded `since` could exceed the 1 MiB frame cap. `until` bounds the far end; `max_points` downsamples each window's series independently. The daemon applies `MAX_HISTORY_POINTS` (2 000 per window) even when `max_points` is `None` — see [domain.md](domain.md).
 

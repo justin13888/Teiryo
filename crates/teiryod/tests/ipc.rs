@@ -77,7 +77,7 @@ impl WindowPresenter for StubAdapter {
             style: BarStyle::Percent,
             warn_threshold: 0.8,
             critical_threshold: 0.95,
-            note: None,
+            note: Some("stub caveat".into()),
         }
     }
     fn group_order(&self) -> &[WindowId] {
@@ -166,8 +166,19 @@ fn full_ipc_roundtrip() {
             Response::Status(statuses) => {
                 assert_eq!(statuses.len(), 1);
                 assert_eq!(statuses[0].account, stub_account());
-                assert_eq!(statuses[0].windows, vec![stub_window()]);
+                assert_eq!(statuses[0].windows.len(), 1);
+                assert_eq!(statuses[0].windows[0].window, stub_window());
+                // The adapter's render hint reaches the client intact.
+                assert_eq!(
+                    statuses[0].windows[0].hint.note.as_deref(),
+                    Some("stub caveat")
+                );
+                assert_eq!(statuses[0].windows[0].hint.critical_threshold, 0.95);
                 assert_eq!(statuses[0].last_poll.as_ref().unwrap().id, startup.id);
+                // The successful poll backing those windows is timestamped
+                // separately from `last_poll`, and the cadence is exposed.
+                assert_eq!(statuses[0].last_success, Some(startup.ts));
+                assert_eq!(statuses[0].poll_interval_secs, 3600);
             }
             other => panic!("expected Status, got {other:?}"),
         }

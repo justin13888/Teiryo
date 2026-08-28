@@ -179,6 +179,8 @@ mod tests {
                 outcome: PollOutcome::Success { windows: vec![] },
                 latency_ms: 1,
             }),
+            last_success: None,
+            poll_interval_secs: 60,
         }
     }
 

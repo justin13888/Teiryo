@@ -145,7 +145,7 @@ fn render_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
             RowRef {
                 window: Some(wi), ..
             } => {
-                let window = &status.windows[*wi];
+                let window = &status.windows[*wi].window;
                 let mut spans = vec![Span::raw("  ")];
                 match utilization(window) {
                     Some(ratio) => {

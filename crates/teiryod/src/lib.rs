@@ -55,6 +55,16 @@ pub async fn run(
                     .entry((provider.clone(), account.id.clone()))
                     .or_default();
             }
+            // Serve what the last run already learned about this account
+            // while the first poll of this run is still in flight.
+            daemon.hydrate_account(&account);
+            {
+                let mut st = daemon.state.borrow_mut();
+                // Kept for its `WindowPresenter` impl: `Status` attaches each
+                // window's render hint so the TUI never hardcodes thresholds.
+                st.presenters.insert(provider.clone(), adapter.clone());
+                st.poll_intervals.insert(account.id.clone(), interval);
+            }
             let tx = scheduler::spawn_poller(&daemon, adapter.clone(), account.clone(), interval);
             daemon
                 .state

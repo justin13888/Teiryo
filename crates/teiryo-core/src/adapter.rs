@@ -6,6 +6,7 @@ use std::fmt;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::{Account, ProviderId, QuotaWindow, WindowId};
 use crate::error::{AuthError, ParseError, ProbeError};
@@ -84,8 +85,10 @@ pub trait ProviderAdapter: Authenticator + Prober + QuotaParser + WindowPresente
     fn id(&self) -> ProviderId;
 }
 
-/// How the TUI should draw a quota window.
-#[derive(Debug, Clone, PartialEq)]
+/// How the TUI should draw a quota window. Crosses the wire inside
+/// [`crate::protocol::wire::WindowView`], so the TUI never hardcodes
+/// provider-specific thresholds or caveats.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RenderHint {
     /// Gauge style.
     pub style: BarStyle,
@@ -98,7 +101,7 @@ pub struct RenderHint {
 }
 
 /// Gauge style for a quota window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BarStyle {
     /// Percentage bar (limit unpublished).
     Percent,

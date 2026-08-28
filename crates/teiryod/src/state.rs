@@ -3,10 +3,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use teiryo_core::{
-    rollover, Account, AccountId, AccountStatus, PollEvent, PollOutcome, PollTrigger,
-    ProviderHealth, ProviderId, QuotaWindow, Storage,
+    rollover, Account, AccountId, AccountStatus, BarStyle, PollEvent, PollOutcome, PollTrigger,
+    ProviderAdapter, ProviderHealth, ProviderId, QuotaWindow, RenderHint, Storage, WindowView,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -34,6 +35,30 @@ pub struct SharedState {
     pub health: HashMap<(ProviderId, AccountId), AccountHealth>,
     /// Manual-trigger senders into each poll task.
     pub pollers: HashMap<(ProviderId, AccountId), mpsc::UnboundedSender<PollTrigger>>,
+    /// Effective scheduler cadence per account, so clients can show how long
+    /// until the next poll without knowing the daemon's config.
+    pub poll_intervals: HashMap<AccountId, Duration>,
+    /// Adapters kept for their [`teiryo_core::WindowPresenter`] impl: `Status`
+    /// attaches each window's render hint so the TUI never hardcodes
+    /// provider-specific thresholds.
+    pub presenters: HashMap<ProviderId, Rc<dyn ProviderAdapter>>,
+}
+
+/// Cadence in whole seconds. `0` means "no next poll to expect", which is
+/// what a client needs to draw no countdown.
+fn interval_secs(interval: Option<&Duration>) -> u32 {
+    interval.map_or(0, |d| d.as_secs().min(u64::from(u32::MAX)) as u32)
+}
+
+/// Fallback for an account whose adapter is not registered — it cannot happen
+/// for a scheduled account, but `Status` must still render something sane.
+fn default_hint() -> RenderHint {
+    RenderHint {
+        style: BarStyle::Percent,
+        warn_threshold: 0.8,
+        critical_threshold: 0.95,
+        note: None,
+    }
 }
 
 /// The windows a previous poll reported, or none when it was a failure — a
@@ -70,6 +95,8 @@ impl Daemon {
                 latest_success: HashMap::new(),
                 health: HashMap::new(),
                 pollers: HashMap::new(),
+                poll_intervals: HashMap::new(),
+                presenters: HashMap::new(),
             })),
             watch_tx,
             shutdown_tx,
@@ -124,6 +151,55 @@ impl Daemon {
         self.watch_tx.send_replace(Some(event.clone()));
     }
 
+    /// Reload an account's last poll, last success, and health counters from
+    /// storage.
+    ///
+    /// The caches this fills are in-memory only, so without it a freshly
+    /// started daemon serves an empty `Status` — no windows, nothing for the
+    /// TUI to select, and therefore an empty trend chart — until its own
+    /// first poll *succeeds*. That can be a long wait when the provider is
+    /// rate limiting, even though the history is already on disk.
+    pub fn hydrate_account(&self, account: &Account) {
+        let mut st = self.state.borrow_mut();
+        match st.storage.latest_poll_for(&account.id) {
+            Ok(Some(event)) => {
+                st.latest_poll.insert(account.id.clone(), event);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(account = %account.id, error = %e, "failed to restore last poll")
+            }
+        }
+        match st.storage.latest_success_for(&account.id) {
+            Ok(Some(event)) => {
+                st.latest_success.insert(account.id.clone(), event);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(account = %account.id, error = %e, "failed to restore last success")
+            }
+        }
+        let failures = match st.storage.consecutive_failures_for(&account.id) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(account = %account.id, error = %e, "failed to restore failure count");
+                0
+            }
+        };
+        // Keep the error message and the counter agreeing: both describe the
+        // stretch of failures since the last success, or neither is set.
+        let last_error = st
+            .latest_poll
+            .get(&account.id)
+            .and_then(|e| e.outcome.error_message().map(str::to_owned));
+        let health = st
+            .health
+            .entry((account.provider.clone(), account.id.clone()))
+            .or_default();
+        health.consecutive_failures = failures;
+        health.last_error = last_error;
+    }
+
     /// Assemble `Status` payload, optionally filtered.
     pub fn status(
         &self,
@@ -136,14 +212,25 @@ impl Daemon {
             .filter(|a| provider.is_none_or(|p| &a.provider == p))
             .filter(|a| account.is_none_or(|id| &a.id == id))
             .map(|a| {
-                let windows = match st.latest_success.get(&a.id).map(|e| &e.outcome) {
-                    Some(PollOutcome::Success { windows }) => windows.clone(),
+                let success = st.latest_success.get(&a.id);
+                let presenter = st.presenters.get(&a.provider);
+                let windows = match success.map(|e| &e.outcome) {
+                    Some(PollOutcome::Success { windows }) => windows
+                        .iter()
+                        .map(|window| WindowView {
+                            hint: presenter
+                                .map_or_else(default_hint, |adapter| adapter.render_hint(window)),
+                            window: window.clone(),
+                        })
+                        .collect(),
                     _ => Vec::new(),
                 };
                 AccountStatus {
                     account: a.clone(),
                     windows,
                     last_poll: st.latest_poll.get(&a.id).cloned(),
+                    last_success: success.map(|e| e.ts),
+                    poll_interval_secs: interval_secs(st.poll_intervals.get(&a.id)),
                 }
             })
             .collect()

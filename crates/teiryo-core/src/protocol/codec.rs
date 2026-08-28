@@ -52,9 +52,12 @@ mod tests {
     use futures::{SinkExt, StreamExt};
 
     use super::*;
+    use crate::adapter::{BarStyle, RenderHint};
     use crate::domain::*;
     use crate::error::ErrorKind;
-    use crate::protocol::wire::{AccountStatus, HistoryPage, ProviderHealth, Request, Response};
+    use crate::protocol::wire::{
+        AccountStatus, HistoryPage, ProviderHealth, Request, Response, WindowView,
+    };
     use crate::rollover::{RolloverKind, WindowRollover};
 
     fn sample_window() -> QuotaWindow {
@@ -137,10 +140,20 @@ mod tests {
                     provider: "claude".into(),
                     label: "personal".into(),
                 },
-                windows: vec![sample_window()],
+                windows: vec![WindowView {
+                    window: sample_window(),
+                    hint: RenderHint {
+                        style: BarStyle::Percent,
+                        warn_threshold: 0.8,
+                        critical_threshold: 0.95,
+                        note: Some("blocks entirely at cap".into()),
+                    },
+                }],
                 last_poll: Some(sample_event(PollOutcome::Success {
                     windows: vec![sample_window()],
                 })),
+                last_success: Some(Utc::now()),
+                poll_interval_secs: 60,
             }]),
             Response::PollAccepted {
                 poll_id: PollId::generate(),

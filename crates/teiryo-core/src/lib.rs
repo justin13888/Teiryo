@@ -26,7 +26,9 @@ pub use protocol::codec::{
 pub use protocol::handshake::{
     client_handshake, server_handshake, Hello, PROTOCOL_MAGIC, PROTOCOL_VERSION,
 };
-pub use protocol::wire::{AccountStatus, HistoryPage, ProviderHealth, Request, Response};
+pub use protocol::wire::{
+    AccountStatus, HistoryPage, ProviderHealth, Request, Response, WindowView,
+};
 pub use rollover::{RolloverKind, WindowRollover, RESET_TOLERANCE};
 pub use storage::{Storage, StorageError, MAX_HISTORY_POINTS};
 
