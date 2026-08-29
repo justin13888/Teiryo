@@ -40,3 +40,170 @@ run = "cargo run -p teiryod"
 description = "Run the teiryo TUI"
 # teiryod must be built first: the TUI spawns it as a sibling of its own binary.
 run = ["cargo build -p teiryod", "cargo run -p teiryo"]
+
+[tasks.install]
+description = "Install teiryo and teiryod, then restart the daemon"
+# Both crates, always, into one directory: the TUI spawns `teiryod` from its own
+# directory before falling back to $PATH, so installing the TUI alone leaves it
+# unable to start its daemon. teiryod goes first, so the TUI is never present
+# without it. A shared --target-dir lets the second build reuse the first's
+# artifacts instead of recompiling the dependency graph (bundled SQLite
+# included) from scratch; --force is required because the version is pinned, so
+# reinstalling the same version is the normal case.
+run = [
+  "cargo install --path crates/teiryod --locked --force --target-dir target",
+  "cargo install --path crates/teiryo --locked --force --target-dir target",
+  '''
+set -eu
+
+# Explicit, because the fallback is worse than failing: without pgrep we cannot
+# tell a running daemon from none, would skip the restart below, and would then
+# accept the *old* daemon as proof that the new one works.
+for tool in pgrep pkill; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "install: $tool is required to restart the daemon" >&2
+    exit 1
+  fi
+done
+
+realdir() { CDPATH= cd -- "$1" && pwd -P; }
+
+bin_dir="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin"
+for binary in teiryo teiryod; do
+  if ! command -v "$binary" >/dev/null 2>&1; then
+    echo "install: $binary is installed but not on PATH — add $bin_dir to PATH" >&2
+    exit 1
+  fi
+done
+
+tui_dir=$(realdir "$(dirname "$(command -v teiryo)")")
+daemon_dir=$(realdir "$(dirname "$(command -v teiryod)")")
+if [ "$tui_dir" != "$daemon_dir" ]; then
+  echo "install: teiryo ($tui_dir) and teiryod ($daemon_dir) are not in the same directory" >&2
+  echo "install: the TUI looks for teiryod next to itself; remove whichever is stale" >&2
+  exit 1
+fi
+if [ "$tui_dir" != "$(realdir "$bin_dir")" ]; then
+  echo "install: PATH resolves teiryo to $tui_dir, shadowing what was just installed in $bin_dir" >&2
+  exit 1
+fi
+
+uid=$(id -u)
+daemon="$daemon_dir/teiryod"
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+  sock="$XDG_RUNTIME_DIR/teiryo.sock"
+else
+  sock="/tmp/teiryo-$uid.sock"
+fi
+
+# An open TUI respawns the daemon within a second of losing it, using whichever
+# build that TUI came from. It races the restart below, and being the older
+# build it then fails its own handshake against the daemon it just spawned.
+if pgrep -x -u "$uid" teiryo >/dev/null 2>&1; then
+  echo "install: a teiryo TUI is running; quit and relaunch it once this finishes" >&2
+fi
+
+# The TUI spawns the daemon and drops the handle without ever waiting on it, so
+# a daemon it outlives lingers as a zombie until the TUI itself exits. Zombies
+# answer pgrep but hold no socket, and counting one would stall every stop below
+# on a process that cannot exit.
+live_daemon_pids() {
+  for pid in $(pgrep -x -u "$uid" teiryod 2>/dev/null || true); do
+    state=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d " \t\n" || true)
+    case "$state" in
+      Z* | "") ;;
+      *) echo "$pid" ;;
+    esac
+  done
+}
+
+# "Some teiryod is alive" is not the question — the stale one and the installed
+# one are both that. Ask which binary it is, wherever the OS will say.
+if [ -r "/proc/$$/exe" ]; then introspect=1; else introspect=0; fi
+installed_daemon_running() {
+  pids=$(live_daemon_pids)
+  if [ -z "$pids" ]; then
+    return 1
+  fi
+  if [ "$introspect" = 0 ]; then
+    return 0
+  fi
+  want=$(readlink -f "$daemon")
+  for pid in $pids; do
+    if [ "$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)" = "$want" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# A daemon outlives the TUI, and the two ship together with no protocol
+# compatibility: left running across an upgrade, the old one keeps the socket
+# and the new TUI dies at the handshake.
+if [ -n "$(live_daemon_pids)" ]; then
+  echo "install: stopping the running teiryod"
+  pkill -TERM -x -u "$uid" teiryod || true
+  waited=0
+  while [ -n "$(live_daemon_pids)" ]; do
+    waited=$((waited + 1))
+    if [ "$waited" -gt 50 ]; then
+      pkill -KILL -x -u "$uid" teiryod || true
+      break
+    fi
+    sleep 0.1
+  done
+fi
+
+# Nothing of ours should hold the socket now, so a file still sitting there is
+# debris from a crash or from the SIGKILL above. Clearing it is what makes the
+# file reappearing below proof that the new daemon bound, rather than something
+# the old one left behind.
+rm -f "$sock"
+
+# teiryod does not detach itself — the TUI is what normally puts it in its own
+# process group — so the task has to.
+if command -v setsid >/dev/null 2>&1; then
+  setsid "$daemon" </dev/null >/dev/null 2>&1 &
+else
+  nohup "$daemon" </dev/null >/dev/null 2>&1 &
+fi
+
+# Both conditions, because either alone accepts what it should not: the socket
+# file can outlive a crashed daemon, and a live process may be one that found
+# the socket already owned and exited.
+waited=0
+while :; do
+  if [ -S "$sock" ] && installed_daemon_running; then
+    echo "install: teiryo and teiryod are in $daemon_dir; teiryod is serving $sock"
+    exit 0
+  fi
+  waited=$((waited + 1))
+  if [ "$waited" -gt 100 ]; then
+    break
+  fi
+  sleep 0.1
+done
+
+echo "install: the binaries are installed, but $daemon is not serving $sock" >&2
+if pgrep -x -u "$uid" teiryo >/dev/null 2>&1; then
+  echo "install: a running teiryo TUI keeps respawning its own daemon — quit it and re-run" >&2
+else
+  echo "install: see ${XDG_DATA_HOME:-$HOME/.local/share}/teiryo/teiryo.log" >&2
+fi
+exit 1
+''',
+]
+
+[tasks.uninstall]
+description = "Stop the daemon and remove the installed teiryo and teiryod"
+# The daemon first: removing its binary while it still holds the socket leaves a
+# running process no client can replace.
+run = [
+  '''
+set -eu
+if command -v pkill >/dev/null 2>&1; then
+  pkill -TERM -x -u "$(id -u)" teiryod || true
+fi
+''',
+  "cargo uninstall teiryo teiryod",
+]
