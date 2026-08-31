@@ -53,33 +53,55 @@ pub fn pace(window: &QuotaWindow, now: DateTime<Utc>) -> Option<f64> {
     Some(utilization(window)? / elapsed)
 }
 
-/// When the window is projected to hit its cap, extrapolating current usage
-/// linearly.
+/// How much longer the remaining headroom lasts at `pace`, sustained.
 ///
-/// `None` when nothing has been used yet, when the window is not far enough
-/// along to extrapolate from, or when the projected cap falls *after* the
-/// reset — in that last case the window rolls over first and there is no
-/// exhaustion to warn about.
-pub fn eta_to_cap(window: &QuotaWindow, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let reset_at = window.reset_at?;
-    let span = window_span(window)?;
+/// Deliberately says nothing about the reset: a runway longer than the window
+/// has left is a real answer to "how long could I keep this up", and the row
+/// prints it alongside the countdown so the two can be compared. `Some(zero)`
+/// when the cap is already reached; `None` at a pace of zero, which never
+/// arrives.
+///
+/// Takes a pace rather than a clock because the caller chooses which rate to
+/// project: the average since the window opened, or a rate measured over some
+/// recent stretch of it.
+pub fn runway_at(window: &QuotaWindow, pace: f64) -> Option<Duration> {
     let used = utilization(window)?;
     if used >= 1.0 {
-        return Some(now);
+        return Some(Duration::zero());
     }
-    if used <= 0.0 {
+    if pace <= 0.0 {
         return None;
     }
-    let elapsed = (now - (reset_at - span)).num_seconds();
-    if elapsed <= 0 {
+    let span_secs = window_span(window)?.num_seconds();
+    if span_secs <= 0 {
         return None;
     }
-    let per_second = used / elapsed as f64;
+    // A pace is a multiple of the rate that exactly spends the window over its
+    // own span, so the span is what converts it back into a rate per second.
+    let per_second = pace / span_secs as f64;
     let secs = ((1.0 - used) / per_second).round();
     if !secs.is_finite() || secs < 0.0 || secs > i64::MAX as f64 {
         return None;
     }
-    let eta = now + Duration::seconds(secs as i64);
+    Some(Duration::seconds(secs as i64))
+}
+
+/// How much longer the headroom lasts at the pace held since the window
+/// opened.
+pub fn runway(window: &QuotaWindow, now: DateTime<Utc>) -> Option<Duration> {
+    runway_at(window, pace(window, now)?)
+}
+
+/// When the window is projected to hit its cap, extrapolating current usage
+/// linearly.
+///
+/// The reset-aware reading of [`runway`]: `None` when the projected cap falls
+/// *after* the reset, because the window rolls over first and there is no
+/// exhaustion to warn about. That makes it the test for "is the runway the
+/// binding limit", which is how the row decides whether to colour it.
+pub fn eta_to_cap(window: &QuotaWindow, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let reset_at = window.reset_at?;
+    let eta = now + runway(window, now)?;
     (eta < reset_at).then_some(eta)
 }
 
@@ -225,6 +247,34 @@ mod tests {
         assert_eq!(pace(&window(30.0, 4), now()), Some(0.5));
         // A window that just started cannot be extrapolated from.
         assert_eq!(pace(&window(0.0, 10), now()), None);
+    }
+
+    #[test]
+    fn runway_spends_the_remaining_headroom_at_the_pace_given() {
+        // Half a 10-hour window left to spend, at exactly the rate the window
+        // affords: five hours of headroom.
+        assert_eq!(runway_at(&window(50.0, 5), 1.0), Some(Duration::hours(5)),);
+        // Twice that rate empties it in half the time.
+        assert_eq!(
+            runway_at(&window(50.0, 5), 2.0),
+            Some(Duration::hours(2) + Duration::minutes(30)),
+        );
+        // Already capped: no headroom left to project.
+        assert_eq!(runway_at(&window(100.0, 4), 2.0), Some(Duration::zero()));
+        // A pace of zero never arrives at the cap.
+        assert_eq!(runway_at(&window(50.0, 5), 0.0), None);
+    }
+
+    #[test]
+    fn runway_is_reported_even_when_the_window_resets_first() {
+        // 30% used with 6 of 10 hours gone burns the rest in another 14h —
+        // long after the 4h reset, which is exactly the case `eta_to_cap`
+        // suppresses. The rate is still a real answer.
+        assert_eq!(runway(&window(30.0, 4), now()), Some(Duration::hours(14)));
+        assert_eq!(eta_to_cap(&window(30.0, 4), now()), None);
+
+        // Nothing used yet: no rate to project from, either way.
+        assert_eq!(runway(&window(0.0, 4), now()), None);
     }
 
     #[test]
