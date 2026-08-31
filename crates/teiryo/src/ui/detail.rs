@@ -152,13 +152,22 @@ fn trend_footer(app: &App, now: DateTime<Utc>) -> Line<'static> {
             }
         }
     }
-    if let Some((_, view)) = app.selected_window() {
+    if let Some((status, view)) = app.selected_window() {
         spans.push(Span::styled(
             format!(" · now {}", usage_text(&view.window)),
             theme::dim(),
         ));
         if let Some(pace) = metrics::pace(&view.window, now) {
             spans.push(Span::styled(format!(" · pace {pace:.2}×"), theme::dim()));
+        }
+        // Named for what separates it from the pace beside it: that one is the
+        // average since the window opened, this one only the recent end of it.
+        let points = app.recent_points(&status.account.id, &view.window.id);
+        if let Some(recent) = metrics::recent_pace(&view.window, points, now) {
+            spans.push(Span::styled(
+                format!(" · lately {recent:.2}×"),
+                theme::dim(),
+            ));
         }
         if let Some(note) = &view.hint.note {
             spans.push(Span::styled(

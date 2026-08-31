@@ -8,7 +8,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 
-use teiryo_core::domain::QuotaWindow;
+use teiryo_core::domain::{QuotaSnapshot, QuotaWindow};
 use teiryo_core::rollover::{WindowRollover, RESET_TOLERANCE};
 
 /// Utilization ratio in `0.0..=1.0`, when computable from the window's data.
@@ -105,6 +105,78 @@ pub fn affordable_pace(window: &QuotaWindow, now: DateTime<Utc>) -> Option<f64> 
         return None;
     }
     Some((1.0 - used) / remaining)
+}
+
+/// Shortest stretch of series a rate is worth deriving from. Below this, one
+/// poll's rounding is most of the signal.
+const MIN_SAMPLE_SECS: i64 = 300;
+
+/// How far back a "recent" rate looks: a tenth of the window, but never so
+/// short that two polls dominate it, nor so long that recent stops meaning
+/// anything. A 5-hour window looks back 30 minutes, a weekly one 12 hours.
+fn recent_lookback(span: Duration) -> Duration {
+    Duration::seconds((span.num_seconds() / 10).clamp(15 * 60, 12 * 3600))
+}
+
+/// Burn rate over the last stretch of the window, on the same scale as
+/// [`pace`]: `1.0` is the rate the window can afford, `2.0` is twice that.
+///
+/// [`pace`] averages everything since the window opened, so a sprint after an
+/// idle stretch barely moves it. This measures only the recent end of the
+/// series, which is what says whether the sprint is happening now.
+///
+/// Never measured across a rollover, where `used` falls back to zero: the
+/// series is floored at the window's own start, and cut again at any reading
+/// whose `reset_at` is not this window's. The recorded rollover list is
+/// deliberately not consulted — it omits the unannounced kind
+/// (`rollover::RolloverKind::Unannounced`), which is exactly a large drop in
+/// `used`, and reading across one would invent a burn that never happened.
+///
+/// `None` until two readings at least [`MIN_SAMPLE_SECS`] apart lie inside
+/// both the lookback and the current window. A drop in `used` with no
+/// rollover behind it — a provider correction — reads as `0.0`, not as a
+/// negative rate.
+pub fn recent_pace(
+    window: &QuotaWindow,
+    points: &[QuotaSnapshot],
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    let span = window_span(window)?;
+    let floor = (now - recent_lookback(span)).max(window.started_at()?);
+
+    let (mut first, mut last) = (None, None);
+    for point in points
+        .iter()
+        .filter(|p| p.window == window.id)
+        .filter(|p| p.ts >= floor && p.ts <= now)
+    {
+        if !is_same_window(point, window) {
+            // Everything up to here belongs to a window that has since rolled
+            // over. Start again on the far side of the boundary.
+            first = None;
+            continue;
+        }
+        first = first.or(Some(point));
+        last = Some(point);
+    }
+
+    let (first, last) = (first?, last?);
+    let elapsed = (last.ts - first.ts).num_seconds();
+    if elapsed < MIN_SAMPLE_SECS {
+        return None;
+    }
+    let burned = (last.utilization()? - first.utilization()?).max(0.0);
+    Some(burned / elapsed as f64 * span.num_seconds() as f64)
+}
+
+/// Whether a reading was taken inside the window as it stands now, judged by
+/// the reset instant it carried — the same signal `rollover::classify` uses,
+/// and the only one a lone snapshot carries.
+fn is_same_window(point: &QuotaSnapshot, window: &QuotaWindow) -> bool {
+    match (point.reset_at, window.reset_at) {
+        (Some(theirs), Some(ours)) => (theirs - ours).abs() <= RESET_TOLERANCE,
+        _ => false,
+    }
 }
 
 /// When the window is projected to hit its cap, extrapolating current usage
@@ -303,6 +375,78 @@ mod tests {
         assert_eq!(affordable_pace(&window(100.0, 5), now()), Some(0.0));
         // A window at its reset has no time left to spread anything over.
         assert_eq!(affordable_pace(&window(50.0, 0), now()), None);
+    }
+
+    /// A burn rate rounded to the two decimals the row prints. Rates are
+    /// ratios of ratios, so the last bit of a `f64` is noise the UI never
+    /// shows.
+    fn as_shown(rate: Option<f64>) -> Option<f64> {
+        rate.map(|r| (r * 100.0).round() / 100.0)
+    }
+
+    /// A reading of the 10-hour test window taken `minutes_ago`, `used`%
+    /// consumed, belonging to the window that resets 4 hours from `now()`.
+    fn point(minutes_ago: i64, used: f64) -> QuotaSnapshot {
+        QuotaSnapshot {
+            poll_id: PollId::generate(),
+            ts: now() - Duration::minutes(minutes_ago),
+            window: WindowId::from("w"),
+            label: "w".to_owned(),
+            unit: QuotaUnit::Percent,
+            used,
+            limit: Some(100.0),
+            reset_at: Some(now() + Duration::hours(4)),
+        }
+    }
+
+    #[test]
+    fn recent_pace_measures_the_last_stretch_not_the_whole_window() {
+        // 60% of a 10-hour window used with 6 hours gone is dead on track...
+        let window = window(60.0, 4);
+        assert_eq!(pace(&window, now()), Some(1.0));
+        // ...but 10 points of it went in the last half hour, which is twice
+        // the rate the window can afford.
+        let series = [point(30, 50.0), point(0, 60.0)];
+        assert_eq!(as_shown(recent_pace(&window, &series, now())), Some(2.0));
+    }
+
+    #[test]
+    fn recent_pace_never_measures_across_a_rollover() {
+        let window = window(60.0, 4);
+        // A reading from the window that came before this one: same series,
+        // different reset instant, and 90% used where this window has 60%.
+        let mut previous = point(45, 90.0);
+        previous.reset_at = Some(now() - Duration::hours(1));
+
+        let series = [previous, point(30, 50.0), point(0, 60.0)];
+        // Measured from the far side of the boundary only — reading across it
+        // would report usage falling by 30 points.
+        assert_eq!(as_shown(recent_pace(&window, &series, now())), Some(2.0));
+    }
+
+    #[test]
+    fn recent_pace_needs_two_readings_far_enough_apart() {
+        let window = window(60.0, 4);
+        assert_eq!(recent_pace(&window, &[], now()), None);
+        assert_eq!(recent_pace(&window, &[point(0, 60.0)], now()), None);
+        // Two polls two minutes apart are mostly rounding.
+        let series = [point(2, 59.0), point(0, 60.0)];
+        assert_eq!(recent_pace(&window, &series, now()), None);
+    }
+
+    #[test]
+    fn a_provider_correction_reads_as_idle_rather_than_as_negative_burn() {
+        let window = window(60.0, 4);
+        let series = [point(30, 62.0), point(0, 60.0)];
+        assert_eq!(recent_pace(&window, &series, now()), Some(0.0));
+    }
+
+    #[test]
+    fn a_window_that_just_opened_has_no_recent_stretch_to_measure() {
+        // Nothing before the window's own start counts, and it started now.
+        let window = window(0.0, 10);
+        let series = [point(30, 50.0), point(0, 60.0)];
+        assert_eq!(recent_pace(&window, &series, now()), None);
     }
 
     #[test]

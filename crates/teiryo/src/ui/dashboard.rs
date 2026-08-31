@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-use teiryo_core::{AccountStatus, WindowView};
+use teiryo_core::{AccountStatus, QuotaSnapshot, WindowView};
 
 use crate::app::{App, Pane, RowRef};
 use crate::metrics;
@@ -203,7 +203,11 @@ pub fn render_quotas(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: Date
                     RowRef { window: None, .. } => vec![account_line(status, now)],
                     RowRef {
                         window: Some(wi), ..
-                    } => window_lines(&status.windows[*wi], inner_width, now, two_line),
+                    } => {
+                        let view = &status.windows[*wi];
+                        let points = app.recent_points(&status.account.id, &view.window.id);
+                        window_lines(view, points, inner_width, now, two_line)
+                    }
                 })
             })
             .collect()
@@ -258,6 +262,7 @@ fn account_line(status: &AccountStatus, now: DateTime<Utc>) -> Line<'static> {
 /// — the line of derived numbers.
 fn window_lines(
     view: &WindowView,
+    points: &[QuotaSnapshot],
     width: usize,
     now: DateTime<Utc>,
     two_line: bool,
@@ -266,7 +271,7 @@ fn window_lines(
     // pace column to reserve and the bar keeps those columns instead.
     let mut lines = vec![gauge_line(view, width, now, !two_line)];
     if two_line {
-        lines.extend(derived_line(view, width, now));
+        lines.extend(derived_line(view, points, width, now));
     }
     lines
 }
@@ -346,15 +351,21 @@ const MIN_BAR: usize = 8;
 /// going, how long that lasts, and how fast it could afford to go.
 ///
 /// Fields are appended left to right only while they fit, so a narrow terminal
-/// sheds them from the right. The order is by how much each one adds: pace
-/// first because it is the one number that was always here, then the runway
-/// that says what pace costs, then the pace still affordable, and last the
-/// projection — which is *numerically identical* to pace (projected use at
-/// reset is `u + (u/E)(1-E) = u/E`) and so is the field worth losing first.
+/// sheds them from the right. The order is by how much each one adds: the two
+/// burn rates first and together, since the whole point of the recent one is
+/// being read against the average; then the runway that says what the pace
+/// costs; then the pace still affordable; and last the projection — which is
+/// *numerically identical* to pace (projected use at reset is
+/// `u + (u/E)(1-E) = u/E`) and so is the field worth losing first.
 ///
 /// `None` when the window publishes no `reset_at`: every one of these is
 /// derived from the window's own start, so there is nothing to say.
-fn derived_line(view: &WindowView, width: usize, now: DateTime<Utc>) -> Option<Line<'static>> {
+fn derived_line(
+    view: &WindowView,
+    points: &[QuotaSnapshot],
+    width: usize,
+    now: DateTime<Utc>,
+) -> Option<Line<'static>> {
     const INDENT: usize = 4;
     const SEPARATOR: &str = " · ";
 
@@ -365,6 +376,13 @@ fn derived_line(view: &WindowView, width: usize, now: DateTime<Utc>) -> Option<L
         let (glyph, color) = pace_style(pace);
         fields.push((
             format!("{glyph} {pace:.2}× pace"),
+            Style::default().fg(color),
+        ));
+    }
+    if let Some(recent) = metrics::recent_pace(window, points, now) {
+        let (glyph, color) = pace_style(recent);
+        fields.push((
+            format!("{glyph} {recent:.2}× now"),
             Style::default().fg(color),
         ));
     }

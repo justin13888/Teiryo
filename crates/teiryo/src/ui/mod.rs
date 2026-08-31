@@ -491,6 +491,43 @@ mod tests {
         );
     }
 
+    /// Readings of `id` for the populated account, oldest first.
+    fn recent_series(id: &str, readings: &[(i64, f64)]) -> Vec<QuotaSnapshot> {
+        readings
+            .iter()
+            .map(|&(minutes_ago, used)| QuotaSnapshot {
+                poll_id: PollId::generate(),
+                ts: Utc::now() - Duration::minutes(minutes_ago),
+                window: WindowId::from(id),
+                label: "Session".into(),
+                unit: QuotaUnit::Percent,
+                used,
+                limit: Some(100.0),
+                reset_at: Some(Utc::now() + Duration::hours(2)),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_row_reports_a_recent_burst_beside_the_average_that_hides_it() {
+        let mut app = populated();
+        // The 5-hour window is 3 hours in at 62%, an unremarkable 1.03×
+        // average — but 20 of those points went in the last 20 minutes.
+        app.set_recent(
+            &AccountId::from("claude:default"),
+            recent_series("session_5h", &[(20, 42.0), (0, 62.0)]),
+        );
+        let out = rendered(&mut app, 120, 40);
+
+        assert!(out.contains("1.03× pace"), "expected the average:\n{out}");
+        assert!(
+            out.contains("3.00× now"),
+            "expected the recent rate:\n{out}"
+        );
+        // Windows with no history behind them simply omit the field.
+        assert_eq!(out.matches("× now").count(), 1, "only one series:\n{out}");
+    }
+
     #[test]
     fn a_short_pane_keeps_the_bars_and_drops_the_derived_line() {
         let mut app = populated();
