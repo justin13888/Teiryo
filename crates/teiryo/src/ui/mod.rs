@@ -467,6 +467,62 @@ mod tests {
 
     /// Empty state: connected but the daemon has discovered nothing yet.
     #[test]
+    fn every_row_carries_its_derived_numbers_when_the_pane_is_tall_enough() {
+        let mut app = populated();
+        let out = rendered(&mut app, 120, 40);
+
+        // The gauge line no longer carries pace; the continuation line does,
+        // together with the runway and the pace still affordable.
+        assert!(out.contains("pace"), "expected a pace field:\n{out}");
+        assert!(out.contains("cap in"), "expected a runway field:\n{out}");
+        assert!(
+            out.contains("afford"),
+            "expected an affordable pace:\n{out}"
+        );
+        assert!(out.contains("at reset"), "expected a projection:\n{out}");
+
+        // The 97% window is 5 minutes from its cap and 2 hours from its reset,
+        // so the cap is what binds; the 3% window's runway runs days past the
+        // reset and is reported anyway.
+        assert!(out.contains("cap in 5m"), "expected a near cap:\n{out}");
+        assert!(
+            out.contains("cap in 4d"),
+            "expected a runway past the reset:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_short_pane_keeps_the_bars_and_drops_the_derived_line() {
+        let mut app = populated();
+        let out = rendered(&mut app, 120, 12);
+
+        // Every window still has a gauge, and pace falls back to its column on
+        // the gauge line rather than vanishing with the continuation line.
+        assert!(out.contains("62%"), "expected the bars to survive:\n{out}");
+        assert!(
+            out.contains("pace"),
+            "expected pace on the gauge line:\n{out}"
+        );
+        assert!(
+            !out.contains("afford"),
+            "the derived line should be gone:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_pane_sheds_derived_fields_from_the_right() {
+        let mut app = populated();
+        let out = rendered(&mut app, 60, 40);
+
+        // Pace is the last field to go, so it survives where the rest cannot.
+        assert!(out.contains("pace"), "expected pace to survive:\n{out}");
+        assert!(
+            !out.contains("at reset"),
+            "the projection should be gone:\n{out}"
+        );
+    }
+
+    #[test]
     fn renders_before_any_data_arrives() {
         for tab in DetailTab::ALL {
             let mut app = App::new();

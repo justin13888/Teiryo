@@ -92,6 +92,21 @@ pub fn runway(window: &QuotaWindow, now: DateTime<Utc>) -> Option<Duration> {
     runway_at(window, pace(window, now)?)
 }
 
+/// The pace that spends exactly the remaining headroom over exactly the time
+/// left: `1.0` when usage and the clock are level, above `1.0` when there is
+/// slack to burn, `0.0` at the cap.
+///
+/// The forward-looking counterpart to [`pace`], and what answers "how fast may
+/// I go from here without running out early".
+pub fn affordable_pace(window: &QuotaWindow, now: DateTime<Utc>) -> Option<f64> {
+    let used = utilization(window)?;
+    let remaining = 1.0 - elapsed_fraction(window, now)?;
+    if remaining <= f64::EPSILON {
+        return None;
+    }
+    Some((1.0 - used) / remaining)
+}
+
 /// When the window is projected to hit its cap, extrapolating current usage
 /// linearly.
 ///
@@ -275,6 +290,19 @@ mod tests {
 
         // Nothing used yet: no rate to project from, either way.
         assert_eq!(runway(&window(0.0, 4), now()), None);
+    }
+
+    #[test]
+    fn affordable_pace_spreads_what_is_left_over_the_time_left() {
+        // 50% used with half the window to go: usage and clock are level.
+        assert_eq!(affordable_pace(&window(50.0, 5), now()), Some(1.0));
+        // 30% used with half to go — the shape of a weekly window 84h from
+        // reset — leaves 70% for 50% of the span: 1.4× the nominal rate.
+        assert_eq!(affordable_pace(&window(30.0, 5), now()), Some(1.4));
+        // At the cap there is nothing left to afford.
+        assert_eq!(affordable_pace(&window(100.0, 5), now()), Some(0.0));
+        // A window at its reset has no time left to spread anything over.
+        assert_eq!(affordable_pace(&window(50.0, 0), now()), None);
     }
 
     #[test]

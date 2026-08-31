@@ -12,7 +12,8 @@ use teiryo_core::{AccountStatus, WindowView};
 use crate::app::{App, Pane, RowRef};
 use crate::metrics;
 use crate::ui::format::{
-    format_countdown, format_elapsed, outcome_text, text_bar_fine, truncate, usage_short,
+    format_countdown, format_elapsed, format_span, outcome_text, text_bar_fine, truncate,
+    usage_short,
 };
 use crate::ui::theme;
 
@@ -34,7 +35,7 @@ pub fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App, now: DateTime
         left,
     );
     frame.render_widget(
-        Paragraph::new(vec![headroom_line(app), notice_line(app, now)]).alignment(Alignment::Right),
+        Paragraph::new(vec![headroom_line(app), notice_line(app)]).alignment(Alignment::Right),
         right,
     );
 }
@@ -148,7 +149,7 @@ fn worst_window(app: &App) -> Option<(&WindowView, f64)> {
 }
 
 /// Error text, else the selected window's provider caveat.
-fn notice_line(app: &App, now: DateTime<Utc>) -> Line<'static> {
+fn notice_line(app: &App) -> Line<'static> {
     if let Some(error) = &app.error {
         return Line::from(Span::styled(
             truncate(error, 60),
@@ -165,12 +166,9 @@ fn notice_line(app: &App, now: DateTime<Utc>) -> Line<'static> {
         ));
     }
     if let Some((_, view)) = app.selected_window() {
-        if let Some(eta) = metrics::eta_to_cap(&view.window, now) {
-            return Line::from(Span::styled(
-                format!("⚡ projected to cap in {}", format_countdown(eta, now)),
-                Style::default().fg(theme::WARN),
-            ));
-        }
+        // The projected cap used to live here, where it competed with the
+        // provider's caveat for one line and won. Every row now carries its
+        // own runway, so the caveat gets the line back.
         if let Some(note) = &view.hint.note {
             return Line::from(Span::styled(truncate(note, 60), theme::dim()));
         }
@@ -184,9 +182,14 @@ pub fn render_quotas(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: Date
         .borders(Borders::ALL)
         .border_style(theme::border(app.focus == Pane::List))
         .title(Span::styled(" Quotas ", theme::heading()));
-    let inner_width = block.inner(area).width as usize;
+    let inner = block.inner(area);
+    let inner_width = inner.width as usize;
 
     let rows = app.rows();
+    // The derived numbers get a line of their own only while every row can
+    // have one: bars survive, continuation lines go first.
+    let window_rows = rows.iter().filter(|r| r.window.is_some()).count();
+    let two_line = rows.len() + window_rows <= inner.height as usize;
     let items: Vec<ListItem<'_>> = if rows.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  no accounts discovered yet — waiting for the daemon",
@@ -197,10 +200,10 @@ pub fn render_quotas(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: Date
             .map(|row| {
                 let status = &app.statuses[row.account];
                 ListItem::new(match row {
-                    RowRef { window: None, .. } => account_line(status, now),
+                    RowRef { window: None, .. } => vec![account_line(status, now)],
                     RowRef {
                         window: Some(wi), ..
-                    } => window_line(&status.windows[*wi], inner_width, now),
+                    } => window_lines(&status.windows[*wi], inner_width, now, two_line),
                 })
             })
             .collect()
@@ -251,8 +254,31 @@ fn account_line(status: &AccountStatus, now: DateTime<Utc>) -> Line<'static> {
     Line::from(spans)
 }
 
-/// One window row: label, gauge, usage, reset countdown, pace.
-fn window_line(view: &WindowView, width: usize, now: DateTime<Utc>) -> Line<'static> {
+/// One window row: the gauge line, and under it — when the pane is tall enough
+/// — the line of derived numbers.
+fn window_lines(
+    view: &WindowView,
+    width: usize,
+    now: DateTime<Utc>,
+    two_line: bool,
+) -> Vec<Line<'static>> {
+    // With a line of its own for the derived numbers, the gauge line has no
+    // pace column to reserve and the bar keeps those columns instead.
+    let mut lines = vec![gauge_line(view, width, now, !two_line)];
+    if two_line {
+        lines.extend(derived_line(view, width, now));
+    }
+    lines
+}
+
+/// The gauge line: label, bar, usage, reset countdown, and — only when the
+/// derived numbers have no line of their own — pace.
+fn gauge_line(
+    view: &WindowView,
+    width: usize,
+    now: DateTime<Utc>,
+    with_pace: bool,
+) -> Line<'static> {
     const INDENT: usize = 2;
     const LABEL: usize = 24;
     const USAGE: usize = 7;
@@ -263,7 +289,7 @@ fn window_line(view: &WindowView, width: usize, now: DateTime<Utc>) -> Line<'sta
     // Give the bar whatever the fixed columns do not need, and drop the pace
     // column entirely before letting the bar shrink into illegibility.
     let fixed = INDENT + LABEL + USAGE + RESET;
-    let show_pace = width >= fixed + PACE + MIN_BAR;
+    let show_pace = with_pace && width >= fixed + PACE + MIN_BAR;
     let bar_width = width
         .saturating_sub(fixed + if show_pace { PACE } else { 0 })
         .clamp(MIN_BAR, 48);
@@ -316,19 +342,87 @@ fn window_line(view: &WindowView, width: usize, now: DateTime<Utc>) -> Line<'sta
 /// Narrowest bar still worth drawing.
 const MIN_BAR: usize = 8;
 
+/// The continuation line: what the gauge cannot say — how fast the window is
+/// going, how long that lasts, and how fast it could afford to go.
+///
+/// Fields are appended left to right only while they fit, so a narrow terminal
+/// sheds them from the right. The order is by how much each one adds: pace
+/// first because it is the one number that was always here, then the runway
+/// that says what pace costs, then the pace still affordable, and last the
+/// projection — which is *numerically identical* to pace (projected use at
+/// reset is `u + (u/E)(1-E) = u/E`) and so is the field worth losing first.
+///
+/// `None` when the window publishes no `reset_at`: every one of these is
+/// derived from the window's own start, so there is nothing to say.
+fn derived_line(view: &WindowView, width: usize, now: DateTime<Utc>) -> Option<Line<'static>> {
+    const INDENT: usize = 4;
+    const SEPARATOR: &str = " · ";
+
+    let window = &view.window;
+    let mut fields: Vec<(String, Style)> = Vec::new();
+
+    if let Some(pace) = metrics::pace(window, now) {
+        let (glyph, color) = pace_style(pace);
+        fields.push((
+            format!("{glyph} {pace:.2}× pace"),
+            Style::default().fg(color),
+        ));
+    }
+    if let Some(runway) = metrics::runway(window, now) {
+        // Warn only when the cap is what actually arrives first. A runway
+        // longer than the window has left is information, not an alarm — the
+        // rollover gets there before the cap does.
+        let binding = metrics::eta_to_cap(window, now).is_some();
+        let text = if runway <= chrono::Duration::zero() {
+            "at cap".to_owned()
+        } else {
+            format!("cap in {}", format_span(runway))
+        };
+        let color = if binding { theme::WARN } else { theme::DIM };
+        fields.push((text, Style::default().fg(color)));
+    }
+    if let Some(afford) = metrics::affordable_pace(window, now) {
+        fields.push((format!("afford {afford:.2}×"), theme::dim()));
+    }
+    if let Some(pace) = metrics::pace(window, now) {
+        fields.push((format!("→{:.0}% at reset", pace * 100.0), theme::dim()));
+    }
+
+    let mut spans = vec![Span::raw(" ".repeat(INDENT))];
+    let mut used = INDENT;
+    for (text, style) in fields {
+        let cost = text.chars().count() + if used > INDENT { SEPARATOR.len() } else { 0 };
+        if used + cost > width {
+            break;
+        }
+        if used > INDENT {
+            spans.push(Span::styled(SEPARATOR, theme::dim()));
+        }
+        used += cost;
+        spans.push(Span::styled(text, style));
+    }
+    (spans.len() > 1).then(|| Line::from(spans))
+}
+
+/// Glyph and colour for a burn rate, whether it is the average since the
+/// window opened or a rate measured over a shorter stretch.
+fn pace_style(pace: f64) -> (&'static str, ratatui::style::Color) {
+    if pace >= 1.5 {
+        ("▲", theme::CRIT)
+    } else if pace >= 1.05 {
+        ("▲", theme::WARN)
+    } else if pace <= 0.8 {
+        ("▼", theme::OK)
+    } else {
+        ("=", theme::DIM)
+    }
+}
+
 /// "▲ 1.3× pace" / "▼ 0.5× pace" — usage measured against the clock.
 fn pace_span(view: &WindowView, now: DateTime<Utc>) -> Span<'static> {
     match metrics::pace(&view.window, now) {
         Some(pace) => {
-            let (glyph, color) = if pace >= 1.5 {
-                ("▲", theme::CRIT)
-            } else if pace >= 1.05 {
-                ("▲", theme::WARN)
-            } else if pace <= 0.8 {
-                ("▼", theme::OK)
-            } else {
-                ("=", theme::DIM)
-            };
+            let (glyph, color) = pace_style(pace);
             Span::styled(
                 format!("  {glyph} {pace:.2}× pace"),
                 Style::default().fg(color),

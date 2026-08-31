@@ -34,6 +34,15 @@ pub fn format_countdown(reset_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     humanize(secs)
 }
 
+/// Humanized length of a duration: "3d 4h", "2h 05m", "41s", "0s".
+///
+/// The same ladder [`format_countdown`] uses, for a span that is not anchored
+/// to an instant — how long something lasts rather than when it lands. Note it
+/// is coarse above a day: 36 hours reads "1d 12h".
+pub fn format_span(span: chrono::Duration) -> String {
+    humanize(span.num_seconds().max(0))
+}
+
 /// Humanized time since an instant: "2h 05m ago", "41s ago", "just now".
 ///
 /// Deliberately a separate function rather than calling [`format_countdown`]
@@ -150,7 +159,7 @@ pub fn truncate(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{Duration, TimeZone};
     use teiryo_core::domain::{ResetKind, WindowId, WindowScope};
 
     fn window(unit: QuotaUnit, used: f64, limit: Option<f64>) -> QuotaWindow {
@@ -168,6 +177,16 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 15, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn format_span_measures_a_length_not_an_instant() {
+        assert_eq!(format_span(Duration::seconds(41)), "41s");
+        assert_eq!(format_span(Duration::minutes(90)), "1h 30m");
+        // Coarse above a day: 36 hours is a day and a half, not "36h".
+        assert_eq!(format_span(Duration::hours(36)), "1d 12h");
+        // A span that has already run out is zero, never negative.
+        assert_eq!(format_span(Duration::seconds(-5)), "0s");
     }
 
     #[test]
