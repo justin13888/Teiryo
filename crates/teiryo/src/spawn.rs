@@ -6,7 +6,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use directories::ProjectDirs;
@@ -90,6 +90,18 @@ fn spawn_error(binary: &Path, e: &io::Error) -> ClientError {
     ))
 }
 
+/// Wait on `child` in the background. Nothing here waits on the daemon inline —
+/// it deliberately outlives the TUI — but a `Child` dropped unwaited leaves the
+/// daemon `<defunct>` in our process table for as long as we run, and the
+/// reconnect loop spawns one per second per connection while the socket is
+/// down. The thread parks in `wait` and dies with the process, which reparents
+/// a daemon that is still running to init.
+fn reap_in_background(mut child: Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
+
 /// Spawn `teiryod` detached in its own session-like process group, stdio
 /// routed away from the TUI's terminal.
 fn spawn_daemon(binary: &Path) -> io::Result<()> {
@@ -100,7 +112,7 @@ fn spawn_daemon(binary: &Path) -> io::Result<()> {
         .stdout(daemon_output())
         .stderr(daemon_output())
         .process_group(0);
-    cmd.spawn().map(drop)
+    cmd.spawn().map(reap_in_background)
 }
 
 /// Connect to the daemon socket, spawning the daemon if it is not running.
@@ -172,5 +184,33 @@ mod tests {
             Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
             None => std::env::remove_var("XDG_RUNTIME_DIR"),
         }
+    }
+
+    /// A zombie keeps its pid valid for the life of its parent, so polling the
+    /// pid is what separates "reaped" from "still sitting in our process
+    /// table": without the background `wait` this never reaches `ESRCH`.
+    #[test]
+    fn reaped_child_leaves_no_zombie() {
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("/bin/sh should be spawnable");
+        let pid = i32::try_from(child.id()).expect("a pid fits in pid_t");
+        reap_in_background(child);
+
+        for _ in 0..200 {
+            // SAFETY: signal 0 performs no delivery, only an existence check.
+            if unsafe { libc::kill(pid, 0) } == -1
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("pid {pid} still exists: the child was never reaped");
     }
 }
