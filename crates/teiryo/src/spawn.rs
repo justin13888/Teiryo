@@ -86,7 +86,8 @@ fn spawn_error(binary: &Path, e: &io::Error) -> ClientError {
     );
     ClientError::DaemonStart(format!(
         "cannot find the teiryod binary (looked in {looked}) — \
-         build it with `cargo build -p teiryod`"
+         install it with `mise run install`, or build it with \
+         `cargo build -p teiryod` when running from a checkout"
     ))
 }
 
@@ -212,5 +213,38 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("pid {pid} still exists: the child was never reaped");
+    }
+
+    #[test]
+    fn missing_daemon_error_names_both_ways_to_get_it() {
+        let missing = io::Error::from(io::ErrorKind::NotFound);
+        let ClientError::DaemonStart(message) =
+            spawn_error(Path::new("/nowhere/teiryod"), &missing)
+        else {
+            panic!("a missing binary is a start failure");
+        };
+        // Spelled out end to end: the remedy spans two escaped line
+        // continuations, and a botched one would only show up as stray
+        // whitespace in the sentence the user actually reads.
+        assert!(
+            message.ends_with(
+                "install it with `mise run install`, or build it with \
+                 `cargo build -p teiryod` when running from a checkout"
+            ),
+            "{message}"
+        );
+    }
+
+    /// The falsifier for the test above: only `NotFound` means "we could not
+    /// find it", so any other failure keeps naming the binary it tried.
+    #[test]
+    fn other_spawn_failures_name_the_binary() {
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        let ClientError::DaemonStart(message) = spawn_error(Path::new("/nowhere/teiryod"), &denied)
+        else {
+            panic!("a failed start is a start failure");
+        };
+        assert!(message.contains("/nowhere/teiryod"), "{message}");
+        assert!(!message.contains("mise run install"), "{message}");
     }
 }
