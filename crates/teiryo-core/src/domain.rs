@@ -129,18 +129,26 @@ pub struct QuotaWindow {
     pub reset_at: Option<DateTime<Utc>>,
 }
 
+/// Utilization ratio in `0.0..=1.0` from a reading's own three fields, when
+/// computable.
+///
+/// `Percent` readings are self-describing; anything else needs a published
+/// limit, which not every provider gives (see `docs/providers.md`). Shared by
+/// [`QuotaWindow`] and [`QuotaSnapshot`] so a live row and its own history can
+/// never disagree about what a reading means.
+fn utilization_of(unit: QuotaUnit, used: f64, limit: Option<f64>) -> Option<f64> {
+    match (unit, limit) {
+        (QuotaUnit::Percent, _) => Some((used / 100.0).clamp(0.0, 1.0)),
+        (_, Some(limit)) if limit > 0.0 => Some((used / limit).clamp(0.0, 1.0)),
+        _ => None,
+    }
+}
+
 impl QuotaWindow {
     /// Utilization ratio in `0.0..=1.0`, when computable from the window's own
     /// fields.
-    ///
-    /// `Percent` windows are self-describing; anything else needs a published
-    /// limit, which not every provider gives (see `docs/providers.md`).
     pub fn utilization(&self) -> Option<f64> {
-        match (self.unit, self.limit) {
-            (QuotaUnit::Percent, _) => Some((self.used / 100.0).clamp(0.0, 1.0)),
-            (_, Some(limit)) if limit > 0.0 => Some((self.used / limit).clamp(0.0, 1.0)),
-            _ => None,
-        }
+        utilization_of(self.unit, self.used, self.limit)
     }
 
     /// How long the window rolls over, as a `chrono` duration.
@@ -255,4 +263,55 @@ pub struct QuotaSnapshot {
     pub limit: Option<f64>,
     /// When the window resets, if known.
     pub reset_at: Option<DateTime<Utc>>,
+}
+
+impl QuotaSnapshot {
+    /// Utilization ratio in `0.0..=1.0` at the moment of this reading, when
+    /// computable from the fields the snapshot carries.
+    ///
+    /// The same rule [`QuotaWindow::utilization`] applies, so a rate measured
+    /// across two snapshots is in the same units as the live row's gauge.
+    pub fn utilization(&self) -> Option<f64> {
+        utilization_of(self.unit, self.used, self.limit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(unit: QuotaUnit, used: f64, limit: Option<f64>) -> QuotaSnapshot {
+        QuotaSnapshot {
+            poll_id: PollId::generate(),
+            ts: Utc::now(),
+            window: WindowId::from("w"),
+            label: "w".to_owned(),
+            unit,
+            used,
+            limit,
+            reset_at: None,
+        }
+    }
+
+    #[test]
+    fn a_snapshot_reads_its_utilization_the_way_its_window_does() {
+        assert_eq!(
+            snapshot(QuotaUnit::Percent, 42.0, Some(100.0)).utilization(),
+            Some(0.42)
+        );
+        assert_eq!(
+            snapshot(QuotaUnit::Messages, 30.0, Some(60.0)).utilization(),
+            Some(0.5)
+        );
+        // No published limit: a count alone says nothing about headroom.
+        assert_eq!(
+            snapshot(QuotaUnit::Messages, 30.0, None).utilization(),
+            None
+        );
+        // Overuse clamps rather than reporting more than a full window.
+        assert_eq!(
+            snapshot(QuotaUnit::Percent, 150.0, None).utilization(),
+            Some(1.0)
+        );
+    }
 }
