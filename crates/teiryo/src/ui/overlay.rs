@@ -59,6 +59,25 @@ const KEYS: &[(&str, &str)] = &[
     ("Q", "stop the daemon (confirmation required)"),
 ];
 
+/// What each derived number on a quota row means. Five numbers per row are
+/// worth having only if there is somewhere that says what they are.
+///
+/// Every description has to fit the overlay's description column unwrapped:
+/// the box sizes itself from the line count, so a wrapped line pushes the last
+/// entries out through the bottom border.
+const NUMBERS: &[(&str, &str)] = &[
+    ("⟳ 1h 59m", "when the window rolls over"),
+    ("1.03× pace", "burn rate since the window opened"),
+    ("3.00× now", "the same rate over the recent stretch"),
+    ("cap in 1h 50m", "how long the headroom lasts at that pace"),
+    (
+        "afford 0.95×",
+        "the pace that spends the rest exactly by then",
+    ),
+    ("→103% at reset", "where the current pace lands"),
+    ("▲ ▼ =", "above, below, or level with what it affords"),
+];
+
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let mut lines = vec![Line::from(Span::styled(
         "Every key works from the one dashboard — there are no other screens.",
@@ -72,6 +91,21 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
                 Style::default()
                     .fg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(*description),
+        ])
+    }));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "What the numbers on a row mean.",
+        theme::dim(),
+    )));
+    lines.push(Line::from(""));
+    lines.extend(NUMBERS.iter().map(|(number, description)| {
+        Line::from(vec![
+            Span::styled(
+                format!("  {number:<22}"),
+                Style::default().fg(theme::ACCENT),
             ),
             Span::raw(*description),
         ])

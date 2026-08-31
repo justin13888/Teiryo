@@ -560,6 +560,19 @@ mod tests {
     }
 
     #[test]
+    fn the_help_overlay_says_what_the_row_numbers_mean() {
+        let mut app = populated();
+        app.overlay = Some(Overlay::Help);
+        let out = rendered(&mut app, 100, 50);
+
+        assert!(out.contains("What the numbers on a row mean"), "{out}");
+        assert!(out.contains("burn rate since the window opened"), "{out}");
+        // The legend sits below the keymap, so nothing may push it out through
+        // the bottom border — the box sizes itself from the line count.
+        assert!(out.contains("press any key to close"), "{out}");
+    }
+
+    #[test]
     fn renders_before_any_data_arrives() {
         for tab in DetailTab::ALL {
             let mut app = App::new();
