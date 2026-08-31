@@ -6,7 +6,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use directories::ProjectDirs;
@@ -86,8 +86,21 @@ fn spawn_error(binary: &Path, e: &io::Error) -> ClientError {
     );
     ClientError::DaemonStart(format!(
         "cannot find the teiryod binary (looked in {looked}) — \
-         build it with `cargo build -p teiryod`"
+         install it with `mise run install`, or build it with \
+         `cargo build -p teiryod` when running from a checkout"
     ))
+}
+
+/// Wait on `child` in the background. Nothing here waits on the daemon inline —
+/// it deliberately outlives the TUI — but a `Child` dropped unwaited leaves the
+/// daemon `<defunct>` in our process table for as long as we run, and the
+/// reconnect loop spawns one per second per connection while the socket is
+/// down. The thread parks in `wait` and dies with the process, which reparents
+/// a daemon that is still running to init.
+fn reap_in_background(mut child: Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 /// Spawn `teiryod` detached in its own session-like process group, stdio
@@ -100,7 +113,7 @@ fn spawn_daemon(binary: &Path) -> io::Result<()> {
         .stdout(daemon_output())
         .stderr(daemon_output())
         .process_group(0);
-    cmd.spawn().map(drop)
+    cmd.spawn().map(reap_in_background)
 }
 
 /// Connect to the daemon socket, spawning the daemon if it is not running.
@@ -172,5 +185,66 @@ mod tests {
             Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
             None => std::env::remove_var("XDG_RUNTIME_DIR"),
         }
+    }
+
+    /// A zombie keeps its pid valid for the life of its parent, so polling the
+    /// pid is what separates "reaped" from "still sitting in our process
+    /// table": without the background `wait` this never reaches `ESRCH`.
+    #[test]
+    fn reaped_child_leaves_no_zombie() {
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("/bin/sh should be spawnable");
+        let pid = i32::try_from(child.id()).expect("a pid fits in pid_t");
+        reap_in_background(child);
+
+        for _ in 0..200 {
+            // SAFETY: signal 0 performs no delivery, only an existence check.
+            if unsafe { libc::kill(pid, 0) } == -1
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("pid {pid} still exists: the child was never reaped");
+    }
+
+    #[test]
+    fn missing_daemon_error_names_both_ways_to_get_it() {
+        let missing = io::Error::from(io::ErrorKind::NotFound);
+        let ClientError::DaemonStart(message) =
+            spawn_error(Path::new("/nowhere/teiryod"), &missing)
+        else {
+            panic!("a missing binary is a start failure");
+        };
+        // Spelled out end to end: the remedy spans two escaped line
+        // continuations, and a botched one would only show up as stray
+        // whitespace in the sentence the user actually reads.
+        assert!(
+            message.ends_with(
+                "install it with `mise run install`, or build it with \
+                 `cargo build -p teiryod` when running from a checkout"
+            ),
+            "{message}"
+        );
+    }
+
+    /// The falsifier for the test above: only `NotFound` means "we could not
+    /// find it", so any other failure keeps naming the binary it tried.
+    #[test]
+    fn other_spawn_failures_name_the_binary() {
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        let ClientError::DaemonStart(message) = spawn_error(Path::new("/nowhere/teiryod"), &denied)
+        else {
+            panic!("a failed start is a start failure");
+        };
+        assert!(message.contains("/nowhere/teiryod"), "{message}");
+        assert!(!message.contains("mise run install"), "{message}");
     }
 }

@@ -3,7 +3,7 @@
 ## Process model
 
 - Two processes: `teiryod` (daemon) and `teiryo` (TUI client). Providers are compiled in — no plugin or dylib loading.
-- **Startup**: `teiryo` spawns `teiryod` on first connect if the socket is unreachable (`setsid`-detached, stdout/stderr redirected to the log file) — tmux's client/server pattern. No manual double-fork.
+- **Startup**: `teiryo` spawns `teiryod` on first connect if the socket is unreachable (its own process group, stdout/stderr redirected to the log file, reaped in the background so it never lingers as a zombie) — tmux's client/server pattern. No manual double-fork.
 - **Single instance**: the UDS bind *is* the lock. `EADDRINUSE` → a daemon is already running → exit 0. No separate pidfile/lockfile.
 - **Stale socket**: on bind failure, try connecting as a client first; `ECONNREFUSED` means the socket is stale from a crash → unlink and rebind.
 - **Shutdown**: SIGTERM/SIGINT → flush DB, unlink socket. The TUI quitting never kills the daemon; daemon shutdown is only via the explicit `Shutdown` request or a signal.
