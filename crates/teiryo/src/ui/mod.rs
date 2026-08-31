@@ -467,6 +467,112 @@ mod tests {
 
     /// Empty state: connected but the daemon has discovered nothing yet.
     #[test]
+    fn every_row_carries_its_derived_numbers_when_the_pane_is_tall_enough() {
+        let mut app = populated();
+        let out = rendered(&mut app, 120, 40);
+
+        // The gauge line no longer carries pace; the continuation line does,
+        // together with the runway and the pace still affordable.
+        assert!(out.contains("pace"), "expected a pace field:\n{out}");
+        assert!(out.contains("cap in"), "expected a runway field:\n{out}");
+        assert!(
+            out.contains("afford"),
+            "expected an affordable pace:\n{out}"
+        );
+        assert!(out.contains("at reset"), "expected a projection:\n{out}");
+
+        // The 97% window is 5 minutes from its cap and 2 hours from its reset,
+        // so the cap is what binds; the 3% window's runway runs days past the
+        // reset and is reported anyway.
+        assert!(out.contains("cap in 5m"), "expected a near cap:\n{out}");
+        assert!(
+            out.contains("cap in 4d"),
+            "expected a runway past the reset:\n{out}"
+        );
+    }
+
+    /// Readings of `id` for the populated account, oldest first.
+    fn recent_series(id: &str, readings: &[(i64, f64)]) -> Vec<QuotaSnapshot> {
+        readings
+            .iter()
+            .map(|&(minutes_ago, used)| QuotaSnapshot {
+                poll_id: PollId::generate(),
+                ts: Utc::now() - Duration::minutes(minutes_ago),
+                window: WindowId::from(id),
+                label: "Session".into(),
+                unit: QuotaUnit::Percent,
+                used,
+                limit: Some(100.0),
+                reset_at: Some(Utc::now() + Duration::hours(2)),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_row_reports_a_recent_burst_beside_the_average_that_hides_it() {
+        let mut app = populated();
+        // The 5-hour window is 3 hours in at 62%, an unremarkable 1.03×
+        // average — but 20 of those points went in the last 20 minutes.
+        app.set_recent(
+            &AccountId::from("claude:default"),
+            recent_series("session_5h", &[(20, 42.0), (0, 62.0)]),
+        );
+        let out = rendered(&mut app, 120, 40);
+
+        assert!(out.contains("1.03× pace"), "expected the average:\n{out}");
+        assert!(
+            out.contains("3.00× now"),
+            "expected the recent rate:\n{out}"
+        );
+        // Windows with no history behind them simply omit the field.
+        assert_eq!(out.matches("× now").count(), 1, "only one series:\n{out}");
+    }
+
+    #[test]
+    fn a_short_pane_keeps_the_bars_and_drops_the_derived_line() {
+        let mut app = populated();
+        let out = rendered(&mut app, 120, 12);
+
+        // Every window still has a gauge, and pace falls back to its column on
+        // the gauge line rather than vanishing with the continuation line.
+        assert!(out.contains("62%"), "expected the bars to survive:\n{out}");
+        assert!(
+            out.contains("pace"),
+            "expected pace on the gauge line:\n{out}"
+        );
+        assert!(
+            !out.contains("afford"),
+            "the derived line should be gone:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_pane_sheds_derived_fields_from_the_right() {
+        let mut app = populated();
+        let out = rendered(&mut app, 60, 40);
+
+        // Pace is the last field to go, so it survives where the rest cannot.
+        assert!(out.contains("pace"), "expected pace to survive:\n{out}");
+        assert!(
+            !out.contains("at reset"),
+            "the projection should be gone:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_help_overlay_says_what_the_row_numbers_mean() {
+        let mut app = populated();
+        app.overlay = Some(Overlay::Help);
+        let out = rendered(&mut app, 100, 50);
+
+        assert!(out.contains("What the numbers on a row mean"), "{out}");
+        assert!(out.contains("burn rate since the window opened"), "{out}");
+        // The legend sits below the keymap, so nothing may push it out through
+        // the bottom border — the box sizes itself from the line count.
+        assert!(out.contains("press any key to close"), "{out}");
+    }
+
+    #[test]
     fn renders_before_any_data_arrives() {
         for tab in DetailTab::ALL {
             let mut app = App::new();

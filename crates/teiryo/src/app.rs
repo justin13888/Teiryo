@@ -5,7 +5,7 @@
 //! settings) draw *over* it rather than replacing it, so there is no screen
 //! stack and no per-screen keymap to keep straight.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
@@ -314,6 +314,10 @@ pub struct App {
     pub detail_area: Rect,
     /// Loaded trend series, if any.
     pub trend: Option<Trend>,
+    /// Recent history per window, for the burn rates the rows draw. Keyed by
+    /// window rather than held on [`Trend`] because every row needs its own,
+    /// not just the selected one.
+    recent: HashMap<(AccountId, WindowId), Vec<QuotaSnapshot>>,
     /// Loaded poll log.
     pub activity: Vec<PollEvent>,
     /// Loaded provider health.
@@ -357,6 +361,7 @@ impl App {
             quotas_area: Rect::ZERO,
             detail_area: Rect::ZERO,
             trend: None,
+            recent: HashMap::new(),
             activity: Vec::new(),
             health: Vec::new(),
             overlay: None,
@@ -562,6 +567,29 @@ impl App {
         } else {
             self.trend_pan_secs.clamp(0, max)
         };
+    }
+
+    /// Install one account's recent history, bucketed per window.
+    ///
+    /// Replaces everything held for that account, so a window the daemon has
+    /// stopped reporting leaves with its series rather than freezing a rate
+    /// that no longer has data behind it.
+    pub fn set_recent(&mut self, account: &AccountId, snapshots: Vec<QuotaSnapshot>) {
+        self.recent.retain(|(a, _), _| a != account);
+        for snapshot in snapshots {
+            self.recent
+                .entry((account.clone(), snapshot.window.clone()))
+                .or_default()
+                .push(snapshot);
+        }
+    }
+
+    /// One window's recent readings, oldest first; empty until the first
+    /// history reply for its account lands.
+    pub fn recent_points(&self, account: &AccountId, window: &WindowId) -> &[QuotaSnapshot] {
+        self.recent
+            .get(&(account.clone(), window.clone()))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Pan the chart by `secs`, positive being *later*, clipped at both ends:

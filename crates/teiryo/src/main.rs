@@ -13,6 +13,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use teiryo_core::domain::AccountId;
 use teiryo_core::protocol::handshake::PROTOCOL_VERSION;
 use teiryo_core::{ErrorKind, Request, Response};
 
@@ -49,6 +50,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new();
     refresh_status(&mut command, &mut app).await;
+    refresh_recent(&mut command, &mut app).await;
     reload_detail(&mut command, &mut app).await;
     // Primed before the first frame so a rejected config.toml shows in the
     // header immediately, rather than only once the user opens Settings.
@@ -171,6 +173,7 @@ async fn drive(
                     app.disconnected = false;
                     app.poll_settled(&event.account);
                     refresh_status(command, app).await;
+                    refresh_recent(command, app).await;
                     // The detail pane tracks the same data, so it refreshes
                     // with the dashboard rather than freezing at whatever it
                     // held when the tab was opened.
@@ -181,6 +184,7 @@ async fn drive(
                     app.config = Some(*state);
                     // Cadences just changed, and `Status` is what carries them.
                     refresh_status(command, app).await;
+                    refresh_recent(command, app).await;
                 }
                 NetEvent::Disconnected(message) => {
                     app.disconnected = true;
@@ -197,6 +201,7 @@ async fn drive(
                         app.disconnected = false;
                         app.error = None;
                         refresh_status(command, app).await;
+                        refresh_recent(command, app).await;
                         reload_detail(command, app).await;
                         // The daemon may have restarted onto a different
                         // config; a stale generation would also make the new
@@ -224,6 +229,40 @@ async fn refresh_status(command: &mut Client, app: &mut App) {
     match command.request(&request).await {
         Ok(Response::Status(statuses)) => app.set_statuses(statuses),
         other => note_unexpected(app, other),
+    }
+}
+
+/// How far back the rows' burn rates may look. Twelve hours covers the longest
+/// lookback `metrics::recent_pace` uses, and at the default cadence it is a few
+/// hundred readings per window — inside `RECENT_MAX_POINTS`, so the daemon
+/// returns them undownsampled and a rate is measured from real endpoints.
+const RECENT_SPAN_HOURS: i64 = 12;
+
+/// Point budget for one window's slice of that history.
+const RECENT_MAX_POINTS: u32 = 512;
+
+/// Fetch the recent history the rows measure their burn rates from.
+///
+/// One request per account rather than per window: `History` takes
+/// `window: None` to mean all of them, and the daemon buckets the reply by
+/// window on the way out.
+async fn refresh_recent(command: &mut Client, app: &mut App) {
+    let since = Utc::now() - chrono::Duration::hours(RECENT_SPAN_HOURS);
+    let accounts: Vec<AccountId> = app.statuses.iter().map(|s| s.account.id.clone()).collect();
+    for account in accounts {
+        let request = Request::History {
+            account: account.clone(),
+            window: None,
+            since,
+            until: None,
+            max_points: Some(RECENT_MAX_POINTS),
+        };
+        match command.request(&request).await {
+            Ok(Response::History(page)) => app.set_recent(&account, page.snapshots),
+            // One unreachable account means the socket is gone; the rest will
+            // fail the same way, so stop rather than pile up identical errors.
+            other => return note_unexpected(app, other),
+        }
     }
 }
 

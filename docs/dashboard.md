@@ -26,26 +26,55 @@ selection only drives which series the chart emphasizes.
 ```
 Teiryō  claude/max-20x · a1b2  4 windows         ● live
 
- Session — 5 hour   ██████░░░░  62%  ▁▂▄▆█
-   1.4× pace · cap in ~48m · resets 1h47m
- Weekly — all       ███░░░░░░░  38%  ▁▁▂▃▄
-   0.9× pace · resets 3d 04h
- Weekly — Opus      ███████░░░  71%  ▂▄▆▇█
-   1.3× pace · cap in ~2d · resets 3d 04h
- Weekly — Sonnet    ██░░░░░░░░  22%  ▁▁▁▂▂
-   0.5× pace · resets 3d 04h
+ Session — 5 hour   ██████░░░░  62%  ▁▂▄▆█  ⟳ 1h 47m
+   ▲ 1.40× pace · ▲ 2.10× now · cap in 48m · afford 0.62× · →140% at reset
+ Weekly — all       ███░░░░░░░  38%  ▁▁▂▃▄  ⟳ 3d 04h
+   ▼ 0.79× pace · = 0.90× now · cap in 6d 2h · afford 1.27× · →79% at reset
 ```
 
-Per row: bar, utilization, inline sparkline, then a continuation line with
-`pace`, `eta_to_cap`, and the reset countdown — all three already exist in
-`crates/teiryo/src/metrics.rs` and are simply promoted from the detail pane.
-The continuation line is dropped when the row is a superseded account's, or
-when height is tight (bars survive, detail lines go first).
+Per row: bar, utilization, inline sparkline and the reset countdown, then a
+continuation line of everything derived from them. All of it comes from
+`crates/teiryo/src/metrics.rs` and needs no data the row does not already
+carry, except the recent rate — see below.
 
-The sparkline is the same series the chart draws, downsampled to the row
-width. It needs recent history in `AccountStatus`, so the daemon pushes a short
-per-window tail (the last ~64 points) rather than the TUI issuing a history
-request per row.
+The five derived fields, and why each is not the others:
+
+- **`pace`** — usage over elapsed time, both as fractions of the window. The
+  average *since the window opened*, so it answers "how have I been going",
+  and an idle stretch keeps it low however hard the last hour ran.
+- **`now`** — `recent_pace`, the same scale over a lookback of a tenth of the
+  window. This is the one that moves when the user does. It is the only field
+  needing history, and it stays blank until enough of it exists.
+- **`cap in`** — `runway`, how long the remaining headroom lasts at `pace`.
+  Reported whether or not the window resets first: a runway past the reset is
+  a real answer to "how long could I keep this up", and it is drawn dim
+  instead of warn, because the rollover, not the cap, is what arrives.
+- **`afford`** — `affordable_pace`, what is left over the time left. The
+  forward-looking mirror of `pace`, and the field that answers "may I spend
+  the rest of this window in the next day and a half?" without arithmetic.
+- **`→…% at reset`** — projected utilization, which is *numerically identical*
+  to `pace` (`u + (u/E)(1-E) = u/E`). Kept only because an outcome reads more
+  plainly than a ratio, and so the first field shed when the row narrows.
+
+Fields are appended only while they fit, so a narrow terminal sheds them from
+the right, `pace` last. The whole continuation line is dropped when the row is
+a superseded account's, or when height is tight (bars survive, detail lines go
+first) — in which case `pace` returns to a column on the gauge line.
+
+`recent_pace` is measured between two readings of the current window, floored
+at the window's own start and cut at any reading carrying a different
+`reset_at`, so it is never taken across a rollover. The recorded rollover list
+is deliberately not what guards it: `boundaries` filters unannounced rollovers
+out, and an unannounced rollover is exactly the large drop in `used` that would
+otherwise read as burn. The TUI fetches the series with one `History` request
+per account (`window: None`), alongside the `Status` it already refreshes.
+
+The sparkline is the same series the chart draws, downsampled to the row width.
+It is the one part of this row still unbuilt. It needs no new plumbing: the
+per-account `History` fetch that feeds `recent_pace` already carries every
+window's recent series, which supersedes the earlier plan of pushing a
+per-window tail in `AccountStatus` and the protocol change that would have
+taken.
 
 ## Screen 2 — the trend: one overlaid chart
 
