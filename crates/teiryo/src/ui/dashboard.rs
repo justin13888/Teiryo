@@ -409,7 +409,14 @@ fn derived_line(
     let mut spans = vec![Span::raw(" ".repeat(INDENT))];
     let mut used = INDENT;
     for (text, style) in fields {
-        let cost = text.chars().count() + if used > INDENT { SEPARATOR.len() } else { 0 };
+        // Counted in cells, not bytes: the separator's "·" is two bytes wide
+        // and one column, and so are the glyphs inside the fields.
+        let separator = if used > INDENT {
+            SEPARATOR.chars().count()
+        } else {
+            0
+        };
+        let cost = text.chars().count() + separator;
         if used + cost > width {
             break;
         }
