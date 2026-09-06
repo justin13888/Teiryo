@@ -26,6 +26,7 @@ crossterm = "0.28"
 directories = "5"
 futures = "0.3"
 notify = "8"
+proptest = "1"
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
