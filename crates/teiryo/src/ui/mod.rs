@@ -137,6 +137,7 @@ mod tests {
                 critical_threshold: 0.95,
                 note: note.map(str::to_owned),
             },
+            observed_start: None,
         }
     }
 
@@ -248,6 +249,7 @@ mod tests {
                 window: view.window.id.clone(),
                 poll: PollId::generate(),
                 observed_at: Utc::now() - Duration::minutes(minutes_ago),
+                prev_observed_at: None,
                 kind,
                 prev_reset_at: Some(Utc::now() + Duration::hours(2)),
                 new_reset_at: Some(Utc::now() + Duration::hours(3)),

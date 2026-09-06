@@ -247,6 +247,7 @@ impl Daemon {
             previous_windows(st.latest_success.get(&event.account)),
             &windows,
             event.id,
+            st.latest_success.get(&event.account).map(|e| e.ts),
             event.ts,
         );
         for r in rollovers.iter().filter(|r| r.kind.is_surprise()) {
@@ -348,6 +349,7 @@ impl Daemon {
                         .map(|window| WindowView {
                             hint: presenter
                                 .map_or_else(default_hint, |adapter| adapter.render_hint(window)),
+                            observed_start: None,
                             window: window.clone(),
                         })
                         .collect(),

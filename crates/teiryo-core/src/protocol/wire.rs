@@ -9,7 +9,7 @@ use crate::domain::{
     Account, AccountId, PollEvent, PollId, ProviderId, QuotaSnapshot, QuotaWindow, WindowId,
 };
 use crate::error::ErrorKind;
-use crate::rollover::WindowRollover;
+use crate::rollover::{ObservedStart, WindowRollover};
 
 /// Client → daemon request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,6 +137,20 @@ pub struct WindowView {
     pub window: QuotaWindow,
     /// How the provider wants it drawn.
     pub hint: RenderHint,
+    /// When this window was last seen to actually restart, if it ever was.
+    ///
+    /// `reset_at` minus the window's own length is the window's start only
+    /// when the provider moved `reset_at` with the reset. Where it did not —
+    /// a weekly quota that restarts early and keeps publishing the old instant
+    /// — that arithmetic describes a window which is over, and every rate
+    /// derived from it reads low. This is the correction.
+    ///
+    /// The daemon holds it because only the daemon can: the reset may be days
+    /// older than any history a client fetches, and it is inferred from
+    /// consecutive polls the client never sees individually. `None` when no
+    /// reset has been observed for this window, in which case the provider's
+    /// own arithmetic is all there is and is taken at face value.
+    pub observed_start: Option<ObservedStart>,
 }
 
 /// Live status of one account: its windows and the poll that produced them.

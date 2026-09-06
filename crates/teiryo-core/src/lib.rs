@@ -30,7 +30,10 @@ pub use protocol::wire::{
     AccountHealth, AccountStatus, ConfigEdit, ConfigState, ConfigView, HistoryPage, ProviderHealth,
     ProviderSettings, Request, Response, WindowView,
 };
-pub use rollover::{RolloverKind, WindowRollover, RESET_TOLERANCE};
+pub use rollover::{
+    is_collapse, ObservedStart, RolloverKind, WindowRollover, MIN_RESET_DROP, RESET_COLLAPSE_RATIO,
+    RESET_TOLERANCE,
+};
 pub use storage::{Storage, StorageError, MAX_HISTORY_POINTS};
 
 #[cfg(test)]

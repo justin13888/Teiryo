@@ -1,8 +1,12 @@
 //! Detecting when a quota window rolled over, and whether that was a surprise.
 //!
-//! A rollover is read from `reset_at` **moving**, never from `used` falling: a
-//! provider correction that lowers `used` mid-window is not a new window, and
-//! treating it as one would split a chart series that never actually broke.
+//! A rollover is read from `reset_at` **moving** where the provider moved it,
+//! and otherwise from `used` collapsing. The second signal is the weaker one
+//! and is treated as such: a provider correction that shaves a couple of
+//! points off `used` mid-window is not a new window, and treating it as one
+//! would split a chart series that never actually broke. What separates the
+//! two is [`is_collapse`] — a fall to at most half of what was there, and by
+//! at least a few points, which a correction is not and a reset always is.
 //!
 //! The interesting cases are the ones the provider did not advertise. A window
 //! whose `reset_at` advances while the *old* reset was still in the future
@@ -33,10 +37,34 @@ use crate::domain::{AccountId, PollId, QuotaWindow, WindowId};
 /// like a rollover.
 pub const RESET_TOLERANCE: Duration = Duration::seconds(120);
 
-/// Utilization drop that counts as an unannounced reset rather than a
-/// provider correction. A quarter of the window's capacity vanishing in one
-/// poll interval is not a rounding fix.
-pub const UNANNOUNCED_DROP: f64 = 0.25;
+/// What must be left for a fall in usage to be a correction rather than a
+/// reset. A window holding at most half of what it held a poll ago was not
+/// revised — it restarted.
+///
+/// Deliberately a ratio rather than an absolute drop. An absolute threshold
+/// asks "did a lot of quota vanish", which is the wrong question: a weekly
+/// window that resets from 20% to 0 gave back a fifth of the week and is
+/// indistinguishable, on that measure, from a rounding fix — so it went
+/// unrecorded, and every number derived from the window's start stayed
+/// anchored to a window that had already ended.
+pub const RESET_COLLAPSE_RATIO: f64 = 0.5;
+
+/// How much of the window must actually vanish before a fall is considered at
+/// all, whatever the ratio says.
+///
+/// The ratio alone is too eager at the bottom of the scale, where halving a
+/// small number is easy: a correction from 5% to 2% passes it, and a false
+/// reset is far more costly than a missed one. It re-anchors the window to an
+/// instant nothing actually restarted at, so every derived number — the pace,
+/// the runway, the countdown to the cap — is measured against a span that
+/// never ran, and the ones the client suppresses while a window is young
+/// simply disappear from the row. A missed reset merely leaves the pace
+/// reading as it did before any of this existed.
+///
+/// Five points is comfortably above the corrections providers actually make
+/// (a point or two) and comfortably below the reported symptom, a weekly
+/// window restarting from 20%.
+pub const MIN_RESET_DROP: f64 = 0.05;
 
 /// Why a window's accounting restarted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +142,58 @@ pub struct WindowRollover {
     pub prev_used: f64,
     /// `used` after it.
     pub new_used: f64,
+    /// When the poll this was compared against completed — the latest instant
+    /// the *old* window was still provably running.
+    ///
+    /// With `observed_at` it brackets the reset. In normal running that
+    /// bracket is one poll interval wide and can be ignored; across a daemon
+    /// outage it is days wide, and that width is the uncertainty every rate
+    /// anchored to this reset inherits. Hiding it is what makes a pace
+    /// computed after an outage diverge without saying so.
+    ///
+    /// `None` on rows written before the column existed; those read as a
+    /// zero-width bracket at `observed_at`, which is the behaviour they had.
+    pub prev_observed_at: Option<DateTime<Utc>>,
+}
+
+/// Where a window is known to have begun, and how precisely.
+///
+/// A reset is never seen happening, only inferred from two readings that
+/// straddle it, so the honest answer is an interval rather than an instant.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ObservedStart {
+    /// Latest instant the previous window was still provably running.
+    pub not_before: DateTime<Utc>,
+    /// Earliest instant the new window was provably running.
+    pub not_after: DateTime<Utc>,
+}
+
+impl ObservedStart {
+    /// The bracket implied by one rollover.
+    pub fn from_rollover(rollover: &WindowRollover) -> Self {
+        Self {
+            not_before: rollover.prev_observed_at.unwrap_or(rollover.observed_at),
+            not_after: rollover.observed_at,
+        }
+    }
+
+    /// The single instant to compute against: the bracket's midpoint.
+    ///
+    /// Neither end is usable on its own. `not_before` under-reports the pace
+    /// after an outage — the same fault this whole rule exists to fix, only
+    /// smaller — while `not_after` can sit arbitrarily close to `now`, and a
+    /// window that opened a moment ago divides by an elapsed fraction of
+    /// nearly zero. The midpoint is wrong by at most half the bracket in
+    /// either direction, which is the best a bracket allows.
+    pub fn estimate(self) -> DateTime<Utc> {
+        self.not_before + (self.not_after - self.not_before) / 2
+    }
+
+    /// How wide the bracket is — how much the estimate could be out by,
+    /// doubled.
+    pub fn uncertainty(self) -> Duration {
+        self.not_after - self.not_before
+    }
 }
 
 /// Compare two consecutive successful polls and report every window that
@@ -122,11 +202,16 @@ pub struct WindowRollover {
 /// Windows present in only one of the two are skipped: a window appearing for
 /// the first time has nothing to have rolled over from, and one that vanished
 /// tells us about the provider's payload, not about a reset.
+///
+/// `prev_observed_at` is when the earlier of the two polls completed; it is
+/// recorded on every rollover so the reset's instant is stored as the bracket
+/// it actually is rather than as the moment we happened to notice.
 pub fn detect(
     account: &AccountId,
     prev: &[QuotaWindow],
     next: &[QuotaWindow],
     poll: PollId,
+    prev_observed_at: Option<DateTime<Utc>>,
     observed_at: DateTime<Utc>,
 ) -> Vec<WindowRollover> {
     let before: HashMap<&WindowId, &QuotaWindow> = prev.iter().map(|w| (&w.id, w)).collect();
@@ -144,6 +229,7 @@ pub fn detect(
                 new_reset_at: after.reset_at,
                 prev_used: before.used,
                 new_used: after.used,
+                prev_observed_at,
             })
         })
         .collect()
@@ -177,9 +263,18 @@ fn classify(
 /// Requires both readings to be expressible as a ratio; without a limit or a
 /// percentage unit there is no scale to judge "far enough" against, and a bare
 /// token count falling is not evidence of anything.
+///
+/// Exported as the crate's answer to "was that a reset": what the detector
+/// records and what anything downstream calls a reset have to be the same
+/// question, or the chart's rules and the row's numbers end up describing
+/// different windows.
+pub fn is_collapse(prev: f64, new: f64) -> bool {
+    prev - new >= MIN_RESET_DROP && new <= prev * RESET_COLLAPSE_RATIO
+}
+
 fn collapsed(before: &QuotaWindow, after: &QuotaWindow) -> bool {
     match (before.utilization(), after.utilization()) {
-        (Some(prev), Some(new)) => prev - new > UNANNOUNCED_DROP,
+        (Some(prev), Some(new)) => is_collapse(prev, new),
         _ => false,
     }
 }
@@ -214,7 +309,14 @@ mod tests {
     }
 
     fn detected(before: QuotaWindow, after: QuotaWindow) -> Option<RolloverKind> {
-        let found = detect(&account(), &[before], &[after], PollId::generate(), now());
+        let found = detect(
+            &account(),
+            &[before],
+            &[after],
+            PollId::generate(),
+            Some(now() - Duration::minutes(3)),
+            now(),
+        );
         found.first().map(|r| r.kind)
     }
 
@@ -295,6 +397,59 @@ mod tests {
     }
 
     #[test]
+    fn a_reset_is_judged_by_what_is_left_not_by_how_much_went() {
+        let reset = Some(now() + Duration::hours(2));
+        // A fifth of a weekly window handed back is a reset, however modest
+        // the absolute drop. This is the case the old 25-point threshold could
+        // not see, and the reason the pace row stayed anchored to a window
+        // that had already ended.
+        assert_eq!(
+            detected(window(20.0, reset), window(0.0, reset)),
+            Some(RolloverKind::Unannounced)
+        );
+        // Halving a number this small is a revision, not a restart: the ratio
+        // alone is trivially satisfied down here, so the floor is what decides.
+        assert_eq!(detected(window(0.4, reset), window(0.1, reset)), None);
+        assert_eq!(detected(window(5.0, reset), window(2.0, reset)), None);
+        // A big drop that still leaves most of the window standing is a
+        // correction, not a restart — the ratio, not the drop, decides.
+        assert_eq!(detected(window(90.0, reset), window(50.0, reset)), None);
+    }
+
+    #[test]
+    fn an_observed_start_is_the_middle_of_the_bracket_it_was_seen_in() {
+        let observed_at = now();
+        let found = detect(
+            &account(),
+            &[window(60.0, Some(observed_at + Duration::hours(2)))],
+            &[window(0.0, Some(observed_at + Duration::hours(2)))],
+            PollId::generate(),
+            Some(observed_at - Duration::hours(4)),
+            observed_at,
+        );
+        let start = ObservedStart::from_rollover(&found[0]);
+        assert_eq!(start.uncertainty(), Duration::hours(4));
+        assert_eq!(start.estimate(), observed_at - Duration::hours(2));
+    }
+
+    #[test]
+    fn a_rollover_with_no_recorded_predecessor_brackets_nothing() {
+        // How a row written before the column existed reads: the instant we
+        // noticed, with no claim about how long before that it happened.
+        let found = detect(
+            &account(),
+            &[window(60.0, Some(now() + Duration::hours(2)))],
+            &[window(0.0, Some(now() + Duration::hours(2)))],
+            PollId::generate(),
+            None,
+            now(),
+        );
+        let start = ObservedStart::from_rollover(&found[0]);
+        assert_eq!(start.uncertainty(), Duration::zero());
+        assert_eq!(start.estimate(), now());
+    }
+
+    #[test]
     fn usage_rising_is_never_a_rollover() {
         let reset = Some(now() + Duration::hours(2));
         assert_eq!(detected(window(20.0, reset), window(55.0, reset)), None);
@@ -327,7 +482,15 @@ mod tests {
         let mut fresh = window(0.0, Some(now() + Duration::hours(5)));
         fresh.id = WindowId::from("weekly");
         // `fresh` has no predecessor and `existing` has no successor.
-        assert!(detect(&account(), &[existing], &[fresh], PollId::generate(), now()).is_empty());
+        assert!(detect(
+            &account(),
+            &[existing],
+            &[fresh],
+            PollId::generate(),
+            Some(now() - Duration::minutes(3)),
+            now()
+        )
+        .is_empty());
     }
 
     #[test]
@@ -346,6 +509,7 @@ mod tests {
             ],
             &[window(1.0, Some(now() + Duration::hours(5))), weekly_after],
             poll,
+            Some(now() - Duration::minutes(3)),
             now(),
         );
         assert_eq!(found.len(), 2);
@@ -387,5 +551,238 @@ mod tests {
             assert_eq!(RolloverKind::from_column(kind.as_str()), Some(kind));
         }
         assert_eq!(RolloverKind::from_column("nonsense"), None);
+    }
+}
+
+/// Property tests for reset detection against a generated ground truth.
+///
+/// The invariant all of these rest on: inside one window instance `used` only
+/// ever climbs. A reading lower than the one before it therefore was not
+/// revised — the window restarted. These generate a series whose reset
+/// instants are *known*, and hold the detector to them.
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use chrono::TimeZone;
+    use proptest::prelude::*;
+
+    use crate::domain::{QuotaUnit, ResetKind, WindowScope};
+
+    /// One generated window instance: when it opened, and how far usage got
+    /// before the window ended.
+    #[derive(Debug, Clone)]
+    struct Run {
+        opened_at: DateTime<Utc>,
+        /// Utilization at each reading, oldest first, non-decreasing.
+        used: Vec<f64>,
+    }
+
+    /// A generated history of one window: consecutive runs, the readings taken
+    /// of them, and whether the provider moved `reset_at` at each boundary.
+    #[derive(Debug, Clone)]
+    struct Scenario {
+        span: Duration,
+        cadence: Duration,
+        runs: Vec<Run>,
+        /// Whether `reset_at` advances with each reset. `false` is the case
+        /// this change is about: the provider restarts the quota and leaves
+        /// the published instant where it was.
+        announced: bool,
+    }
+
+    impl Scenario {
+        /// The readings, oldest first, as the daemon would have polled them,
+        /// each paired with the instant it was taken.
+        fn readings(&self) -> Vec<(DateTime<Utc>, QuotaWindow)> {
+            let mut out = Vec::new();
+            for run in &self.runs {
+                // Announced: each run publishes its own end. Silent: every run
+                // keeps reporting the first one's, which is the whole defect.
+                let reset_at = if self.announced {
+                    run.opened_at + self.span
+                } else {
+                    self.runs[0].opened_at + self.span
+                };
+                for (k, used) in run.used.iter().enumerate() {
+                    out.push((
+                        run.opened_at + self.cadence * (k as i32),
+                        QuotaWindow {
+                            id: WindowId::from("w"),
+                            label: "w".to_owned(),
+                            scope: WindowScope::AccountWide,
+                            reset_kind: ResetKind::Rolling(
+                                self.span.to_std().expect("positive span"),
+                            ),
+                            unit: QuotaUnit::Percent,
+                            used: used * 100.0,
+                            limit: Some(100.0),
+                            reset_at: Some(reset_at),
+                        },
+                    ));
+                }
+            }
+            out.sort_by_key(|(ts, _)| *ts);
+            out
+        }
+
+        /// Each instant at which a run actually gave way to the next, as the
+        /// bracket between the last reading of the old and the first of the new.
+        fn true_resets(&self) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+            self.runs
+                .windows(2)
+                .map(|pair| {
+                    let last_old =
+                        pair[0].opened_at + self.cadence * (pair[0].used.len() as i32 - 1);
+                    (last_old, pair[1].opened_at)
+                })
+                .collect()
+        }
+
+        /// Every rollover the detector finds, walking the readings pairwise the
+        /// way the daemon does.
+        fn detected(&self) -> Vec<WindowRollover> {
+            self.readings()
+                .windows(2)
+                .flat_map(|pair| {
+                    detect(
+                        &AccountId::from("a"),
+                        std::slice::from_ref(&pair[0].1),
+                        std::slice::from_ref(&pair[1].1),
+                        PollId::generate(),
+                        Some(pair[0].0),
+                        pair[1].0,
+                    )
+                })
+                .collect()
+        }
+    }
+
+    /// A non-decreasing ramp of `len` readings from 0 up to exactly `peak`.
+    fn ramp(len: usize, peak: f64) -> Vec<f64> {
+        let step = peak / (len - 1) as f64;
+        (0..len).map(|k| step * k as f64).collect()
+    }
+
+    /// Scenarios with `runs` consecutive window instances. Each run restarts at
+    /// zero and climbs to its own peak; that peak is how much usage vanishes at
+    /// the reset, and so is exactly what decides whether an absolute threshold
+    /// can see the reset at all.
+    fn scenario(runs: usize) -> impl Strategy<Value = Scenario> {
+        (
+            // 5 hours to 14 days: the two shapes Claude publishes, and beyond.
+            5i64 * 3600..14 * 24 * 3600i64,
+            60i64..600i64,
+            // A peak floor clear of `MIN_RESET_DROP`, so every generated reset
+            // is one a correct detector is obliged to report rather than one
+            // it is entitled to read as a correction.
+            prop::collection::vec((4usize..40, 0.08f64..1.0), runs),
+            any::<bool>(),
+        )
+            .prop_map(|(span_secs, cadence_secs, shapes, announced)| {
+                let cadence = Duration::seconds(cadence_secs);
+                let mut opened_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+                let mut out = Vec::new();
+                for (len, peak) in shapes {
+                    out.push(Run {
+                        opened_at,
+                        used: ramp(len, peak),
+                    });
+                    opened_at += cadence * (len as i32);
+                }
+                Scenario {
+                    span: Duration::seconds(span_secs),
+                    cadence,
+                    runs: out,
+                    announced,
+                }
+            })
+    }
+
+    proptest! {
+        /// **P1 — the ground truth is what it claims to be.** Readings are
+        /// strictly ordered in time and non-decreasing inside each run, and the
+        /// only falls are at the generated reset instants. Without this the
+        /// other two properties would be evidence about the generator rather
+        /// than about the detector.
+        #[test]
+        fn the_generated_history_falls_only_at_its_own_resets(scenario in scenario(3)) {
+            let readings = scenario.readings();
+            let resets: Vec<_> = scenario.true_resets().iter().map(|(_, to)| *to).collect();
+            for pair in readings.windows(2) {
+                let (prev_ts, prev) = &pair[0];
+                let (ts, next) = &pair[1];
+                prop_assert!(ts > prev_ts, "readings out of order at {ts}");
+                if next.used < prev.used {
+                    prop_assert!(resets.contains(ts), "usage fell at {ts}, which is no reset");
+                }
+            }
+        }
+
+        /// **P2 — every reset is observed.** A window that restarts from zero
+        /// after climbing to `peak` reset, however small `peak` was, and the
+        /// detector must report it between the two readings that straddle it.
+        ///
+        /// Red before the change that introduced it: the rule was an absolute
+        /// drop of a quarter of the window, so a silent weekly reset from 20%
+        /// to 0 was never recorded — and a reset nobody recorded is a window
+        /// start nobody can correct.
+        #[test]
+        fn every_reset_is_observed(scenario in scenario(3)) {
+            let found = scenario.detected();
+            for (from, to) in scenario.true_resets() {
+                prop_assert!(
+                    found.iter().any(|r| r.observed_at == to),
+                    "reset in ({from}, {to}] went unobserved; detected: {:?}",
+                    found.iter().map(|r| (r.observed_at, r.kind)).collect::<Vec<_>>(),
+                );
+            }
+        }
+
+        /// **P3 — no phantom resets.** One run climbing monotonically is one
+        /// window: nothing inside it may read as a boundary. This is the guard
+        /// on relaxing the threshold — a rule sensitive enough for P2 must
+        /// still not fire on an ordinary ramp.
+        #[test]
+        fn a_single_climbing_run_holds_no_resets(scenario in scenario(1)) {
+            let found = scenario.detected();
+            prop_assert!(
+                found.is_empty(),
+                "invented {} reset(s) inside one window: {:?}",
+                found.len(),
+                found.iter().map(|r| (r.observed_at, r.kind)).collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    /// The reported symptom, as a case that does not depend on the generator:
+    /// a weekly window sitting at 20% restarts, and the provider leaves
+    /// `reset_at` alone. Nothing about that is ambiguous — a fifth of the
+    /// week's budget did not get refunded by a rounding fix.
+    #[test]
+    fn a_silent_weekly_reset_from_twenty_percent_is_observed() {
+        let reset_at = Utc.with_ymd_and_hms(2026, 8, 27, 0, 0, 0).unwrap();
+        let weekly = |used: f64| QuotaWindow {
+            id: WindowId::from("weekly"),
+            label: "Weekly — all models".to_owned(),
+            scope: WindowScope::AccountWide,
+            reset_kind: ResetKind::Rolling(std::time::Duration::from_secs(7 * 24 * 3600)),
+            unit: QuotaUnit::Percent,
+            used,
+            limit: Some(100.0),
+            reset_at: Some(reset_at),
+        };
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 25, 9, 0, 0).unwrap();
+        let found = detect(
+            &AccountId::from("claude:test"),
+            &[weekly(20.0)],
+            &[weekly(0.0)],
+            PollId::generate(),
+            Some(observed_at - Duration::minutes(3)),
+            observed_at,
+        );
+        assert_eq!(
+            found.first().map(|r| r.kind),
+            Some(RolloverKind::Unannounced),
+        );
     }
 }

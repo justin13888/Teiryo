@@ -59,7 +59,7 @@ mod tests {
         AccountHealth, AccountStatus, ConfigEdit, ConfigState, ConfigView, HistoryPage,
         ProviderHealth, ProviderSettings, Request, Response, WindowView,
     };
-    use crate::rollover::{RolloverKind, WindowRollover};
+    use crate::rollover::{ObservedStart, RolloverKind, WindowRollover};
 
     fn sample_window() -> QuotaWindow {
         QuotaWindow {
@@ -161,6 +161,10 @@ mod tests {
                         critical_threshold: 0.95,
                         note: Some("blocks entirely at cap".into()),
                     },
+                    observed_start: Some(ObservedStart {
+                        not_before: Utc::now(),
+                        not_after: Utc::now(),
+                    }),
                 }],
                 last_poll: Some(sample_event(PollOutcome::Success {
                     windows: vec![sample_window()],
@@ -197,6 +201,7 @@ mod tests {
                     new_reset_at: Some(Utc::now()),
                     prev_used: 88.0,
                     new_used: 1.0,
+                    prev_observed_at: Some(Utc::now()),
                 }],
             }),
             Response::History(HistoryPage {

@@ -479,6 +479,7 @@ mod tests {
             window: WindowId::from("w"),
             poll: PollId::generate(),
             observed_at: now() - Duration::hours(hours_ago),
+            prev_observed_at: None,
             kind,
             prev_reset_at: None,
             new_reset_at: None,
