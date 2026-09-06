@@ -19,7 +19,7 @@ A hand-decoded, **never-changing** preamble runs before any bincode bytes:
 
 ```rust
 // First 6 bytes on every connection, raw — not bincode, so it can never itself go stale
-struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 5 */ }
+struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 6 */ }
 ```
 
 - Client sends the 6-byte Hello. Daemon replies with **one raw byte**: `0x00` accepted, `0x01` version mismatch — then closes the connection on mismatch without ever attempting to decode a `Request`.
@@ -70,7 +70,11 @@ struct HistoryPage {
     rollovers: Vec<WindowRollover>,     // boundaries over the same interval, never downsampled
 }
 
-struct WindowView { window: QuotaWindow, hint: RenderHint }
+struct WindowView {
+    window: QuotaWindow,
+    hint: RenderHint,
+    observed_start: Option<ObservedStart>,  // the last restart actually seen for this window
+}
 
 struct AccountStatus {
     account: Account,
@@ -139,6 +143,10 @@ enum ConfigEdit {
 `poll_interval_secs` on `AccountStatus` and `AccountHealth` is `0` when the account's provider is disabled, the same value already used for "no poller registered" — both mean "no next poll to count down to". It reports the cadence the poll task is *actually* running at, so while the provider is rate limiting us it reads longer than `ConfigView.effective_poll_interval_secs`; a client counting down to the next poll wants the former, and one labelling the user's setting wants the latter. See [domain.md](domain.md) and [architecture.md](architecture.md).
 
 **Windows carry their render hint.** `WindowView` pairs each `QuotaWindow` with the `RenderHint` its adapter produced, so warn/critical thresholds and the provider caveat (`"blocks entirely at cap"` vs. `"auto-downgrades, doesn't block"`) reach the client instead of being hardcoded there. Pairing them in one struct rather than parallel `Vec`s makes it impossible for the two to drift apart. See [providers.md](providers.md).
+
+**Windows carry where they actually began.** `reset_at` minus the roll duration is a window's start only while the provider moves `reset_at` with the reset; where it does not, that arithmetic describes a window that is over, and every rate derived from it reads low. `observed_start` is the bracket around the last restart the daemon saw (`ObservedStart { not_before, not_after }` — see [domain.md](domain.md#window-rollovers)), and the client reconciles the two in `metrics::effective_window`.
+
+It has to travel on `Status` rather than be derived client-side: the restart anchoring a weekly window is routinely days older than the 12 hours of series a dashboard fetches, and it is inferred from consecutive polls the client never sees individually. `None` means no restart has been observed, in which case the provider's own arithmetic is all there is. Added in protocol v6.
 
 **`last_poll` vs. `last_success`.** `windows` is served from the latest *successful* poll while `last_poll` is the latest poll of any outcome. After a failure the two diverge, and only `last_success` says how stale the displayed windows are — a client that reports staleness from `last_poll` would claim fresh data it does not have.
 

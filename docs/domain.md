@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS window_rollover (
     kind TEXT NOT NULL,              -- scheduled | early | retracted | unannounced
     prev_reset_at INTEGER, new_reset_at INTEGER,
     prev_used REAL NOT NULL, new_used REAL NOT NULL,
+    prev_observed_at INTEGER,        -- the poll this was compared against; NULL on pre-existing rows
     PRIMARY KEY (poll_id, window_id)
 );
 CREATE INDEX IF NOT EXISTS idx_poll_lookup ON poll_event(provider, account_id, ts);
@@ -100,18 +101,41 @@ struct WindowRollover {
     observed_at: DateTime<Utc>, kind: RolloverKind,
     prev_reset_at: Option<DateTime<Utc>>, new_reset_at: Option<DateTime<Utc>>,
     prev_used: f64, new_used: f64,
+    prev_observed_at: Option<DateTime<Utc>>,              // when the compared-against poll completed
+}
+
+/// Where a window is known to have begun, and how precisely.
+struct ObservedStart {
+    not_before: DateTime<Utc>,   // latest instant the old window was provably running
+    not_after: DateTime<Utc>,    // earliest instant the new one provably was
 }
 ```
+
+A reset is never seen happening, only inferred from two polls that straddle it, so `[prev_observed_at, observed_at]` is the honest answer and `ObservedStart` is that bracket. `estimate()` is its midpoint — `not_before` under-reports the burn rate after an outage, and `not_after` can sit at `now` and send a pace to infinity — and `uncertainty()` is its width, one poll interval in normal running and as wide as a daemon outage otherwise.
 
 `teiryo_core::rollover::detect` compares each successful poll against the **previous successful one** — not the previous poll, or a run of failures would read as every window vanishing. The daemon calls it in `record_event` and writes the result inside `record_poll`'s transaction, so a boundary can never outlive the reading that justifies it. `hydrate_account` restores the comparison baseline, so detection survives a restart.
 
 Rules, per window present in both polls:
 
-- `reset_at` **moving** is the signal, never `used` falling on its own: a provider correction that lowers `used` mid-window is not a new window, and splitting a series on it would draw a break that never happened.
+- `reset_at` **moving** is the primary signal. `used` falling is the fallback, and a weaker one: a provider correction that lowers `used` mid-window is not a new window, and splitting a series on it would draw a break that never happened.
 - A jump *further* than one span is **not** a surprise. Rolling windows are anchored to first use, so after an idle stretch the next window legitimately starts later than the last one ended.
 - `Early` and `Retracted` are what the provider did not advertise; both are logged at `info` by the daemon.
-- `Unannounced` is inferred from a utilization drop past `UNANNOUNCED_DROP` (0.25) and needs a percent unit or a published limit to have a scale at all. It is recorded and marked on the chart but is **not** treated as a window boundary — see `RolloverKind::is_boundary`.
+- `Unannounced` is inferred from usage **collapsing**: `rollover::is_collapse`, a fall of at least `MIN_RESET_DROP` (0.05) that leaves at most `RESET_COLLAPSE_RATIO` (half) of what was there. It needs a percent unit or a published limit to have a scale at all.
+
+  The ratio is there because "did a lot of quota vanish" is the wrong question on its own. A weekly window resetting from 20% to 0 handed back a fifth of the week and is indistinguishable, on an absolute threshold alone, from a rounding fix — so it went unrecorded, and every number derived from the window's start stayed anchored to a window that had already ended. Conversely 90% → 50% is a big drop that still leaves most of the window standing, and is a correction.
+
+  The floor is there because the ratio alone is too eager at the bottom of the scale, where halving a small number is easy: 5% → 2% passes it, and that is an ordinary revision. The asymmetry is deliberate — a **false** reset is much more costly than a missed one. It re-anchors the window, and a window believed to have opened a minute ago divides real usage by a nearly-zero elapsed fraction, so the row would shout an enormous pace at a quota that is 2% used. A missed one leaves the pace reading as it did before any of this existed.
+
+  `Unannounced` is recorded and marked on the chart but is **not** a window boundary — see `RolloverKind::is_boundary`. It *does* anchor the pace: whether to break a drawn series on a `used`-only signal and where the window a rate is measured against began are different questions, and the evidence is good enough for the second. See [dashboard.md](dashboard.md#the-effective-window).
 - `RESET_TOLERANCE` (120 s) absorbs clock skew between our poll timestamp and the provider's published reset instant.
+
+The daemon keeps the latest **`Unannounced`** rollover per window as that window's `ObservedStart` and publishes it on `Status`. Every other kind moved `reset_at`, which makes `reset_at - span` the provider's own statement of where the new window began — exact, and better than anything inferred here. Anchoring on those would actively make things worse: a rollover seen across a weekend outage carries a bracket days wide, and its midpoint would override a start the provider had given precisely. So an announced rollover instead **retires** any anchor the window was carrying.
+
+`hydrate_account` reseeds the cache from the last 21 days of stored rollovers, longer than any window an adapter publishes, replaying them oldest-first so an announced rollover retires an earlier unannounced one exactly as it did when live.
+
+**Known limit:** for a provider that never moves `reset_at`, a restart missed entirely — the daemon down across it, with usage higher on the far side than the near one, so neither signal fires — leaves the previous anchor in place for the rest of the window. The failure is the same under-reporting this whole rule exists to fix, bounded by the window's own length; correcting it would need evidence the series does not contain.
+
+`prev_observed_at` was added after the table shipped. There is no migration framework — the schema is `CREATE TABLE IF NOT EXISTS` and the database is a local cache, not a system of record — so `Storage::init` runs an idempotent `ALTER TABLE ... ADD COLUMN` and tolerates the "duplicate column name" error. Rows written before it read as `NULL`, which `ObservedStart::from_rollover` treats as a zero-width bracket at `observed_at`: exactly the behaviour those rows had when they were written.
 
 Rollovers are **exempt from the downsampling** below. They are sparse by construction, and bucketing them would move the very instants they exist to record.
 

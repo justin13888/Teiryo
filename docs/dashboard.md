@@ -37,11 +37,57 @@ continuation line of everything derived from them. All of it comes from
 `crates/teiryo/src/metrics.rs` and needs no data the row does not already
 carry, except the recent rate — see below.
 
+### The effective window
+
+Every field below is usage measured against the window's start, so the start
+has to be right. `reset_at` minus the roll duration gives it only while the
+provider moves `reset_at` with the reset. Where it does not — a weekly quota
+that restarts early and keeps publishing the old instant — that subtraction
+names a window which is over, and every number built on it reads *low*: it
+divides real usage by a stretch of clock most of which belonged to a window
+already paid for. A weekly window that really restarted on Tuesday, 5% gone by
+Tuesday evening, read `0.07× pace` — "you are barely touching it" — against a
+true `0.60×` and climbing. Low is the dangerous direction.
+
+So the daemon publishes `WindowView.observed_start`, the bracket around any
+restart it actually saw (see [domain.md](domain.md#window-rollovers)), and
+`metrics::effective_window` reconciles the two:
+
+- Only an **unannounced** restart is published at all. Where `reset_at` moved,
+  the provider stated the new window's start precisely and there is nothing to
+  correct — see [domain.md](domain.md#window-rollovers).
+- The observed restart then wins only where it puts the start **later** than
+  the provider's arithmetic. That is the one direction an unannounced reset can
+  push it; an earlier restart belongs to a window that has since ended, and no
+  window began before its own `reset_at - span` and is still running.
+- `EffectiveWindow::span()` is `reset_at - start`, so a window that restarted
+  early is genuinely **shorter and still carries a full budget**. Both halves
+  matter: the same usage is a faster burn, and there is more left to afford
+  than the clock alone suggests. `pace`, `cap in`, `afford` and `→…% at reset`
+  all move together with it.
+- `start_uncertainty` carries the bracket's width — a poll interval in normal
+  running, as wide as a daemon outage otherwise. Nothing renders it yet; it is
+  there so a field derived from a days-wide bracket can be dimmed rather than
+  presented as measured.
+
+Only the daemon can supply this. The TUI fetches 12 hours of series, and the
+reset anchoring a weekly window is routinely days older than that, so there is
+nothing client-side to reconstruct it from.
+
 The five derived fields, and why each is not the others:
 
 - **`pace`** — usage over elapsed time, both as fractions of the window. The
   average *since the window opened*, so it answers "how have I been going",
-  and an idle stretch keeps it low however hard the last hour ran.
+  and an idle stretch keeps it low however hard the last hour ran. Blank for
+  the window's first twentieth (`MIN_ELAPSED_FRACTION`): whatever has been
+  used divided by a nearly-zero elapsed fraction is a number in the tens that
+  says nothing, and `cap in` inherits it as an hour-and-a-half warning
+  extrapolated from five minutes. The threshold is a *fraction* rather than a
+  duration because the same five minutes is a twentieth of a short window and
+  a fourteen-hundredth of a weekly one; flooring the fraction is what bounds
+  the number, at `1 / MIN_ELAPSED_FRACTION`. `now` is unaffected and carries
+  the signal over that stretch, which is where a burst right after a reset
+  shows.
 - **`now`** — `recent_pace`, the same scale over a lookback of a tenth of the
   window. This is the one that moves when the user does. It is the only field
   needing history, and it stays blank until enough of it exists.
@@ -61,13 +107,48 @@ the right, `pace` last. The whole continuation line is dropped when the row is
 a superseded account's, or when height is tight (bars survive, detail lines go
 first) — in which case `pace` returns to a column on the gauge line.
 
-`recent_pace` is measured between two readings of the current window, floored
-at the window's own start and cut at any reading carrying a different
-`reset_at`, so it is never taken across a rollover. The recorded rollover list
-is deliberately not what guards it: `boundaries` filters unannounced rollovers
-out, and an unannounced rollover is exactly the large drop in `used` that would
-otherwise read as burn. The TUI fetches the series with one `History` request
-per account (`window: None`), alongside the `Status` it already refreshes.
+### What `now` is measured over
+
+A series is not a continuous record. The daemon stops and resumes hours later;
+the provider restarts the window without saying so. Neither hole is a
+measurement, and averaging across one invents a rate nobody burnt. So
+`recent_pace` sorts and deduplicates the readings — nothing on the wire
+promises an ordering, and a repeated poll is not a second measurement — then
+walks **backwards from the newest**, extending the stretch while each step back
+is all of:
+
+- no longer than `max_gap`,
+- not a **fall in `used`** — deliberately any fall, not one large enough to be
+  a reset. Inside a single window instance usage only climbs, so a fall is
+  always either a restart or a revision, and neither leaves the readings on
+  its two sides comparable. Judging how big it was would only reintroduce the
+  question at a smaller scale: a restart from under `MIN_RESET_DROP` is
+  invisible to the detector, and subtracting straight across one would report
+  `0.00× now` over exactly the stretch a fresh window was being burnt through,
+- carrying this window's `reset_at` within `RESET_TOLERANCE`, which catches an
+  announced rollover,
+- at or after the effective start and the lookback floor.
+
+The difference is what the field now shows on a revision: a stretch whose only
+content is a correction has **no** rate rather than `0.00×`, and one with usable
+readings on the far side of it is measured from there. A slip under
+`FALL_EPSILON` — half of the last digit the row prints — is not a cut, because
+losing the field over a change nobody can see is worse than reading across it.
+
+`max_gap` is `metrics::gap_tolerance`: four missed polls at the account's own
+cadence, never under ten minutes. Derived rather than fixed, so a user polling
+every ten minutes is not permanently stale while one polling every thirty
+seconds gets a rate averaged over an outage.
+
+The field is **dropped entirely** when the newest reading is itself older than
+`max_gap`. A series that stopped has no current rate, and printing the last one
+it had under a `now` label is worse than printing nothing.
+
+The recorded rollover list is deliberately not what guards any of this:
+`boundaries` filters unannounced rollovers out, and an unannounced rollover is
+exactly the drop in `used` that would otherwise read as burn. The TUI fetches
+the series with one `History` request per account (`window: None`), alongside
+the `Status` it already refreshes.
 
 The sparkline is the same series the chart draws, downsampled to the row width.
 It is the one part of this row still unbuilt. It needs no new plumbing: the
@@ -132,10 +213,12 @@ from zero has a visible cause. Implemented in `render_trend`; the geometry is
   recorded rollovers. A rolling window is anchored to first use, so after an
   idle stretch the next one starts later than the last ended — a fixed lattice
   of `reset_at - k·span` would draw rules where nothing happened.
-- **The live window's own edges are derived.** `reset_at - span` and `reset_at`,
-  from the current `QuotaWindow`. The start is drawn even when history is too
-  short to have observed that rollover. When the start coincides with a recorded
-  rollover — the same event from the other side — only one rule is drawn.
+- **The live window's own edges are derived.** `EffectiveWindow::start` and
+  `reset_at` — so the rule sits where the window actually began, and the chart
+  and the row's numbers can never describe different windows. The start is
+  drawn even when history is too short to have observed that rollover. When it
+  coincides with a recorded rollover — the same event from the other side —
+  only one rule is drawn.
 - **The axis grows to reach the next reset.** It lies in the future, so x
   extends past `now` by up to `FUTURE_LEAD_MAX` (20%) of the visible range and
   the right label runs forwards, `+1h 59m`. Past that ceiling the rule is
@@ -150,7 +233,11 @@ from zero has a visible cause. Implemented in `render_trend`; the geometry is
   anything the provider did not advertise.
 - **An unannounced drop gets a marker, not a rule.** Inferred from `used`
   alone, it is not trustworthy enough to break the chart — the same reasoning
-  as Rollover-split above.
+  as Rollover-split above. It *does* anchor the effective window: whether to
+  break a drawn series and where to measure a rate from are different
+  questions, and the evidence clears the second bar. It is also the **only**
+  kind that anchors one, because it is the only kind that says something
+  `reset_at` does not already say.
 - **Nothing is drawn without a cap.** A window with no `reset_at` and no
   recorded rollover charts exactly as it did before this existed, which is the
   case for a provider or credential that enforces no such limit. The Claude
