@@ -7,9 +7,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use teiryo_core::{
-    rollover, Account, AccountHealth, AccountId, AccountStatus, BarStyle, ConfigState, PollEvent,
-    PollOutcome, PollTrigger, ProviderAdapter, ProviderHealth, ProviderId, QuotaWindow, RenderHint,
-    Storage, WindowView,
+    rollover, Account, AccountHealth, AccountId, AccountStatus, BarStyle, ConfigState,
+    ObservedStart, PollEvent, PollOutcome, PollTrigger, ProviderAdapter, ProviderHealth,
+    ProviderId, QuotaWindow, RenderHint, RolloverKind, Storage, WindowId, WindowRollover,
+    WindowView,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -61,6 +62,31 @@ pub struct SharedState {
     /// attaches each window's render hint so the TUI never hardcodes
     /// provider-specific thresholds.
     pub presenters: HashMap<ProviderId, Rc<dyn ProviderAdapter>>,
+    /// Most recent observed restart per window, published on `Status`.
+    ///
+    /// Held here rather than recomputed per request because deriving it means
+    /// walking the stored rollovers, and because the client cannot derive it
+    /// at all: the reset that anchors a weekly window is routinely older than
+    /// any history a dashboard fetches.
+    pub observed_starts: HashMap<(AccountId, WindowId), ObservedStart>,
+}
+
+/// How far back [`Daemon::hydrate_account`] looks for the reset that anchors a
+/// window. Longer than the longest window any adapter publishes (7 days), so
+/// the anchor for a weekly quota survives a restart, and bounded so a database
+/// kept for months is not scanned on every startup.
+const ANCHOR_LOOKBACK: chrono::Duration = chrono::Duration::days(21);
+
+/// Whether a rollover is one the provider failed to announce, and so the only
+/// kind that can say anything `reset_at` does not already say.
+///
+/// Every other kind moved `reset_at`, which makes `reset_at - span` the
+/// provider's own statement of where the new window began — exact, and better
+/// than anything inferred here. Anchoring on those would actively make things
+/// worse: a restart seen across a weekend outage carries a bracket days wide,
+/// and its midpoint would override a start the provider had told us precisely.
+fn unannounced(rollover: &WindowRollover) -> bool {
+    matches!(rollover.kind, RolloverKind::Unannounced)
 }
 
 /// Cadence in whole seconds. `0` means "no next poll to expect": either the
@@ -156,6 +182,7 @@ impl Daemon {
                 config_state,
                 known_providers,
                 presenters: HashMap::new(),
+                observed_starts: HashMap::new(),
             })),
             watch_tx,
             config_tx,
@@ -250,6 +277,25 @@ impl Daemon {
             st.latest_success.get(&event.account).map(|e| e.ts),
             event.ts,
         );
+        // An unannounced restart is where the current window began, and the
+        // only evidence there is for it. It counts here even though it is
+        // deliberately not a chart boundary: the two questions are different.
+        // Whether to break a drawn series on a `used`-only signal is about
+        // drawing; where the window a rate is measured against began is about
+        // arithmetic, and on that one the evidence is good enough.
+        //
+        // An announced rollover does the opposite — it retires the anchor,
+        // because `reset_at` has moved and the provider's own arithmetic is
+        // now both correct and more precise than any bracket.
+        for r in &rollovers {
+            let key = (r.account.clone(), r.window.clone());
+            if unannounced(r) {
+                st.observed_starts
+                    .insert(key, ObservedStart::from_rollover(r));
+            } else {
+                st.observed_starts.remove(&key);
+            }
+        }
         for r in rollovers.iter().filter(|r| r.kind.is_surprise()) {
             tracing::info!(
                 account = %r.account, window = %r.window, kind = r.kind.as_str(),
@@ -308,6 +354,31 @@ impl Daemon {
                 tracing::warn!(account = %account.id, error = %e, "failed to restore last success")
             }
         }
+        // Restore the anchor too: without it the first status after a restart
+        // would fall back to the provider's arithmetic and report a pace the
+        // daemon already knew to be wrong.
+        let now = chrono::Utc::now();
+        match st
+            .storage
+            .rollovers(&account.id, None, now - ANCHOR_LOOKBACK, now)
+        {
+            // Oldest first, replayed in order, so an announced rollover after
+            // an unannounced one retires it exactly as it did when live.
+            Ok(found) => {
+                for r in &found {
+                    let key = (r.account.clone(), r.window.clone());
+                    if unannounced(r) {
+                        st.observed_starts
+                            .insert(key, ObservedStart::from_rollover(r));
+                    } else {
+                        st.observed_starts.remove(&key);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(account = %account.id, error = %e, "failed to restore window anchors")
+            }
+        }
         let failures = match st.storage.consecutive_failures_for(&account.id) {
             Ok(n) => n,
             Err(e) => {
@@ -349,7 +420,10 @@ impl Daemon {
                         .map(|window| WindowView {
                             hint: presenter
                                 .map_or_else(default_hint, |adapter| adapter.render_hint(window)),
-                            observed_start: None,
+                            observed_start: st
+                                .observed_starts
+                                .get(&(a.id.clone(), window.id.clone()))
+                                .copied(),
                             window: window.clone(),
                         })
                         .collect(),
