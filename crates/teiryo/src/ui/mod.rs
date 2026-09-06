@@ -249,12 +249,12 @@ mod tests {
                 window: view.window.id.clone(),
                 poll: PollId::generate(),
                 observed_at: Utc::now() - Duration::minutes(minutes_ago),
-                prev_observed_at: None,
                 kind,
                 prev_reset_at: Some(Utc::now() + Duration::hours(2)),
                 new_reset_at: Some(Utc::now() + Duration::hours(3)),
                 prev_used: 90.0,
                 new_used: 2.0,
+                prev_observed_at: Some(Utc::now() - Duration::minutes(minutes_ago + 3)),
             })
             .collect(),
             snapshots: (0..points)
@@ -510,14 +510,30 @@ mod tests {
             .collect()
     }
 
+    /// Readings every two minutes over the last `minutes`, climbing linearly
+    /// from `from` to `to` — an account polling on cadence with nothing
+    /// dropped, which is what a rate labelled "now" is allowed to be read from.
+    fn recent_ramp(id: &str, minutes: i64, from: f64, to: f64) -> Vec<QuotaSnapshot> {
+        let steps = minutes / 2;
+        let readings: Vec<(i64, f64)> = (0..=steps)
+            .map(|k| {
+                (
+                    minutes - k * 2,
+                    from + (to - from) * k as f64 / steps as f64,
+                )
+            })
+            .collect();
+        recent_series(id, &readings)
+    }
+
     #[test]
     fn a_row_reports_a_recent_burst_beside_the_average_that_hides_it() {
         let mut app = populated();
-        // The 5-hour window is 3 hours in at 62%, an unremarkable 1.03×
+        // The 5-hour window is 3 hours in at 62%, an unremarkable 1.03%
         // average — but 20 of those points went in the last 20 minutes.
         app.set_recent(
             &AccountId::from("claude:default"),
-            recent_series("session_5h", &[(20, 42.0), (0, 62.0)]),
+            recent_ramp("session_5h", 20, 42.0, 62.0),
         );
         let out = rendered(&mut app, 120, 40);
 
@@ -528,6 +544,30 @@ mod tests {
         );
         // Windows with no history behind them simply omit the field.
         assert_eq!(out.matches("× now").count(), 1, "only one series:\n{out}");
+    }
+
+    #[test]
+    fn a_row_drops_the_now_rate_rather_than_printing_a_stale_one() {
+        let mut app = populated();
+        // The same burst, but the daemon stopped half an hour ago — well past
+        // four missed polls at this account's 60-second cadence. The average
+        // since the window opened is still a fact; the current rate is not.
+        let stale: Vec<QuotaSnapshot> = recent_ramp("session_5h", 20, 42.0, 62.0)
+            .into_iter()
+            .map(|mut p| {
+                p.ts -= Duration::minutes(30);
+                p
+            })
+            .collect();
+        app.set_recent(&AccountId::from("claude:default"), stale);
+        let out = rendered(&mut app, 120, 40);
+
+        assert!(out.contains("1.03× pace"), "expected the average:\n{out}");
+        assert_eq!(
+            out.matches("× now").count(),
+            0,
+            "a rate measured half an hour ago is not a rate now:\n{out}"
+        );
     }
 
     #[test]

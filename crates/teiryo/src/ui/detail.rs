@@ -157,13 +157,18 @@ fn trend_footer(app: &App, now: DateTime<Utc>) -> Line<'static> {
             format!(" · now {}", usage_text(&view.window)),
             theme::dim(),
         ));
-        if let Some(pace) = metrics::pace(&view.window, now) {
+        let effective = metrics::effective_window(view, now);
+        if let Some(pace) = effective.as_ref().and_then(|w| metrics::pace(w, now)) {
             spans.push(Span::styled(format!(" · pace {pace:.2}×"), theme::dim()));
         }
         // Named for what separates it from the pace beside it: that one is the
         // average since the window opened, this one only the recent end of it.
         let points = app.recent_points(&status.account.id, &view.window.id);
-        if let Some(recent) = metrics::recent_pace(&view.window, points, now) {
+        let max_gap = metrics::gap_tolerance(status.poll_interval_secs);
+        if let Some(recent) = effective
+            .as_ref()
+            .and_then(|w| metrics::recent_pace(w, points, max_gap, now))
+        {
             spans.push(Span::styled(
                 format!(" · lately {recent:.2}×"),
                 theme::dim(),
@@ -241,7 +246,8 @@ fn render_trend(
         .selected_window()
         .map(|(_, view)| {
             metrics::boundaries(
-                &view.window,
+                &view.window.id,
+                metrics::effective_window(view, until).as_ref(),
                 &trend.rollovers,
                 until - trend.range.duration(),
                 until,
