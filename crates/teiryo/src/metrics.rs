@@ -1021,7 +1021,91 @@ mod properties {
         }
     }
 
+    /// The least elapsed time, in seconds, a draw may leave the window with.
+    ///
+    /// Enough that `elapsed / (elapsed + remaining)` clears
+    /// `MIN_ELAPSED_FRACTION`, and never less than the hour of headroom every
+    /// draw keeps on each side of `now`.
+    fn youngest_measurable(remaining_secs: i64) -> i64 {
+        let youngest = (remaining_secs as f64 * MIN_ELAPSED_FRACTION / (1.0 - MIN_ELAPSED_FRACTION))
+            .ceil() as i64;
+        youngest.max(3600)
+    }
+
+    /// The shared tail of both generators: turn a drawn tuple into the window
+    /// it describes.
+    fn assemble(
+        (span_secs, used, remaining_secs, early_by, before, after): DrawnReset,
+    ) -> EarlyReset {
+        let reset_at = now() + Duration::seconds(remaining_secs);
+        EarlyReset {
+            span: Duration::seconds(span_secs),
+            reset_at,
+            start: reset_at - Duration::seconds(span_secs) + Duration::seconds(early_by),
+            gap_before: Duration::seconds(before),
+            gap_after: Duration::seconds(after),
+            used,
+        }
+    }
+
+    /// `(span, used, remaining, early_by, gap_before, gap_after)`, all seconds
+    /// but `used`.
+    type DrawnReset = (i64, f64, i64, i64, i64, i64);
+
+    /// A window that restarted early, in every shape `effective_window` will
+    /// accept one.
+    ///
+    /// Deliberately unrestricted, and not the generator to reach for when a
+    /// property needs a pace to talk about. The `MIN_ELAPSED_FRACTION` floor
+    /// below is measured at `start`, but `effective_window` anchors at the
+    /// bracket's midpoint, which sits later — so this draws windows whose
+    /// anchor falls back under the floor, where `pace`, `runway` and
+    /// `eta_to_cap` are all `None` while `affordable_pace` still has a number.
+    /// That band is the first shape a user meets after an outage, and
+    /// `derived_numbers_stay_in_range` — which asserts over *whatever* the
+    /// window's shape, skipping each absent number rather than requiring it —
+    /// is the property that relies on reaching it.
+    ///
+    /// Use [`early_reset_with_a_measurable_pace`] instead when the property
+    /// must have a pace.
     fn early_reset() -> impl Strategy<Value = EarlyReset> {
+        // 5 hours to 14 days, the two shapes Claude publishes and beyond.
+        (5i64 * 3600..14 * 24 * 3600i64, 0.01f64..0.95)
+            .prop_flat_map(|(span_secs, used)| {
+                // Leave at least an hour of window on each side of `now`, so
+                // neither the elapsed fraction nor the remaining one degenerates.
+                let remaining = 3600i64..(span_secs / 2);
+                (Just(span_secs), Just(used), remaining)
+            })
+            .prop_flat_map(|(span_secs, used, remaining_secs)| {
+                // How much later than `reset_at - span` the window really began.
+                // An hour of headroom on each end keeps the bracket below both
+                // that instant and `now`, and the window must additionally have
+                // run for `MIN_ELAPSED_FRACTION` of its effective length *as
+                // measured at `start`*, which is where this stops and the
+                // restricted generator carries on. `elapsed = span - remaining
+                // - early_by`, and the effective length is `elapsed +
+                // remaining`.
+                let early_by =
+                    3600i64..(span_secs - remaining_secs - youngest_measurable(remaining_secs));
+                (
+                    Just(span_secs),
+                    Just(used),
+                    Just(remaining_secs),
+                    early_by,
+                    60i64..3600,
+                    60i64..3600,
+                )
+            })
+            .prop_map(assemble)
+    }
+
+    /// [`early_reset`], narrowed to the draws whose *anchor* — not merely
+    /// whose `start` — is old enough for `pace` to answer.
+    ///
+    /// For properties that assert something about the pace itself, and so
+    /// cannot be handed a window that has none.
+    fn early_reset_with_a_measurable_pace() -> impl Strategy<Value = EarlyReset> {
         // 5 hours to 14 days, the two shapes Claude publishes and beyond.
         (5i64 * 3600..14 * 24 * 3600i64, 0.01f64..0.95)
             .prop_flat_map(|(span_secs, used)| {
@@ -1063,15 +1147,13 @@ mod properties {
                 // `elapsed = span - remaining - early_by - shift`, and the
                 // effective length is `elapsed + remaining`. The range stays
                 // non-empty for every input the earlier stages admit:
-                // `span - remaining > span / 2 >= 9000`, `youngest.max(3600)`
-                // is at most `3600` whenever it binds against that floor, and
-                // `shift` is at most `1770`, leaving at least 31 seconds of
-                // width in the worst case.
-                let youngest = (remaining_secs as f64 * MIN_ELAPSED_FRACTION
-                    / (1.0 - MIN_ELAPSED_FRACTION))
-                    .ceil() as i64;
+                // `span - remaining > span / 2 >= 9000`,
+                // `youngest_measurable` is at most `3600` whenever it binds
+                // against that floor, and `shift` is at most `1770`, leaving
+                // at least 31 seconds of width in the worst case.
                 let shift = ((after - before + 1) / 2).max(0);
-                let early_by = 3600i64..(span_secs - remaining_secs - youngest.max(3600) - shift);
+                let early_by = 3600i64
+                    ..(span_secs - remaining_secs - youngest_measurable(remaining_secs) - shift);
                 (
                     Just(span_secs),
                     Just(used),
@@ -1081,20 +1163,7 @@ mod properties {
                     Just(after),
                 )
             })
-            .prop_map(
-                |(span_secs, used, remaining_secs, early_by, before, after)| {
-                    let reset_at = now() + Duration::seconds(remaining_secs);
-                    EarlyReset {
-                        span: Duration::seconds(span_secs),
-                        reset_at,
-                        start: reset_at - Duration::seconds(span_secs)
-                            + Duration::seconds(early_by),
-                        gap_before: Duration::seconds(before),
-                        gap_after: Duration::seconds(after),
-                        used,
-                    }
-                },
-            )
+            .prop_map(assemble)
     }
 
     /// A generated series of readings of one window: an older stretch, an
@@ -1304,7 +1373,9 @@ mod properties {
         /// under-reporting, the direction that says "you are barely using it"
         /// while the quota drains.
         #[test]
-        fn pace_is_anchored_inside_the_observed_bracket(w in early_reset()) {
+        fn pace_is_anchored_inside_the_observed_bracket(
+            w in early_reset_with_a_measurable_pace(),
+        ) {
             let effective = effective_window(&w.view(), now()).expect("a reset instant");
             let observed = w.observed();
             prop_assert!(
