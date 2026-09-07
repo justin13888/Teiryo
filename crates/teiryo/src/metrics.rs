@@ -1027,28 +1027,58 @@ mod properties {
             .prop_flat_map(|(span_secs, used)| {
                 // Leave at least an hour of window on each side of `now`, so
                 // neither the elapsed fraction nor the remaining one degenerates.
+                // The bracket's two gaps are drawn here rather than last,
+                // because the headroom `early_by` needs depends on them.
                 let remaining = 3600i64..(span_secs / 2);
-                (Just(span_secs), Just(used), remaining)
+                (
+                    Just(span_secs),
+                    Just(used),
+                    remaining,
+                    60i64..3600,
+                    60i64..3600,
+                )
             })
-            .prop_flat_map(|(span_secs, used, remaining_secs)| {
+            .prop_flat_map(|(span_secs, used, remaining_secs, before, after)| {
                 // How much later than `reset_at - span` the window really began.
                 // An hour of headroom on each end keeps the bracket below both
                 // that instant and `now`, and the window must additionally have
                 // run for `MIN_ELAPSED_FRACTION` of its effective length, or it
                 // is too young to have a pace at all and there is nothing to
-                // anchor. `elapsed = span - remaining - early_by`, and the
-                // effective length is `elapsed + remaining`.
+                // anchor.
+                //
+                // That headroom is measured at the *anchor*, not at `start`,
+                // because nothing downstream computes against `start`:
+                // `effective_window` anchors at `ObservedStart::estimate()`,
+                // the bracket's midpoint, which sits `(after - before) / 2`
+                // later than `start` — up to half an hour of it. Every second
+                // of that shift comes off the elapsed side while leaving the
+                // remaining side untouched, so a window sized to clear
+                // `MIN_ELAPSED_FRACTION` at `start` can still fall under it at
+                // the midpoint, and `pace` then hands back `None` where the
+                // property expects a number. Subtracting the exact shift the
+                // gaps imply — rounded up, and floored at zero because a
+                // midpoint *earlier* than `start` only adds headroom — makes
+                // the guarantee hold at the instant that is actually used.
+                //
+                // `elapsed = span - remaining - early_by - shift`, and the
+                // effective length is `elapsed + remaining`. The range stays
+                // non-empty for every input the earlier stages admit:
+                // `span - remaining > span / 2 >= 9000`, `youngest.max(3600)`
+                // is at most `3600` whenever it binds against that floor, and
+                // `shift` is at most `1770`, leaving at least 31 seconds of
+                // width in the worst case.
                 let youngest = (remaining_secs as f64 * MIN_ELAPSED_FRACTION
                     / (1.0 - MIN_ELAPSED_FRACTION))
                     .ceil() as i64;
-                let early_by = 3600i64..(span_secs - remaining_secs - youngest.max(3600));
+                let shift = ((after - before + 1) / 2).max(0);
+                let early_by = 3600i64..(span_secs - remaining_secs - youngest.max(3600) - shift);
                 (
                     Just(span_secs),
                     Just(used),
                     Just(remaining_secs),
                     early_by,
-                    60i64..3600,
-                    60i64..3600,
+                    Just(before),
+                    Just(after),
                 )
             })
             .prop_map(
