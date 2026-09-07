@@ -224,11 +224,15 @@ pub(crate) fn parse(raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
         if windows.iter().any(|w| w.id == id) {
             continue;
         }
-        let used = entry.percent.ok_or_else(|| {
-            ParseError::SchemaDrift(format!(
-                "limits[{WEEKLY_SCOPED_KIND}:{name}].percent missing"
-            ))
-        })?;
+        let Some(used) = entry.percent else {
+            // Same trade as an unreadable row: one row with no reading must
+            // not cost the poll the windows that already parsed.
+            tracing::warn!(
+                model = %name,
+                "skipping limits[] row of kind {WEEKLY_SCOPED_KIND} with no percent"
+            );
+            continue;
+        };
         windows.push(QuotaWindow {
             id,
             label: format!("Weekly — {name}"),
@@ -448,19 +452,16 @@ mod tests {
     }
 
     #[test]
-    fn weekly_scoped_row_without_percent_is_schema_drift() {
-        let err = parse(&raw(
+    fn weekly_scoped_row_without_percent_is_skipped_keeping_fixed_buckets() {
+        let windows = parse(&raw(
             200,
-            r#"{"five_hour":{"utilization":5},
+            r#"{"five_hour":{"utilization":27},"seven_day":{"utilization":41},
                 "limits":[{"kind":"weekly_scoped","resets_at":null,
                            "scope":{"model":{"display_name":"Fable"}}}]}"#,
         ))
-        .unwrap_err();
-        let ParseError::SchemaDrift(msg) = err;
-        assert!(
-            msg.contains("limits[weekly_scoped:Fable].percent"),
-            "got: {msg}"
-        );
+        .unwrap();
+        let ids: Vec<&str> = windows.iter().map(|w| w.id.0.as_str()).collect();
+        assert_eq!(ids, ["session_5h", "weekly"]);
     }
 
     #[test]
