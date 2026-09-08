@@ -1508,6 +1508,87 @@ mod properties {
         (a - b).abs() < 0.005
     }
 
+    /// The shrunk cases from the red runs that produced this suite, pinned as
+    /// literals.
+    ///
+    /// They were checked in as `proptest-regressions` seeds, which is not the
+    /// same thing: proptest persists an RNG *seed*, not a value, so a seed
+    /// reproduces its recorded input only while the strategy is unchanged.
+    /// Every seed in that file had already drifted — one described an
+    /// `EarlyReset` from before the bracket fields existed, and four described
+    /// a `Series` from before `older_base` did — so the file was carrying a
+    /// promise it could not keep, and the generators here have moved again
+    /// since. Written out, these cases stay the cases.
+    #[test]
+    fn the_shrunk_early_resets_still_hold() {
+        // Both are as recorded; the first predates the bracket, so it is given
+        // the narrowest one the generator can draw.
+        for w in [
+            EarlyReset {
+                span: Duration::seconds(209_404),
+                reset_at: Utc.with_ymd_and_hms(2026, 8, 21, 13, 0, 23).unwrap(),
+                start: Utc.with_ymd_and_hms(2026, 8, 19, 21, 23, 11).unwrap(),
+                gap_before: Duration::seconds(60),
+                gap_after: Duration::seconds(60),
+                used: 0.591_235_081_022_373_7,
+            },
+            EarlyReset {
+                span: Duration::seconds(1_127_057),
+                reset_at: Utc.with_ymd_and_hms(2026, 8, 24, 4, 59, 17).unwrap(),
+                start: Utc.with_ymd_and_hms(2026, 8, 21, 8, 41, 54).unwrap(),
+                gap_before: Duration::seconds(60),
+                gap_after: Duration::seconds(60),
+                used: 0.770_789_297_552_086,
+            },
+        ] {
+            let e = effective_window(&w.view(), now()).expect("a reset instant");
+            assert!(e.start < e.reset_at, "window runs backwards: {w:?}");
+            let f = elapsed_fraction(&e, now()).expect("a positive span");
+            assert!((0.0..=1.0).contains(&f), "elapsed fraction {f} for {w:?}");
+            if let Some(p) = pace(&e, now()) {
+                assert!(p.is_finite() && p >= 0.0, "pace {p} for {w:?}");
+            }
+            if let Some(a) = affordable_pace(&e, now()) {
+                assert!(a.is_finite() && a >= 0.0, "affordable {a} for {w:?}");
+            }
+            if let Some(r) = runway(&e, now()) {
+                assert!(r >= Duration::zero(), "runway {r} for {w:?}");
+            }
+            if let Some(eta) = eta_to_cap(&e, now()) {
+                assert!(eta >= now() && eta < w.reset_at, "eta {eta} for {w:?}");
+            }
+        }
+    }
+
+    /// The shrunk `Series`: two identical flat stretches either side of an
+    /// outage, which is the degenerate shape the recent-rate properties kept
+    /// collapsing to.
+    #[test]
+    fn the_shrunk_series_still_reports_only_its_newer_stretch() {
+        let climb: Vec<f64> = vec![0.0, 0.01, 0.02, 0.03, 0.04, 0.05];
+        for reset_between in [false, true] {
+            let s = Series {
+                cadence: Duration::seconds(150),
+                // Beyond four cadences, so the two stretches are not one run.
+                outage: 5,
+                older: climb.clone(),
+                older_base: 0.0,
+                newer: climb.clone(),
+                stale: Duration::zero(),
+                reset_between,
+                order: Vec::new(),
+            };
+            let window = series_window(s.current());
+            let gap = gap_tolerance(s.cadence.num_seconds() as u32);
+            let got = recent_pace(&window, &s.points(), gap, now()).expect("a rate");
+            let want = s.newer_pace();
+            assert!(
+                (got - want).abs() < 1e-9,
+                "reset_between={reset_between}: got {got}, want {want}"
+            );
+        }
+    }
+
     proptest! {
         /// **P4 — pace is anchored inside the bracket the restart was seen
         /// in.** A window that restarted early is shorter than its nominal

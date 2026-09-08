@@ -429,6 +429,53 @@ mod tests {
         assert_eq!(detected(window(90.0, reset), window(50.0, reset)), None);
     }
 
+    /// Both constants are a strict/non-strict choice, and every test above
+    /// straddles them without landing on either. A rule written with `>` and
+    /// `<` instead of `>=` and `<=` passes all of them and fails all of these.
+    #[test]
+    fn a_fall_exactly_on_either_threshold_is_a_reset() {
+        let reset = Some(now() + Duration::hours(2));
+        // 10% → 5% sits on *both* at once: the drop is exactly
+        // `MIN_RESET_DROP` and what is left is exactly
+        // `RESET_COLLAPSE_RATIO` of what was there.
+        assert_eq!(
+            detected(window(10.0, reset), window(5.0, reset)),
+            Some(RolloverKind::Unannounced)
+        );
+        // Exactly on the ratio, well clear of the floor, so only the ratio's
+        // boundary is under test here.
+        assert_eq!(
+            detected(window(90.0, reset), window(45.0, reset)),
+            Some(RolloverKind::Unannounced)
+        );
+        // The shrunk case the checked-in regression seed stood for: a window
+        // that climbed to exactly five points and restarted. The seed itself
+        // no longer reproduces it — the generator's peak floor moved to 0.08,
+        // which cannot produce a 0.05 peak at all — so the case is written out
+        // rather than left to an RNG seed that has drifted off it.
+        assert_eq!(
+            detected(window(5.0, reset), window(0.0, reset)),
+            Some(RolloverKind::Unannounced)
+        );
+    }
+
+    /// The other side of each threshold, isolated: one case that only the
+    /// floor rejects and one that only the ratio rejects.
+    ///
+    /// Without the isolation a single guard could be deleted and the suite
+    /// would still fail on the *other* one, which says nothing about which.
+    #[test]
+    fn a_fall_one_step_past_either_threshold_is_not() {
+        let reset = Some(now() + Duration::hours(2));
+        // Exactly on the ratio and a hair under the floor: 8% → 4% gives back
+        // half of what was there, and half of a number this small is under
+        // five points. The floor alone rejects it.
+        assert_eq!(detected(window(8.0, reset), window(4.0, reset)), None);
+        // Forty-four points is far over the floor, and 46% left is a hair over
+        // half of 90%. The ratio alone rejects it.
+        assert_eq!(detected(window(90.0, reset), window(46.0, reset)), None);
+    }
+
     #[test]
     fn an_observed_start_is_the_middle_of_the_bracket_it_was_seen_in() {
         let observed_at = now();
@@ -601,6 +648,25 @@ mod properties {
         /// this change is about: the provider restarts the quota and leaves
         /// the published instant where it was.
         announced: bool,
+        /// When announced, whether each run publishes its own real end rather
+        /// than a distant one.
+        ///
+        /// This is what separates `Scheduled` from `Early`. With a `reset_at`
+        /// a whole span out, the old instant is always still in the future
+        /// when the next window appears, so `classify` can only ever answer
+        /// `Early` — which is why every announced rollover the generator used
+        /// to produce was one, and `Scheduled` was unreachable from here.
+        punctual: bool,
+        /// Sub-tolerance drift in the published instant, in seconds, applied
+        /// with alternating sign.
+        ///
+        /// Providers recompute `reset_at` per request, so it moves a little
+        /// between polls with nothing having happened — the case
+        /// `RESET_TOLERANCE` exists for. The generator used to emit instants
+        /// that were byte-identical across every reading, so a detector with
+        /// no tolerance at all passed: consecutive readings now differ by
+        /// twice this, which the bound keeps under the tolerance.
+        jitter: i64,
     }
 
     impl Scenario {
@@ -608,15 +674,25 @@ mod properties {
         /// each paired with the instant it was taken.
         fn readings(&self) -> Vec<(DateTime<Utc>, QuotaWindow)> {
             let mut out = Vec::new();
-            for run in &self.runs {
-                // Announced: each run publishes its own end. Silent: every run
-                // keeps reporting the first one's, which is the whole defect.
-                let reset_at = if self.announced {
-                    run.opened_at + self.span
-                } else {
-                    self.runs[0].opened_at + self.span
+            for (r, run) in self.runs.iter().enumerate() {
+                // Announced: each run publishes its own end — its real one when
+                // punctual, so the boundary arrives with the old instant
+                // already reached. Silent: every run keeps reporting the first
+                // one's, which is the whole defect.
+                let reset_at = match (self.announced, self.punctual) {
+                    (true, true) => run.opened_at + self.cadence * (run.used.len() as i32),
+                    (true, false) => run.opened_at + self.span,
+                    (false, _) => self.runs[0].opened_at + self.span,
                 };
                 for (k, used) in run.used.iter().enumerate() {
+                    // Alternating, so consecutive readings differ by twice the
+                    // jitter — under `RESET_TOLERANCE`, and far enough under
+                    // that a punctual boundary still clears it.
+                    let drift = if (r + k) % 2 == 0 {
+                        self.jitter
+                    } else {
+                        -self.jitter
+                    };
                     out.push((
                         run.opened_at + self.cadence * (k as i32),
                         QuotaWindow {
@@ -629,7 +705,7 @@ mod properties {
                             unit: QuotaUnit::Percent,
                             used: used * 100.0,
                             limit: Some(100.0),
-                            reset_at: Some(reset_at),
+                            reset_at: Some(reset_at + Duration::seconds(drift)),
                         },
                     ));
                 }
@@ -670,10 +746,16 @@ mod properties {
         }
     }
 
-    /// A non-decreasing ramp of `len` readings from 0 up to exactly `peak`.
-    fn ramp(len: usize, peak: f64) -> Vec<f64> {
-        let step = peak / (len - 1) as f64;
-        (0..len).map(|k| step * k as f64).collect()
+    /// A non-decreasing ramp of `len` readings from `base` up to exactly
+    /// `peak`.
+    ///
+    /// `base` is what the window restarts *from*. It used to be zero always,
+    /// which made every generated reset a fall to nothing — and a fall to
+    /// nothing satisfies `new <= prev * RESET_COLLAPSE_RATIO` as `0 <=
+    /// anything`, so the ratio was never the thing deciding.
+    fn ramp(len: usize, base: f64, peak: f64) -> Vec<f64> {
+        let step = (peak - base) / (len - 1) as f64;
+        (0..len).map(|k| base + step * k as f64).collect()
     }
 
     /// Scenarios with `runs` consecutive window instances. Each run restarts at
@@ -687,28 +769,108 @@ mod properties {
             60i64..600i64,
             // A peak floor clear of `MIN_RESET_DROP`, so every generated reset
             // is one a correct detector is obliged to report rather than one
-            // it is entitled to read as a correction.
-            prop::collection::vec((4usize..40, 0.08f64..1.0), runs),
+            // it is entitled to read as a correction. The third number is how
+            // much of the allowed leftover the *next* run restarts from.
+            prop::collection::vec((4usize..40, 0.08f64..1.0, 0.5f64..1.0), runs),
             any::<bool>(),
+            any::<bool>(),
+            // Half of `RESET_TOLERANCE` would put a punctual boundary's own
+            // move inside the tolerance too; a third leaves both sides clear.
+            0i64..=40,
         )
-            .prop_map(|(span_secs, cadence_secs, shapes, announced)| {
-                let cadence = Duration::seconds(cadence_secs);
-                let mut opened_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-                let mut out = Vec::new();
-                for (len, peak) in shapes {
-                    out.push(Run {
-                        opened_at,
-                        used: ramp(len, peak),
-                    });
-                    opened_at += cadence * (len as i32);
+            .prop_map(
+                |(span_secs, cadence_secs, shapes, announced, punctual, jitter)| {
+                    let cadence = Duration::seconds(cadence_secs);
+                    let mut opened_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+                    let mut out = Vec::new();
+                    let mut base = 0.0f64;
+                    for (len, peak, leftover) in shapes {
+                        // Kept below this run's own peak, or it would not
+                        // climb — but only just below, because clamping hard
+                        // here would undo the leftover the previous run's
+                        // reset was chosen to leave.
+                        let from = base.min(peak * 0.9);
+                        out.push(Run {
+                            opened_at,
+                            used: ramp(len, from, peak),
+                        });
+                        // What the *next* run restarts from: comfortably inside
+                        // both conditions a reset has to satisfy, so the ratio
+                        // is exercised against a real number instead of being
+                        // trivially true against zero — and drawn from the
+                        // upper half of what is allowed, so the ratio rather
+                        // than the floor is usually the binding condition.
+                        // Small peaks leave no
+                        // room for a partial reset and fall back to zero, which
+                        // is correct — five points cannot vanish out of eight
+                        // and still leave half standing.
+                        // Literals, deliberately, not the constants under
+                        // test. Sizing the generator from `MIN_RESET_DROP` and
+                        // `RESET_COLLAPSE_RATIO` would move the ground truth
+                        // with the rule: tightening either constant would also
+                        // tighten what the generator produces, and the change
+                        // would be invisible to every property here.
+                        let ceiling = (peak - 0.075).min(peak * 0.475);
+                        base = (leftover * ceiling).max(0.0);
+                        opened_at += cadence * (len as i32);
+                    }
+                    Scenario {
+                        span: Duration::seconds(span_secs),
+                        cadence,
+                        runs: out,
+                        announced,
+                        punctual,
+                        jitter,
+                    }
+                },
+            )
+    }
+
+    /// What the generator actually reaches, sampled and asserted.
+    ///
+    /// Both of these were unreachable, and neither fact was visible from a
+    /// green suite. Every announced boundary classified as `Early`, because
+    /// the published instant was always a whole span out when the next window
+    /// appeared. And every reset fell to exactly zero, which satisfies
+    /// `new <= prev * RESET_COLLAPSE_RATIO` as `0 <= anything` — so the ratio
+    /// never decided anything and `MIN_RESET_DROP` was the only live guard.
+    ///
+    /// A generator that cannot produce a case is a property that cannot test
+    /// it, which is why the reach is pinned here rather than left to a comment.
+    #[test]
+    fn the_generator_reaches_both_announced_kinds_and_partial_resets() {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+
+        let mut runner = TestRunner::deterministic();
+        let strategy = scenario(3);
+        let mut kinds: Vec<RolloverKind> = Vec::new();
+        let mut partial = false;
+        for _ in 0..512 {
+            let s = strategy
+                .new_tree(&mut runner)
+                .expect("a scenario")
+                .current();
+            for r in s.detected() {
+                if !kinds.contains(&r.kind) {
+                    kinds.push(r.kind);
                 }
-                Scenario {
-                    span: Duration::seconds(span_secs),
-                    cadence,
-                    runs: out,
-                    announced,
-                }
-            })
+                // A reset that left something behind is the only kind that
+                // puts the ratio guard in charge of the answer.
+                partial |= r.new_used > 0.0;
+            }
+        }
+        for wanted in [
+            RolloverKind::Scheduled,
+            RolloverKind::Early,
+            RolloverKind::Unannounced,
+        ] {
+            assert!(
+                kinds.contains(&wanted),
+                "the generator never produced {wanted:?} in 512 scenarios; saw {kinds:?}"
+            );
+        }
+        assert!(partial, "every generated reset still falls to exactly zero");
     }
 
     proptest! {

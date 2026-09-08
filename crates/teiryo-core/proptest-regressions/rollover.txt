@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 829c500330892b4dc2d92266a7293eea7fbc43e06f4cc819a6dae438d39dc783 # shrinks to scenario = Scenario { span: TimeDelta { secs: 18000, nanos: 0 }, cadence: TimeDelta { secs: 60, nanos: 0 }, runs: [Run { opened_at: 2026-01-01T00:00:00Z, used: [0.0, 0.016666666666666666, 0.03333333333333333, 0.05] }, Run { opened_at: 2026-01-01T00:04:00Z, used: [0.0, 0.016666666666666666, 0.03333333333333333, 0.05] }, Run { opened_at: 2026-01-01T00:08:00Z, used: [0.0, 0.016666666666666666, 0.03333333333333333, 0.05] }], announced: false }
