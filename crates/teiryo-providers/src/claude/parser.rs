@@ -29,8 +29,8 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use teiryo_core::{
     ParseError, QuotaUnit, QuotaWindow, RawResponse, ResetKind, WindowId, WindowScope,
 };
@@ -87,7 +87,7 @@ struct UsageResponse {
     /// `RawValue` holds the bytes and converts nothing until each row is
     /// examined on its own, which is what the isolation above claims.
     #[serde(default)]
-    limits: Option<Box<serde_json::value::RawValue>>,
+    limits: Option<Box<RawValue>>,
 }
 
 /// One row of `limits[]`. Only `weekly_scoped` rows are mapped; the rest are
@@ -97,24 +97,28 @@ struct LimitEntry {
     #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
-    percent: Option<f64>,
-    /// Unreadable rather than absent costs the instant, not the window: a
-    /// window with no reset instant is a shape the rest of the codebase
-    /// already handles, so a `resets_at` this parser cannot read is no reason
-    /// to discard a cap the user is being charged against.
-    #[serde(default, deserialize_with = "lenient_instant")]
-    resets_at: Option<DateTime<Utc>>,
+    percent: Option<Box<RawValue>>,
+    /// Held raw for the reason `limits` is. Unreadable rather than absent
+    /// must cost the instant and not the window: a window with no reset
+    /// instant is a shape the rest of the codebase already handles, so a
+    /// `resets_at` this parser cannot read is no reason to discard a cap the
+    /// user is charged against.
+    ///
+    /// A typed field cannot give that guarantee however leniently it is
+    /// deserialized. Deserializing it at all converts the value, and a number
+    /// outside `f64` fails the whole row before any leniency can run.
+    #[serde(default)]
+    resets_at: Option<Box<RawValue>>,
     #[serde(default)]
     scope: Option<LimitScope>,
 }
 
-/// Deserialize an instant, treating anything unreadable as absent.
-fn lenient_instant<'de, D>(de: D) -> Result<Option<DateTime<Utc>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = Option::<serde_json::Value>::deserialize(de)?;
-    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
+/// Read one raw JSON value, treating anything unreadable as absent.
+///
+/// The point of holding these fields raw: conversion happens here, one field
+/// at a time, so a value this parser cannot represent costs that field alone.
+fn readable<T: serde::de::DeserializeOwned>(raw: Option<&RawValue>) -> Option<T> {
+    serde_json::from_str(raw?.get()).ok()
 }
 
 #[derive(Deserialize)]
@@ -146,12 +150,20 @@ struct LimitModel {
 /// The `limits[].kind` of a per-model weekly window.
 const WEEKLY_SCOPED_KIND: &str = "weekly_scoped";
 
+/// One fixed top-level bucket.
+///
+/// Both fields raw, for the reason `limits` is: they are read during the outer
+/// `from_slice`, so a strictly-typed one hands the whole poll to whichever
+/// value the server got wrong. An unparseable `resets_at`, or a `utilization`
+/// outside `f64`, blacked out every window on every account — the same blast
+/// radius this parser exists to avoid, reached through a field nobody was
+/// watching.
 #[derive(Deserialize)]
 struct UsageBucket {
     #[serde(default)]
-    utilization: Option<f64>,
+    utilization: Option<Box<RawValue>>,
     #[serde(default)]
-    resets_at: Option<DateTime<Utc>>,
+    resets_at: Option<Box<RawValue>>,
 }
 
 struct BucketSpec {
@@ -227,9 +239,14 @@ pub(crate) fn parse(raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
     })?;
 
     let mut windows = Vec::new();
+    // The models the fixed buckets already account for. Only these suppress a
+    // `limits[]` row: a row is never suppressed by another row, because two
+    // scoped rows are two caps until their ids actually collide, and the exact
+    // check below catches that.
+    let mut fixed_models: Vec<String> = Vec::new();
     for (spec, get) in specs() {
         let Some(bucket) = get(&usage) else { continue };
-        let Some(used) = bucket.utilization else {
+        let Some(used) = readable::<f64>(bucket.utilization.as_deref()) else {
             // The same trade a `limits[]` row gets, and for the same reason:
             // one reading the server did not send must not cost the poll every
             // window that did arrive. Losing them freezes an established
@@ -243,6 +260,9 @@ pub(crate) fn parse(raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
             );
             continue;
         };
+        if let WindowScope::Model(model) = &spec.scope {
+            fixed_models.push(model.clone());
+        }
         windows.push(QuotaWindow {
             id: WindowId::from(spec.id),
             label: spec.label.to_owned(),
@@ -251,7 +271,7 @@ pub(crate) fn parse(raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
             unit: QuotaUnit::Percent,
             used: checked_percent(spec.id, used),
             limit: Some(100.0),
-            reset_at: bucket.resets_at,
+            reset_at: readable(bucket.resets_at.as_deref()),
         });
     }
     for value in limit_rows(usage.limits.as_deref()) {
@@ -303,13 +323,19 @@ pub(crate) fn parse(raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
         // "Opus", "Claude Opus 4.5" and whatever it renames it to next, and an
         // exact comparison catches only the first, listing one cap twice under
         // two confusable labels.
-        if windows
-            .iter()
-            .any(|w| w.id == id || covers_same_model(w, &slug))
-        {
+        if windows.iter().any(|w| w.id == id) {
             continue;
         }
-        let Some(used) = entry.percent else {
+        if let Some(covered) = fixed_models.iter().find(|m| same_model(&slug, m)) {
+            tracing::warn!(
+                row = %value,
+                model = name,
+                covered_by = covered,
+                "skipping {WEEKLY_SCOPED_KIND} row for a model a fixed bucket already reports"
+            );
+            continue;
+        }
+        let Some(used) = readable::<f64>(entry.percent.as_deref()) else {
             // Same trade as an unreadable row: one row with no reading must
             // not cost the poll the windows that already parsed.
             tracing::warn!(
@@ -332,7 +358,7 @@ pub(crate) fn parse(raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
             unit: QuotaUnit::Percent,
             used: checked_percent(&slug, used),
             limit: Some(100.0),
-            reset_at: entry.resets_at,
+            reset_at: readable(entry.resets_at.as_deref()),
         });
     }
     if windows.is_empty() {
@@ -352,12 +378,12 @@ pub(crate) fn parse(raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
 /// changed the field's shape, which is worth a line — `docs/providers.md` said
 /// this warned long before anything did: the old `as_array().into_iter()`
 /// yielded an empty iterator and emitted nothing at all.
-fn limit_rows(limits: Option<&serde_json::value::RawValue>) -> Vec<&serde_json::value::RawValue> {
+fn limit_rows(limits: Option<&RawValue>) -> Vec<&RawValue> {
     let Some(raw) = limits else { return Vec::new() };
     if raw.get().trim() == "null" {
         return Vec::new();
     }
-    match serde_json::from_str::<Vec<&serde_json::value::RawValue>>(raw.get()) {
+    match serde_json::from_str::<Vec<&RawValue>>(raw.get()) {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(error = %e, "ignoring a limits field that is not an array");
@@ -379,23 +405,41 @@ fn checked_percent(window: &str, used: f64) -> f64 {
     used
 }
 
-/// Whether an already-mapped window is the same model cap as `slug`.
+/// Whether a scoped row's slug names the same model as a fixed bucket.
 ///
-/// The fixed buckets are `weekly_opus` and `weekly_sonnet`, and the server
-/// names those same caps in `limits[]` with whatever label it currently uses —
-/// "Opus", "Claude Opus 4.5". Comparing ids exactly recognises only the bare
-/// form, so any other label produced a second window for a cap already listed.
-/// Matching on the fixed bucket's model name appearing in the candidate slug
-/// catches the family without needing to know the naming scheme.
-fn covers_same_model(mapped: &QuotaWindow, slug: &str) -> bool {
-    let WindowScope::Model(model) = &mapped.scope else {
-        return false;
-    };
-    mapped.id.0.starts_with("weekly_")
-        && (slug == model
-            || slug.starts_with(&format!("{model}_"))
-            || slug.ends_with(&format!("_{model}"))
-            || slug.contains(&format!("_{model}_")))
+/// The fixed buckets are `opus` and `sonnet`; the server names those same caps
+/// in `limits[]` with whatever label it currently uses — "Opus", "Claude Opus
+/// 4.5". Comparing slugs exactly recognises only the bare form, so any other
+/// label produced a second window for a cap already listed.
+///
+/// The comparison is on a canonical form, not on containment, and the
+/// difference is not cosmetic. Containment suppresses every *neighbouring*
+/// model: "Opus Mini" and "Mini Opus" both contain "opus", and dropping either
+/// loses a cap the user is charged against — silently, and in the one
+/// direction this parser must never fail. Over-reporting a duplicate is
+/// cosmetic; under-reporting a cap is the defect being fixed. So only a vendor
+/// prefix and a trailing version are discarded, and anything else that
+/// distinguishes the name keeps the row.
+fn same_model(slug: &str, fixed: &str) -> bool {
+    canonical_model(slug) == fixed
+}
+
+/// A slug reduced to the model it names: no vendor prefix, no version tail.
+///
+/// A version tail is only a tail if a name precedes it, so a slug that is
+/// nothing but digits is left alone rather than reduced to its first one.
+fn canonical_model(slug: &str) -> String {
+    let numeric = |p: &&str| p.chars().all(|c| c.is_ascii_digit());
+    let mut parts: Vec<&str> = slug.split('_').filter(|p| !p.is_empty()).collect();
+    if parts.first() == Some(&"claude") && parts.len() > 1 {
+        parts.remove(0);
+    }
+    if parts.first().is_some_and(|p| !numeric(p)) {
+        while parts.len() > 1 && parts.last().is_some_and(numeric) {
+            parts.pop();
+        }
+    }
+    parts.join("_")
 }
 
 fn model_slug(display_name: &str) -> String {
@@ -434,7 +478,7 @@ mod tests {
             status,
             headers: vec![],
             body: body.as_bytes().to_vec(),
-            fetched_at: Utc::now(),
+            fetched_at: chrono::Utc::now(),
         }
     }
 
@@ -578,6 +622,9 @@ mod tests {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(move || made.clone())
             .with_max_level(tracing::Level::TRACE)
+            // Field names and their `=` are separated by escape codes
+            // otherwise, so an assertion on `name=` never matches.
+            .with_ansi(false)
             .without_time()
             .finish();
         tracing::subscriber::with_default(subscriber, f);
@@ -622,7 +669,10 @@ mod tests {
         });
         let ids: Vec<_> = windows.iter().map(|w| w.id.0.as_str()).collect();
         assert_eq!(ids, ["session_5h", "weekly_opus"]);
-        assert!(logs.contains("skipping unreadable limits[] row"), "{logs}");
+        // The row itself is readable now — only `percent` is not — so the
+        // loss is reported against that field rather than against the row.
+        // Holding each field raw is what makes the distinction possible.
+        assert!(logs.contains("with no percent"), "{logs}");
     }
 
     #[test]
@@ -815,6 +865,23 @@ mod tests {
         assert_eq!(windows.len(), 1);
     }
 
+    /// `null` is the ordinary shape for a plan with no per-model caps, so it
+    /// must not be reported as a malformed field. Without this the fast path
+    /// could be deleted and only the window count would notice — which it
+    /// would not, since both routes yield no rows.
+    #[test]
+    fn a_null_limits_field_is_silent_rather_than_reported() {
+        for body in [
+            r#"{"five_hour":{"utilization":5},"limits":null}"#,
+            r#"{"five_hour":{"utilization":5}}"#,
+        ] {
+            let mut windows = Vec::new();
+            let logs = captured_logs(|| windows = parse(&raw(200, body)).unwrap());
+            assert_eq!(windows.len(), 1, "body: {body}");
+            assert!(logs.is_empty(), "body: {body}, logs: {logs}");
+        }
+    }
+
     #[test]
     fn a_limits_field_that_is_not_an_array_is_reported() {
         let mut windows = Vec::new();
@@ -862,6 +929,184 @@ mod tests {
         assert_eq!(model_slug("オーパス"), "");
         assert_eq!(model_slug("Opus 東京"), "opus");
         assert_eq!(model_slug(""), "");
+    }
+
+    /// The dedupe must not eat a neighbouring model.
+    ///
+    /// An earlier attempt matched the fixed bucket's model name as a substring
+    /// of the candidate slug, which suppressed "Opus Mini" and "Mini Opus"
+    /// along with "Claude Opus 4.5" — losing caps the user is charged against,
+    /// silently, in the one direction this parser must never fail. Over-
+    /// reporting a duplicate is cosmetic; under-reporting a cap is the defect.
+    #[test]
+    fn a_neighbouring_model_is_not_mistaken_for_the_fixed_bucket() {
+        let windows = parse(&raw(
+            200,
+            r#"{"five_hour":{"utilization":10},
+                "seven_day_opus":{"utilization":30},
+                "limits":[
+                    {"kind":"weekly_scoped","percent":77,
+                     "scope":{"model":{"display_name":"Opus Mini"}}},
+                    {"kind":"weekly_scoped","percent":66,
+                     "scope":{"model":{"display_name":"Mini Opus"}}},
+                    {"kind":"weekly_scoped","percent":55,
+                     "scope":{"model":{"display_name":"Opusx"}}}
+                ]}"#,
+        ))
+        .unwrap();
+        let ids: Vec<_> = windows.iter().map(|w| w.id.0.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "session_5h",
+                "weekly_opus",
+                "weekly_opus_mini",
+                "weekly_mini_opus",
+                "weekly_opusx"
+            ]
+        );
+    }
+
+    /// And a scoped row never suppresses another scoped row. Only the fixed
+    /// buckets suppress, because only they are known to restate a cap; two
+    /// scoped rows are two caps until their ids actually collide.
+    #[test]
+    fn one_scoped_row_never_suppresses_another() {
+        let windows = parse(&raw(
+            200,
+            r#"{"five_hour":{"utilization":10},
+                "limits":[
+                    {"kind":"weekly_scoped","percent":10,
+                     "scope":{"model":{"display_name":"Fable"}}},
+                    {"kind":"weekly_scoped","percent":20,
+                     "scope":{"model":{"display_name":"Fable Mini"}}},
+                    {"kind":"weekly_scoped","percent":30,
+                     "scope":{"model":{"display_name":"Turbo Fable 2"}}}
+                ]}"#,
+        ))
+        .unwrap();
+        let ids: Vec<_> = windows.iter().map(|w| w.id.0.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "session_5h",
+                "weekly_fable",
+                "weekly_fable_mini",
+                "weekly_turbo_fable_2"
+            ]
+        );
+    }
+
+    #[test]
+    fn canonical_model_drops_only_a_vendor_prefix_and_a_version_tail() {
+        assert_eq!(canonical_model("opus"), "opus");
+        assert_eq!(canonical_model("claude_opus_4_5"), "opus");
+        assert_eq!(canonical_model("opus_4_5"), "opus");
+        // Anything that still distinguishes the name is kept.
+        assert_eq!(canonical_model("opus_mini"), "opus_mini");
+        assert_eq!(canonical_model("mini_opus"), "mini_opus");
+        assert_eq!(canonical_model("opusx"), "opusx");
+        // Never reduced away entirely.
+        assert_eq!(canonical_model("claude"), "claude");
+        assert_eq!(canonical_model("4_5"), "4_5");
+        assert!(same_model("claude_opus_4_5", "opus"));
+        assert!(!same_model("opus_mini", "opus"));
+    }
+
+    /// The suppression is a drop like any other, so it says so. Without this
+    /// the one path that discards a row on purpose was also the one path that
+    /// discarded it in silence.
+    #[test]
+    fn suppressing_a_restated_cap_says_so() {
+        let mut windows = Vec::new();
+        let logs = captured_logs(|| {
+            windows = parse(&raw(
+                200,
+                r#"{"five_hour":{"utilization":10},
+                    "seven_day_opus":{"utilization":30},
+                    "limits":[{"kind":"weekly_scoped","percent":30,
+                               "scope":{"model":{"display_name":"Claude Opus 4.5"}}}]}"#,
+            ))
+            .unwrap();
+        });
+        assert_eq!(windows.len(), 2);
+        assert!(logs.contains("a fixed bucket already reports"), "{logs}");
+        assert!(logs.contains("covered_by"), "{logs}");
+    }
+
+    /// A fixed bucket is read at the *outer* parse, so a strictly-typed field
+    /// there hands the whole poll to whichever value the server got wrong —
+    /// the same blast radius `limits[]` was re-typed to avoid, reached through
+    /// a field nobody was watching.
+    #[test]
+    fn an_unreadable_fixed_bucket_field_costs_that_field_not_the_poll() {
+        // An instant the parser cannot read: the bucket survives without one.
+        let windows = parse(&raw(
+            200,
+            r#"{"five_hour":{"utilization":5,"resets_at":"soon"},
+                "seven_day":{"utilization":41}}"#,
+        ))
+        .expect("an unreadable instant must not fail the poll");
+        let ids: Vec<_> = windows.iter().map(|w| w.id.0.as_str()).collect();
+        assert_eq!(ids, ["session_5h", "weekly"]);
+        assert_eq!(windows[0].reset_at, None);
+        assert_eq!(windows[0].used, 5.0);
+
+        // A reading outside f64: that bucket is skipped, the others stand.
+        let windows = parse(&raw(
+            200,
+            r#"{"five_hour":{"utilization":1e400},"seven_day":{"utilization":41}}"#,
+        ))
+        .expect("an unrepresentable reading must not fail the poll");
+        let ids: Vec<_> = windows.iter().map(|w| w.id.0.as_str()).collect();
+        assert_eq!(ids, ["weekly"]);
+    }
+
+    /// The same guarantee for a scoped row, which a leniently-deserialized but
+    /// still typed field could not give: deserializing at all converts the
+    /// value, and a number outside `f64` failed the whole row first.
+    #[test]
+    fn an_unreadable_instant_in_a_scoped_row_costs_only_the_instant() {
+        for body in [
+            r#"{"five_hour":{"utilization":5},
+                "limits":[{"kind":"weekly_scoped","percent":48,"resets_at":"soon",
+                           "scope":{"model":{"display_name":"Fable"}}}]}"#,
+            r#"{"five_hour":{"utilization":5},
+                "limits":[{"kind":"weekly_scoped","percent":48,"resets_at":1e400,
+                           "scope":{"model":{"display_name":"Fable"}}}]}"#,
+        ] {
+            let windows = parse(&raw(200, body)).unwrap();
+            let ids: Vec<_> = windows.iter().map(|w| w.id.0.as_str()).collect();
+            assert_eq!(ids, ["session_5h", "weekly_fable"], "body: {body}");
+            assert_eq!(windows[1].used, 48.0);
+            assert_eq!(windows[1].reset_at, None);
+        }
+    }
+
+    #[test]
+    fn a_skipped_fixed_bucket_says_so() {
+        let mut windows = Vec::new();
+        let logs = captured_logs(|| {
+            windows = parse(&raw(
+                200,
+                r#"{"five_hour":{"resets_at":null},"seven_day":{"utilization":41}}"#,
+            ))
+            .unwrap();
+        });
+        assert_eq!(windows.len(), 1);
+        assert!(logs.contains("skipping fixed bucket"), "{logs}");
+    }
+
+    #[test]
+    fn a_model_id_that_slugs_to_nothing_falls_back_to_the_label() {
+        let windows = parse(&raw(
+            200,
+            r#"{"five_hour":{"utilization":5},
+                "limits":[{"kind":"weekly_scoped","percent":48,
+                           "scope":{"model":{"id":"日本","display_name":"Fable"}}}]}"#,
+        ))
+        .unwrap();
+        assert_eq!(windows[1].id.0, "weekly_fable");
     }
 
     #[test]

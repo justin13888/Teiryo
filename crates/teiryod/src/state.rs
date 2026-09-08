@@ -238,9 +238,11 @@ impl Daemon {
             _ => Vec::new(),
         };
         // Before anything else looks at them: a window whose id changed is
-        // invisible to every comparison below, by design.
+        // invisible to every comparison below, by design. Guarded on success
+        // because a failed poll carries no windows, and every window vanishing
+        // at once is an outage rather than a rename.
         if matches!(event.outcome, PollOutcome::Success { .. }) {
-            warn_on_window_identity_change(
+            warn_on_orphaned_window_history(
                 previous_windows(st.latest_success.get(&event.account)),
                 &windows,
             );
@@ -453,24 +455,29 @@ impl Daemon {
     }
 }
 
-/// Report a per-model window that changed identity between two polls.
+/// Report per-model windows whose stored history has just been orphaned.
 ///
-/// [`rollover::detect`] deliberately skips windows present in only one of two
-/// polls: one appearing for the first time has nothing to have rolled over
-/// from, and one that vanished describes the provider's payload rather than a
-/// reset. That is right for rollovers, and blind to the case here. A
-/// `weekly_<model>` id is derived from what the server calls the model, and it
-/// is a durable storage key — `quota_snapshot` and `window_rollover` are both
-/// keyed on it. So when the server renames a model, or starts sending
+/// A `weekly_<model>` id is a durable storage key — `quota_snapshot` and
+/// `window_rollover` are both keyed on it — derived from what the server calls
+/// the model. When the server renames a model, or starts sending
 /// `scope.model.id` where it previously sent null, the old id stops appearing
-/// and a new one takes its place: no rollover, no error, and a row that shows
-/// a correct percentage beside an empty chart and no burn rate.
+/// and a new one takes its place. Nothing downstream can see that:
+/// [`rollover::detect`] skips windows present in only one of two polls, which
+/// is right for rollovers and precisely blind here.
 ///
-/// Nothing here can prevent that or move the history — there is no migration
-/// framework, and `storage` prunes nothing. What it can do is stop it
-/// happening in silence, which is the difference between a user seeing an
-/// explanation and seeing a bug.
-fn warn_on_window_identity_change(previous: &[QuotaWindow], current: &[QuotaWindow]) {
+/// The condition reported is a scoped window **vanishing**, not a rename.
+/// Pairing an old id to a new one is not possible from here — the server sends
+/// no continuity information, and guessing it from the names is how the
+/// parser's own dedupe went wrong. What *is* certain is that a vanished id's
+/// series is now unreachable: nothing prunes it and there is no migration
+/// path. That is true whether or not something else appeared, which is also
+/// why a window merely *arriving* says nothing and stays quiet.
+///
+/// Reporting the vanish alone rather than a vanish-and-appear pair is what
+/// makes it both honest and complete: the pair fired on a plan simply
+/// exchanging one per-model cap for another, and stayed silent when the rename
+/// straddled a poll where the window was briefly absent.
+fn warn_on_orphaned_window_history(previous: &[QuotaWindow], current: &[QuotaWindow]) {
     let scoped = |w: &&QuotaWindow| {
         matches!(w.scope, teiryo_core::domain::WindowScope::Model(_))
             && w.id.0.starts_with("weekly_")
@@ -482,16 +489,14 @@ fn warn_on_window_identity_change(previous: &[QuotaWindow], current: &[QuotaWind
             .map(|w| w.id.0.clone())
             .collect::<Vec<String>>()
     };
-    let vanished = only_in(previous, current);
-    let appeared = only_in(current, previous);
-    // One without the other is an ordinary come-and-go: a plan gaining or
-    // losing a per-model cap. Both together is the same cap under a new key.
-    if vanished.is_empty() || appeared.is_empty() {
+    let orphaned = only_in(previous, current);
+    if orphaned.is_empty() {
         return;
     }
+    let now_reported = only_in(current, previous);
     tracing::warn!(
-        ?vanished, ?appeared,
-        "per-model window ids changed; history stored under the old ids is orphaned and nothing prunes it"
+        ?orphaned, ?now_reported,
+        "per-model windows are no longer reported; the history stored under their ids is unreachable and nothing prunes it"
     );
 }
 
@@ -706,6 +711,9 @@ mod tests {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(move || made.clone())
             .with_max_level(tracing::Level::TRACE)
+            // Field names and their `=` are separated by escape codes
+            // otherwise, so an assertion on `name=` never matches.
+            .with_ansi(false)
             .without_time()
             .finish();
         tracing::subscriber::with_default(subscriber, f);
@@ -727,14 +735,15 @@ mod tests {
     }
 
     /// A per-model window id is a storage key derived from what the server
-    /// calls the model, so a rename orphans the whole series — and every
+    /// calls the model, so a rename strands the whole series — and every
     /// comparison downstream is blind to it by design: `rollover::detect`
     /// skips windows present in only one of two polls.
     ///
-    /// The rename cannot be prevented or repaired from here. It can be made
-    /// visible, which is the difference between an explanation and a bug.
+    /// The condition is the *vanish*, not a matched pair. Pairing an old id to
+    /// a new one is not possible from here, and the appeared list is context
+    /// rather than a claim about which id replaced which.
     #[test]
-    fn a_per_model_window_changing_its_id_is_reported() {
+    fn a_per_model_window_that_stops_being_reported_is_named_as_orphaned() {
         let dir = std::env::temp_dir().join(format!("teiryod-ident-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let daemon = seeded(&dir.join("teiryo.db"));
@@ -745,8 +754,6 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2));
 
         // The server starts sending `scope.model.id`, or renames the model.
-        // Either way the id the parser derives changes, and the stored series
-        // under the old one is stranded.
         let logs = captured_logs(|| {
             daemon.record_event(&event(PollOutcome::Success {
                 windows: vec![model_window(
@@ -756,18 +763,31 @@ mod tests {
                 )],
             }));
         });
-        assert!(logs.contains("weekly_fable"), "{logs}");
-        assert!(logs.contains("weekly_claude_fable_5_1"), "{logs}");
-        assert!(logs.contains("orphaned"), "{logs}");
+        // The two ids are asserted in their roles, not merely present. Checking
+        // that both strings appear anywhere would pass just as well with the
+        // fields swapped, which states the opposite: that the new id is the one
+        // whose history was lost.
+        let orphaned = logs.find("orphaned=").expect("an orphaned field");
+        let reported = logs.find("now_reported=").expect("a now_reported field");
+        assert!(orphaned < reported, "{logs}");
+        assert!(
+            logs[orphaned..reported].contains("weekly_fable"),
+            "the old id is what was lost:\n{logs}"
+        );
+        assert!(
+            logs[reported..].contains("weekly_claude_fable_5_1"),
+            "the new id is context, not the loss:\n{logs}"
+        );
+        assert!(logs.contains("unreachable"), "{logs}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A plan gaining or losing a per-model cap is ordinary, and must not be
-    /// reported as a rename. Without this the warning fires on every first
-    /// poll after a restart and stops meaning anything.
+    /// A window merely *arriving* orphans nothing and must stay quiet — a plan
+    /// gaining a per-model cap is ordinary, and so is the first poll after a
+    /// restart.
     #[test]
-    fn a_per_model_window_merely_arriving_or_leaving_is_not_reported() {
+    fn a_per_model_window_merely_arriving_is_not_reported() {
         let dir = std::env::temp_dir().join(format!("teiryod-ident2-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let daemon = seeded(&dir.join("teiryo.db"));
@@ -777,15 +797,77 @@ mod tests {
                 windows: vec![model_window("weekly_fable", "fable", 40.0)],
             }));
         });
-        assert!(!arrival.contains("orphaned"), "{arrival}");
+        assert!(!arrival.contains("unreachable"), "{arrival}");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fixed bucket disappearing is an outage, not a rename.
+    ///
+    /// Only `weekly_<model>` ids are derived from a label the server controls.
+    /// The fixed buckets' ids are compiled-in constants and cannot rename, so
+    /// one going missing means the payload lost a bucket — a different problem,
+    /// already visible as the window disappearing from the dashboard, and not
+    /// something to report as unreachable history.
+    #[test]
+    fn a_fixed_bucket_disappearing_is_not_reported_as_orphaned() {
+        let dir = std::env::temp_dir().join(format!("teiryod-ident4-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = seeded(&dir.join("teiryo.db"));
+
+        let mut opus = model_window("session_5h_opus", "opus", 30.0);
+        opus.reset_kind = ResetKind::Rolling(Duration::from_secs(5 * 3600));
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![window(), opus],
+        }));
         std::thread::sleep(Duration::from_millis(2));
-        let departure = captured_logs(|| {
+
+        let logs = captured_logs(|| {
             daemon.record_event(&event(PollOutcome::Success {
                 windows: vec![window()],
             }));
         });
-        assert!(!departure.contains("orphaned"), "{departure}");
+        assert!(!logs.contains("unreachable"), "{logs}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The half a matched pair could not see: a rename straddling a poll where
+    /// the window is briefly absent. Reporting the vanish on its own is what
+    /// makes it visible at the moment the history actually became unreachable.
+    #[test]
+    fn a_rename_across_an_absent_poll_is_still_reported() {
+        let dir = std::env::temp_dir().join(format!("teiryod-ident3-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = seeded(&dir.join("teiryo.db"));
+
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![window(), model_window("weekly_fable", "fable", 40.0)],
+        }));
+        std::thread::sleep(Duration::from_millis(2));
+        // The row was unreadable this poll, so the cap is simply absent.
+        let gone = captured_logs(|| {
+            daemon.record_event(&event(PollOutcome::Success {
+                windows: vec![window()],
+            }));
+        });
+        assert!(
+            gone.contains("weekly_fable") && gone.contains("unreachable"),
+            "the vanish is reported on its own:\n{gone}"
+        );
+
+        std::thread::sleep(Duration::from_millis(2));
+        // It returns under a new id. Nothing vanished this time, so nothing is
+        // claimed — the loss was already reported when it happened.
+        let back = captured_logs(|| {
+            daemon.record_event(&event(PollOutcome::Success {
+                windows: vec![
+                    window(),
+                    model_window("weekly_fable_5_1", "fable_5_1", 41.0),
+                ],
+            }));
+        });
+        assert!(!back.contains("unreachable"), "{back}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
