@@ -68,6 +68,24 @@ pub trait Prober: Send + Sync {
 pub trait QuotaParser: Send + Sync {
     /// Parse all quota windows out of one raw response.
     fn parse(&self, raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError>;
+
+    /// Whether `id` was derived from text the provider's server controls,
+    /// rather than compiled into the adapter.
+    ///
+    /// A [`WindowId`] is a durable storage key, so the distinction is not
+    /// cosmetic. An id built from something the server names — a model's id or
+    /// label — stops being reported the day the server renames it, and the
+    /// series stored under it is then reachable under no id anyone will ask
+    /// for again. A compiled-in id cannot do that: it is the same string on
+    /// every poll, so a poll without it is that window being absent, not a new
+    /// name for it. Only the parser that mints the ids knows which is which,
+    /// which is why this is asked here rather than guessed from the id's shape.
+    ///
+    /// Defaults to `false`, the answer for an adapter whose ids are all
+    /// constants. An adapter that derives ids must say so.
+    fn id_is_server_derived(&self, _id: &WindowId) -> bool {
+        false
+    }
 }
 
 /// Provider-specific rendering rules, so the TUI stays provider-agnostic.

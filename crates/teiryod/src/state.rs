@@ -58,9 +58,13 @@ pub struct SharedState {
     /// Compiled-in provider ids, so [`Config::view`] can offer a row for a
     /// provider the config file never mentions.
     pub known_providers: Vec<ProviderId>,
-    /// Adapters kept for their [`teiryo_core::WindowPresenter`] impl: `Status`
-    /// attaches each window's render hint so the TUI never hardcodes
-    /// provider-specific thresholds.
+    /// Adapters kept for the two questions only the provider can answer:
+    /// [`teiryo_core::WindowPresenter::render_hint`], so `Status` can attach
+    /// each window's hint and the TUI never hardcodes provider-specific
+    /// thresholds, and
+    /// [`teiryo_core::QuotaParser::id_is_server_derived`], so
+    /// [`warn_on_orphaned_window_history`] never hardcodes one provider's
+    /// window ids.
     pub presenters: HashMap<ProviderId, Rc<dyn ProviderAdapter>>,
     /// Most recent observed restart per window, published on `Status`.
     ///
@@ -363,6 +367,17 @@ impl Daemon {
             PollOutcome::Success { windows } => windows.clone(),
             _ => Vec::new(),
         };
+        // Before anything else looks at them: a window whose id changed is
+        // invisible to every comparison below, by design. Guarded on success
+        // because a failed poll carries no windows, and every window vanishing
+        // at once is an outage rather than a rename.
+        if matches!(event.outcome, PollOutcome::Success { .. }) {
+            warn_on_orphaned_window_history(
+                st.presenters.get(&event.provider).map(Rc::as_ref),
+                previous_windows(st.latest_success.get(&event.account)),
+                &windows,
+            );
+        }
         // Detect against the last *successful* poll, not the last poll: a run
         // of failures in between leaves the windows untouched, and comparing
         // against an empty failure payload would invent a rollover. This runs
@@ -619,7 +634,8 @@ impl Daemon {
     }
 
     /// Register a poll task for `account`: open its live schedule channel,
-    /// record the cadence clients see, and keep the adapter for its presenter.
+    /// record the cadence clients see, and keep the adapter for the questions
+    /// `SharedState::presenters` documents.
     /// Returns the receiver to hand to [`crate::scheduler::spawn_poller`].
     pub fn register_poller(
         &self,
@@ -658,6 +674,68 @@ impl Daemon {
             .map(|e| e.id)
             .unwrap_or_else(teiryo_core::PollId::zero)
     }
+}
+
+/// Report per-model windows that have stopped being reported under the id
+/// their history is stored under.
+///
+/// A per-model window id derived from server text is a durable storage key —
+/// `quota_snapshot` and `window_rollover` are both keyed on it. When the
+/// server renames a model, or starts sending `scope.model.id` where it
+/// previously sent null, the old id stops appearing and a new one takes its
+/// place. Nothing downstream can see that: [`rollover::detect`] skips windows
+/// present in only one of two polls, which is right for rollovers and
+/// precisely blind here.
+///
+/// Which ids are derived is the adapter's answer, not this function's:
+/// [`teiryo_core::QuotaParser::id_is_server_derived`]. A compiled-in id cannot
+/// rename, so its absence is a window missing from one payload — a different
+/// problem, already visible on the dashboard. Without an adapter for the
+/// provider the two cannot be told apart, and nothing is reported rather than
+/// guessed.
+///
+/// The condition reported is a derived window **vanishing**, not a rename.
+/// Pairing an old id to a new one is not possible from here — the server sends
+/// no continuity information, and guessing it from the names is how the
+/// parser's own dedupe went wrong. So the claim stays at what a single poll
+/// establishes: this id was reported before and is not now, and whatever
+/// history is stored under it is not reachable under any new id. A one-poll
+/// absence — an unreadable row, or a plan dropping a cap — reads the same from
+/// here and is deliberately reported the same, which is exactly why nothing is
+/// said about the loss being permanent: whether the id returns next poll is not
+/// knowable here. That is true whether or not something else appeared, which is
+/// also why a window merely *arriving* says nothing and stays quiet.
+///
+/// Reporting the vanish alone rather than a vanish-and-appear pair is what
+/// makes it both honest and complete: the pair fired on a plan simply
+/// exchanging one per-model cap for another, and stayed silent when the rename
+/// straddled a poll where the window was briefly absent.
+fn warn_on_orphaned_window_history(
+    adapter: Option<&dyn ProviderAdapter>,
+    previous: &[QuotaWindow],
+    current: &[QuotaWindow],
+) {
+    let Some(adapter) = adapter else { return };
+    let scoped = |w: &&QuotaWindow| {
+        matches!(w.scope, teiryo_core::domain::WindowScope::Model(_))
+            && adapter.id_is_server_derived(&w.id)
+    };
+    let only_in = |side: &[QuotaWindow], other: &[QuotaWindow]| {
+        side.iter()
+            .filter(scoped)
+            .filter(|w| !other.iter().any(|o| o.id == w.id))
+            .map(|w| w.id.0.clone())
+            .collect::<Vec<String>>()
+    };
+    let no_longer_reported = only_in(previous, current);
+    if no_longer_reported.is_empty() {
+        return;
+    }
+    let now_reported = only_in(current, previous);
+    tracing::warn!(
+        ?no_longer_reported, ?now_reported,
+        "per-model window ids stopped being reported; history stored under them is not reachable under a new id"
+    );
 }
 
 #[cfg(test)]
@@ -849,6 +927,276 @@ mod tests {
         assert!(rejected.error.is_some());
         // Still a new generation, or a client would never learn about it.
         assert!(rejected.generation > applied.generation);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn captured_logs(f: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let made = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || made.clone())
+            .with_max_level(tracing::Level::TRACE)
+            // Field names and their `=` are separated by escape codes
+            // otherwise, so an assertion on `name=` never matches.
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = sink.0.lock().unwrap().clone();
+        String::from_utf8(bytes).expect("utf-8 log output")
+    }
+
+    /// A daemon whose registered adapter is the real Claude one, so which of
+    /// its window ids count as server-derived is decided by the provider
+    /// rather than restated here. Registered against the stub account because
+    /// `register_poller` keys the adapter by the *account's* provider, and the
+    /// point under test is the daemon asking rather than the account.
+    fn with_claude_adapter(path: &std::path::Path) -> Daemon {
+        let daemon = seeded(path);
+        let _rx = daemon.register_poller(
+            &account(),
+            Rc::new(teiryo_providers::claude::ClaudeAdapter::with_config(
+                path.with_file_name("credentials.json"),
+                "http://127.0.0.1:1".to_owned(),
+            )),
+        );
+        daemon
+    }
+
+    fn model_window(id: &str, model: &str, used: f64) -> QuotaWindow {
+        QuotaWindow {
+            id: WindowId::from(id),
+            label: format!("Weekly — {model}"),
+            scope: WindowScope::Model(model.to_owned()),
+            reset_kind: ResetKind::Rolling(Duration::from_secs(7 * 24 * 3600)),
+            unit: QuotaUnit::Percent,
+            used,
+            limit: Some(100.0),
+            reset_at: None,
+        }
+    }
+
+    /// A per-model window id is a storage key derived from what the server
+    /// calls the model, so a rename strands the whole series — and every
+    /// comparison downstream is blind to it by design: `rollover::detect`
+    /// skips windows present in only one of two polls.
+    ///
+    /// The condition is the *vanish*, not a matched pair. Pairing an old id to
+    /// a new one is not possible from here, and the appeared list is context
+    /// rather than a claim about which id replaced which.
+    #[test]
+    fn a_per_model_window_that_stops_being_reported_is_named_as_orphaned() {
+        let dir = std::env::temp_dir().join(format!("teiryod-ident-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = with_claude_adapter(&dir.join("teiryo.db"));
+
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![model_window("weekly_fable", "fable", 40.0)],
+        }));
+        std::thread::sleep(Duration::from_millis(2));
+
+        // The server starts sending `scope.model.id`, or renames the model.
+        let logs = captured_logs(|| {
+            daemon.record_event(&event(PollOutcome::Success {
+                windows: vec![model_window(
+                    "weekly_claude_fable_5_1",
+                    "claude_fable_5_1",
+                    41.0,
+                )],
+            }));
+        });
+        // The two ids are asserted in their roles, not merely present. Checking
+        // that both strings appear anywhere would pass just as well with the
+        // fields swapped, which states the opposite: that the new id is the one
+        // whose history was lost.
+        let lost = logs
+            .find("no_longer_reported=")
+            .expect("a no_longer_reported field");
+        let reported = logs.find("now_reported=").expect("a now_reported field");
+        assert!(lost < reported, "{logs}");
+        assert!(
+            logs[lost..reported].contains("weekly_fable"),
+            "the old id is what stopped being reported:\n{logs}"
+        );
+        assert!(
+            logs[reported..].contains("weekly_claude_fable_5_1"),
+            "the new id is context, not the loss:\n{logs}"
+        );
+        assert!(logs.contains("not reachable"), "{logs}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A window merely *arriving* orphans nothing and must stay quiet — a plan
+    /// gaining a per-model cap is ordinary, and so is the first poll after a
+    /// restart.
+    #[test]
+    fn a_per_model_window_merely_arriving_is_not_reported() {
+        let dir = std::env::temp_dir().join(format!("teiryod-ident2-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = with_claude_adapter(&dir.join("teiryo.db"));
+
+        let arrival = captured_logs(|| {
+            daemon.record_event(&event(PollOutcome::Success {
+                windows: vec![model_window("weekly_fable", "fable", 40.0)],
+            }));
+        });
+        assert!(!arrival.contains("not reachable"), "{arrival}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fixed bucket disappearing is an outage, not a rename.
+    ///
+    /// `weekly_opus` is the id the Claude adapter actually emits for its
+    /// `seven_day_opus` bucket: model-scoped, `weekly_`-prefixed, and a
+    /// compiled-in constant all at once. It cannot rename, so one poll without
+    /// it is that bucket being absent — a bucket the server sent as null, or
+    /// with a reading the parser could not read — which is a different problem,
+    /// already visible as the window disappearing from the dashboard, and not
+    /// something to report as history no id reaches.
+    ///
+    /// Judging that by the id's shape got this exactly backwards, and the id
+    /// this test used to carry (`session_5h_opus`) is one no adapter emits, so
+    /// it never noticed.
+    #[test]
+    fn a_fixed_bucket_disappearing_is_not_reported_as_orphaned() {
+        let dir = std::env::temp_dir().join(format!("teiryod-ident4-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = with_claude_adapter(&dir.join("teiryo.db"));
+
+        let opus = model_window("weekly_opus", "opus", 30.0);
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![window(), opus],
+        }));
+        std::thread::sleep(Duration::from_millis(2));
+
+        let logs = captured_logs(|| {
+            daemon.record_event(&event(PollOutcome::Success {
+                windows: vec![window()],
+            }));
+        });
+        assert!(!logs.contains("not reachable"), "{logs}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The half a matched pair could not see: a rename straddling a poll where
+    /// the window is briefly absent. Reporting the vanish on its own is what
+    /// makes it visible at the moment the stored series stopped being reachable.
+    #[test]
+    fn a_rename_across_an_absent_poll_is_still_reported() {
+        let dir = std::env::temp_dir().join(format!("teiryod-ident3-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = with_claude_adapter(&dir.join("teiryo.db"));
+
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![window(), model_window("weekly_fable", "fable", 40.0)],
+        }));
+        std::thread::sleep(Duration::from_millis(2));
+        // The row was unreadable this poll, so the cap is simply absent.
+        let gone = captured_logs(|| {
+            daemon.record_event(&event(PollOutcome::Success {
+                windows: vec![window()],
+            }));
+        });
+        assert!(
+            gone.contains("weekly_fable") && gone.contains("not reachable"),
+            "the vanish is reported on its own:\n{gone}"
+        );
+
+        std::thread::sleep(Duration::from_millis(2));
+        // It returns under a new id. Nothing vanished this time, so nothing is
+        // claimed — the loss was already reported when it happened.
+        let back = captured_logs(|| {
+            daemon.record_event(&event(PollOutcome::Success {
+                windows: vec![
+                    window(),
+                    model_window("weekly_fable_5_1", "fable_5_1", 41.0),
+                ],
+            }));
+        });
+        assert!(!back.contains("not reachable"), "{back}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The one path no test outside the parser covered: a real `limits[]`
+    /// payload, through the real adapter, into the daemon and back out as
+    /// `Status`. The parser's own suite proves it produces the window; nothing
+    /// proved the window survives storage, rollover detection and the wire.
+    #[test]
+    fn a_limits_derived_window_survives_the_whole_daemon_path() {
+        use teiryo_core::QuotaParser;
+
+        let dir = std::env::temp_dir().join(format!("teiryod-e2e-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = seeded(&dir.join("teiryo.db"));
+        let adapter = teiryo_providers::claude::ClaudeAdapter::with_config(
+            dir.join("credentials.json"),
+            "http://127.0.0.1:1".to_owned(),
+        );
+
+        let payload = |fable: u32| {
+            format!(
+                r#"{{"five_hour":{{"utilization":27}},
+                     "seven_day":{{"utilization":41}},
+                     "limits":[{{"kind":"weekly_scoped","percent":{fable},
+                                 "scope":{{"model":{{"id":null,"display_name":"Fable"}}}}}}]}}"#
+            )
+        };
+        let probe = |body: String| teiryo_core::RawResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: body.into_bytes(),
+            fetched_at: chrono::Utc::now(),
+        };
+
+        let first = adapter.parse(&probe(payload(48))).expect("parses");
+        assert!(first.iter().any(|w| w.id == WindowId::from("weekly_fable")));
+        daemon.record_event(&event(PollOutcome::Success { windows: first }));
+
+        // It reaches the client as a window with the provider's own hint.
+        let status = &daemon.status(None, None)[0];
+        let fable = status
+            .windows
+            .iter()
+            .find(|v| v.window.id == WindowId::from("weekly_fable"))
+            .expect("the derived window is served");
+        assert_eq!(fable.window.used, 48.0);
+        assert_eq!(fable.window.label, "Weekly — Fable");
+
+        // Its history accumulates under that id, independently of the others.
+        std::thread::sleep(Duration::from_millis(2));
+        let second = adapter.parse(&probe(payload(52))).expect("parses");
+        daemon.record_event(&event(PollOutcome::Success { windows: second }));
+        let page = daemon
+            .state
+            .borrow()
+            .storage
+            .history(
+                &account().id,
+                Some(&WindowId::from("weekly_fable")),
+                chrono::Utc::now() - chrono::Duration::hours(1),
+                None,
+                None,
+            )
+            .expect("history");
+        let used: Vec<f64> = page.iter().map(|s| s.used).collect();
+        assert_eq!(used, vec![48.0, 52.0]);
 
         std::fs::remove_dir_all(&dir).ok();
     }

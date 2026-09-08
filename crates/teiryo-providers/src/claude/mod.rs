@@ -2,7 +2,9 @@
 //!
 //! Usage is exposed as *headroom percentages*, not raw counts: a rolling
 //! 5-hour session window and rolling weekly windows (separate Opus/Sonnet
-//! buckets on Max plans). Hitting a cap hard-blocks new prompts.
+//! buckets on Max plans, plus per-model weekly caps such as Fable's that the
+//! server reports only through its `limits[]` rows). Hitting a cap
+//! hard-blocks new prompts.
 
 mod credentials;
 mod parser;
@@ -183,6 +185,10 @@ impl Prober for ClaudeAdapter {
 impl QuotaParser for ClaudeAdapter {
     fn parse(&self, raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
         parser::parse(raw)
+    }
+
+    fn id_is_server_derived(&self, id: &WindowId) -> bool {
+        parser::is_server_derived(id)
     }
 }
 
