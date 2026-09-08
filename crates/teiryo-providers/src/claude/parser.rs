@@ -383,13 +383,18 @@ pub(crate) fn parse(raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
         } else {
             format!("Weekly — {name}")
         };
+        // The window id, as the fixed buckets pass: `window` means one thing,
+        // and a search for the id that turned up in a `usage reading outside`
+        // line found the scoped windows too, which passing the bare slug —
+        // `fable`, never `weekly_fable` — quietly ruled out.
+        let used = checked_percent(&id.0, used);
         windows.push(QuotaWindow {
             id,
             label,
-            scope: WindowScope::Model(slug.clone()),
+            scope: WindowScope::Model(slug),
             reset_kind: ResetKind::Rolling(SEVEN_DAYS),
             unit: QuotaUnit::Percent,
-            used: checked_percent(&slug, used),
+            used,
             limit: Some(100.0),
             reset_at: readable(entry.resets_at.as_deref()),
         });
@@ -747,6 +752,9 @@ mod tests {
             2,
             "{logs}"
         );
+        // `window` names a window id in both lines, so one grep finds both.
+        assert!(logs.contains(r#"window="session_5h""#), "{logs}");
+        assert!(logs.contains(r#"window="weekly_fable""#), "{logs}");
     }
 
     #[test]
