@@ -264,10 +264,23 @@ fn classify(
 /// percentage unit there is no scale to judge "far enough" against, and a bare
 /// token count falling is not evidence of anything.
 ///
-/// Exported as the crate's answer to "was that a reset": what the detector
-/// records and what anything downstream calls a reset have to be the same
-/// question, or the chart's rules and the row's numbers end up describing
-/// different windows.
+/// Both readings are utilizations in `0.0..=1.0`, not raw `used` values: the
+/// thresholds are a fraction of the whole window, so a caller holding a
+/// percentage or a message count has to scale it first.
+///
+/// Exported so that a decision *recorded* under this rule can be re-judged
+/// under it later. A stored rollover row outlives the binary that wrote it,
+/// and `teiryod` re-checks each one on startup before replaying it as a pace
+/// anchor — rows written before the ratio guard existed were classified by a
+/// bare drop, and replaying those would anchor a window to an instant nothing
+/// restarted at.
+///
+/// It is deliberately *not* a rule every consumer shares. `teiryo`'s
+/// `recent_pace` asks a narrower question — whether to cut a series at a
+/// falling reading — and answers it with its own, much smaller epsilon,
+/// because a restart too small for this rule to see is one it must still not
+/// average across. The two are different questions about the same event, and
+/// this doc used to claim otherwise.
 pub fn is_collapse(prev: f64, new: f64) -> bool {
     prev - new >= MIN_RESET_DROP && new <= prev * RESET_COLLAPSE_RATIO
 }
