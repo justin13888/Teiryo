@@ -26,3 +26,6 @@ unicode-width = "0.2"
 unicode-segmentation = "1"
 tokio.workspace = true
 tokio-util.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

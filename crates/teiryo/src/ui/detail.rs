@@ -14,7 +14,7 @@ use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragrap
 use ratatui::Frame;
 
 use teiryo_core::domain::QuotaUnit;
-use teiryo_core::{PollEvent, ProviderHealth, WindowRollover};
+use teiryo_core::{PollEvent, ProviderHealth, WindowRollover, WindowView};
 
 use crate::app::{App, DetailTab, Pane, TimeRange, Trend};
 use crate::metrics;
@@ -158,13 +158,27 @@ fn trend_footer(app: &App, now: DateTime<Utc>) -> Line<'static> {
             format!(" · now {}", usage_text(&view.window)),
             theme::dim(),
         ));
-        if let Some(pace) = metrics::pace(&view.window, now) {
-            spans.push(Span::styled(format!(" · pace {pace:.2}×"), theme::dim()));
+        let effective = metrics::effective_window(view, now);
+        // Same mark the row's own numbers carry: the window's start is known
+        // only to within a bracket comparable to the window itself.
+        let mark = match effective.as_ref() {
+            Some(w) if metrics::start_is_uncertain(w) => "~",
+            _ => "",
+        };
+        if let Some(pace) = effective.as_ref().and_then(|w| metrics::pace(w, now)) {
+            spans.push(Span::styled(
+                format!(" · pace {mark}{pace:.2}×"),
+                theme::dim(),
+            ));
         }
         // Named for what separates it from the pace beside it: that one is the
         // average since the window opened, this one only the recent end of it.
         let points = app.recent_points(&status.account.id, &view.window.id);
-        if let Some(recent) = metrics::recent_pace(&view.window, points, now) {
+        let max_gap = metrics::gap_tolerance(status.poll_interval_secs);
+        if let Some(recent) = effective
+            .as_ref()
+            .and_then(|w| metrics::recent_pace(w, points, max_gap, now))
+        {
             spans.push(Span::styled(
                 format!(" · lately {recent:.2}×"),
                 theme::dim(),
@@ -179,6 +193,36 @@ fn trend_footer(app: &App, now: DateTime<Utc>) -> Line<'static> {
     }
     spans.push(Span::raw(" "));
     Line::from(spans)
+}
+
+/// The rules drawn over the trend: where the live window began, where it
+/// ends, and every stored boundary inside the drawn interval.
+///
+/// `from`/`until` are the edges of what is *drawn*; `now` is when the question
+/// is asked. Panning moves the first pair and not the second, and only `now`
+/// may decide which window is the live one. `effective_window`'s single
+/// `now`-dependent term is its `not_after <= now` filter, so resolving at a
+/// panned `until` would silently reject the daemon's evidence and fall the
+/// `CurrentStart` rule back to `reset_at - span` — an instant inside the
+/// *previous* window instance, drawn only because the anchor was dropped, and
+/// disagreeing with the footer beside it, which resolves at `now`.
+fn trend_rules(
+    view: Option<&WindowView>,
+    rollovers: &[WindowRollover],
+    from: DateTime<Utc>,
+    until: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Vec<Boundary> {
+    view.map(|view| {
+        metrics::boundaries(
+            &view.window.id,
+            metrics::effective_window(view, now).as_ref(),
+            rollovers,
+            from,
+            until,
+        )
+    })
+    .unwrap_or_default()
 }
 
 fn render_trend(
@@ -238,17 +282,13 @@ fn render_trend(
 
     // Where the window began and where it ends. Empty for a provider that
     // publishes no reset instant and has never been seen to roll over.
-    let rules = app
-        .selected_window()
-        .map(|(_, view)| {
-            metrics::boundaries(
-                &view.window,
-                &trend.rollovers,
-                until - trend.range.duration(),
-                until,
-            )
-        })
-        .unwrap_or_default();
+    let rules = trend_rules(
+        app.selected_window().map(|(_, view)| view),
+        &trend.rollovers,
+        until - trend.range.duration(),
+        until,
+        now,
+    );
     // The upcoming reset is the one boundary that lies to the right of the
     // series, so the axis has to grow to hold it.
     let lead = future_lead(&rules, span, x_of, app.trend_is_live());
@@ -623,6 +663,9 @@ mod tests {
     use teiryo_core::{AccountHealth, AccountId, PollId, PollOutcome, PollTrigger};
 
     use crate::ui::format::cells;
+    use teiryo_core::domain::{QuotaWindow, ResetKind, WindowId, WindowScope};
+    use teiryo_core::rollover::ObservedStart;
+    use teiryo_core::{BarStyle, RenderHint};
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap()
@@ -657,6 +700,68 @@ mod tests {
             outcome,
             latency_ms: 42,
         }
+    }
+
+    /// A 5-hour window the provider says resets in 2½ hours, which the daemon
+    /// saw restart half an hour ago inside a ten-minute bracket.
+    ///
+    /// The two answers about where it began are far apart on purpose: the
+    /// provider's arithmetic gives `now - 2h30m`, the daemon's evidence gives
+    /// `now - 30m`, and a rule drawn at the first while the footer reads the
+    /// second is the disagreement this fixture exists to catch.
+    fn anchored_view() -> WindowView {
+        WindowView {
+            window: QuotaWindow {
+                id: WindowId::from("session_5h"),
+                label: "Session — 5 hour".into(),
+                scope: WindowScope::AccountWide,
+                reset_kind: ResetKind::Rolling(std::time::Duration::from_secs(5 * 3600)),
+                unit: QuotaUnit::Percent,
+                used: 40.0,
+                limit: Some(100.0),
+                reset_at: Some(now() + chrono::Duration::minutes(150)),
+            },
+            hint: RenderHint {
+                style: BarStyle::Percent,
+                warn_threshold: 0.8,
+                critical_threshold: 0.95,
+                note: None,
+            },
+            observed_start: Some(ObservedStart {
+                not_before: now() - chrono::Duration::minutes(35),
+                not_after: now() - chrono::Duration::minutes(25),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_panned_chart_rules_off_the_window_that_is_actually_running() {
+        // Panned back an hour on a six-hour range, so the drawn interval ends
+        // before the restart the daemon observed.
+        let until = now() - chrono::Duration::hours(1);
+        let from = until - chrono::Duration::hours(6);
+
+        let live: Vec<_> = trend_rules(Some(&anchored_view()), &[], from, until, now())
+            .into_iter()
+            .filter(|b| b.kind == BoundaryKind::CurrentStart)
+            .collect();
+        // The window began at `now - 30m`, to the right of everything drawn,
+        // so the honest answer is no rule at all — not a rule elsewhere.
+        assert!(live.is_empty(), "expected no live-start rule, got {live:?}");
+
+        // Resolving against the panned edge instead of `now` is what would put
+        // one there. The anchor fails `not_after <= until` and the start falls
+        // back to `reset_at - span`, an instant two hours inside the *previous*
+        // window instance — and squarely within the drawn interval, so it draws
+        // a rule, while the footer beside it still reads `now - 30m`.
+        let dropped = metrics::effective_window(&anchored_view(), until).expect("a reset instant");
+        assert_eq!(dropped.start, now() - chrono::Duration::minutes(150));
+        assert!(
+            dropped.start >= from && dropped.start <= until,
+            "the fallback start is inside the drawn interval, which is why it draws"
+        );
+        let kept = metrics::effective_window(&anchored_view(), now()).expect("a reset instant");
+        assert_eq!(kept.start, now() - chrono::Duration::minutes(30));
     }
 
     /// A 24h chart ending at `now`, mapped the way `render_trend` maps it.

@@ -1167,6 +1167,7 @@ mod tests {
                 critical_threshold: 0.95,
                 note: None,
             },
+            observed_start: None,
         }
     }
 

@@ -26,12 +26,16 @@ crossterm = "0.28"
 directories = "5"
 futures = "0.3"
 notify = "8"
+proptest = "1"
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 secrecy = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value` keeps `limits[]` rows undecoded until each is examined on its
+# own: without it the outer parse materialises every number in the array, so
+# one unrepresentable value anywhere in it fails the whole poll.
+serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "signal", "sync", "io-util", "process", "fs"] }
 tokio-util = { version = "0.7", features = ["codec"] }
