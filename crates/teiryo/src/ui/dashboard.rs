@@ -206,7 +206,14 @@ pub fn render_quotas(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: Date
                     } => {
                         let view = &status.windows[*wi];
                         let points = app.recent_points(&status.account.id, &view.window.id);
-                        window_lines(view, points, inner_width, now, two_line)
+                        window_lines(
+                            view,
+                            points,
+                            status.poll_interval_secs,
+                            inner_width,
+                            now,
+                            two_line,
+                        )
                     }
                 })
             })
@@ -263,6 +270,7 @@ fn account_line(status: &AccountStatus, now: DateTime<Utc>) -> Line<'static> {
 fn window_lines(
     view: &WindowView,
     points: &[QuotaSnapshot],
+    poll_interval_secs: u32,
     width: usize,
     now: DateTime<Utc>,
     two_line: bool,
@@ -271,7 +279,7 @@ fn window_lines(
     // pace column to reserve and the bar keeps those columns instead.
     let mut lines = vec![gauge_line(view, width, now, !two_line)];
     if two_line {
-        lines.extend(derived_line(view, points, width, now));
+        lines.extend(derived_line(view, points, poll_interval_secs, width, now));
     }
     lines
 }
@@ -363,23 +371,37 @@ const MIN_BAR: usize = 8;
 fn derived_line(
     view: &WindowView,
     points: &[QuotaSnapshot],
+    poll_interval_secs: u32,
     width: usize,
     now: DateTime<Utc>,
 ) -> Option<Line<'static>> {
     const INDENT: usize = 4;
     const SEPARATOR: &str = " · ";
 
-    let window = &view.window;
+    let window = &metrics::effective_window(view, now)?;
     let mut fields: Vec<(String, Style)> = Vec::new();
+
+    // Marks the fields measured from the window's start when that start is
+    // itself only bracketed — a restart seen across an outage can be days
+    // wide. Marked rather than withheld: the figure is still the best there
+    // is, and hiding it would lose the signal a wide bracket is usually
+    // reporting. `afford` and `now` carry no mark because neither is measured
+    // from the start.
+    let mark = if metrics::start_is_uncertain(window) {
+        "~"
+    } else {
+        ""
+    };
 
     if let Some(pace) = metrics::pace(window, now) {
         let (glyph, color) = pace_style(pace);
         fields.push((
-            format!("{glyph} {pace:.2}× pace"),
+            format!("{glyph} {mark}{pace:.2}× pace"),
             Style::default().fg(color),
         ));
     }
-    if let Some(recent) = metrics::recent_pace(window, points, now) {
+    let max_gap = metrics::gap_tolerance(poll_interval_secs);
+    if let Some(recent) = metrics::recent_pace(window, points, max_gap, now) {
         let (glyph, color) = pace_style(recent);
         fields.push((
             format!("{glyph} {recent:.2}× now"),
@@ -394,7 +416,7 @@ fn derived_line(
         let text = if runway <= chrono::Duration::zero() {
             "at cap".to_owned()
         } else {
-            format!("cap in {}", format_span(runway))
+            format!("cap in {mark}{}", format_span(runway))
         };
         let color = if binding { theme::WARN } else { theme::DIM };
         fields.push((text, Style::default().fg(color)));
@@ -403,7 +425,10 @@ fn derived_line(
         fields.push((format!("afford {afford:.2}×"), theme::dim()));
     }
     if let Some(pace) = metrics::pace(window, now) {
-        fields.push((format!("→{:.0}% at reset", pace * 100.0), theme::dim()));
+        fields.push((
+            format!("→{mark}{:.0}% at reset", pace * 100.0),
+            theme::dim(),
+        ));
     }
 
     let mut spans = vec![Span::raw(" ".repeat(INDENT))];
@@ -445,7 +470,7 @@ fn pace_style(pace: f64) -> (&'static str, ratatui::style::Color) {
 
 /// "▲ 1.3× pace" / "▼ 0.5× pace" — usage measured against the clock.
 fn pace_span(view: &WindowView, now: DateTime<Utc>) -> Span<'static> {
-    match metrics::pace(&view.window, now) {
+    match metrics::effective_window(view, now).and_then(|w| metrics::pace(&w, now)) {
         Some(pace) => {
             let (glyph, color) = pace_style(pace);
             Span::styled(

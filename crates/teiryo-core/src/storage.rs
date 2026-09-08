@@ -74,6 +74,10 @@ CREATE TABLE IF NOT EXISTS window_rollover (
     kind TEXT NOT NULL,
     prev_reset_at INTEGER, new_reset_at INTEGER,
     prev_used REAL NOT NULL, new_used REAL NOT NULL,
+    -- When the poll this was compared against completed. With `observed_at`
+    -- it brackets the reset; NULL on rows written before the column existed,
+    -- which read as a zero-width bracket.
+    prev_observed_at INTEGER,
     PRIMARY KEY (poll_id, window_id)
 );
 CREATE INDEX IF NOT EXISTS idx_poll_lookup ON poll_event(provider, account_id, ts);
@@ -83,6 +87,26 @@ CREATE INDEX IF NOT EXISTS idx_poll_account_ts ON poll_event(account_id, ts);
 CREATE INDEX IF NOT EXISTS idx_rollover_lookup
     ON window_rollover(account_id, window_id, observed_at);
 ";
+
+/// Columns added to tables that already exist in the wild.
+///
+/// There is no migration framework here and deliberately so: the schema is
+/// `CREATE TABLE IF NOT EXISTS` and the database is a local cache, not a
+/// system of record. `ALTER TABLE ... ADD COLUMN` is idempotent enough for
+/// that if the "already there" case is tolerated, which is what this does —
+/// SQLite reports it as an ordinary error, not a distinguishable code, so the
+/// message is what there is to match on.
+fn add_missing_columns(conn: &Connection) -> Result<(), StorageError> {
+    const ADDED: &[&str] = &["ALTER TABLE window_rollover ADD COLUMN prev_observed_at INTEGER"];
+    for sql in ADDED {
+        match conn.execute(sql, []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
 
 fn ts_to_millis(ts: DateTime<Utc>) -> i64 {
     ts.timestamp_millis()
@@ -128,6 +152,7 @@ impl Storage {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        add_missing_columns(&conn)?;
         Ok(Self { conn })
     }
 
@@ -202,8 +227,9 @@ impl Storage {
             tx.execute(
                 "INSERT INTO window_rollover
                      (poll_id, window_id, account_id, observed_at, kind,
-                      prev_reset_at, new_reset_at, prev_used, new_used)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                      prev_reset_at, new_reset_at, prev_used, new_used,
+                      prev_observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     rollover.poll.to_string(),
                     rollover.window.0,
@@ -214,6 +240,7 @@ impl Storage {
                     rollover.new_reset_at.map(ts_to_millis),
                     rollover.prev_used,
                     rollover.new_used,
+                    rollover.prev_observed_at.map(ts_to_millis),
                 ],
             )?;
         }
@@ -237,7 +264,8 @@ impl Storage {
     ) -> Result<Vec<WindowRollover>, StorageError> {
         let mut sql = String::from(
             "SELECT poll_id, window_id, observed_at, kind,
-                    prev_reset_at, new_reset_at, prev_used, new_used
+                    prev_reset_at, new_reset_at, prev_used, new_used,
+                    prev_observed_at
              FROM window_rollover
              WHERE account_id = ?1 AND observed_at >= ?2 AND observed_at <= ?3",
         );
@@ -256,6 +284,7 @@ impl Storage {
                 row.get(5)?,
                 row.get(6)?,
                 row.get(7)?,
+                row.get(8)?,
             ))
         };
         let (from, to) = (ts_to_millis(since), ts_to_millis(until));
@@ -277,6 +306,7 @@ impl Storage {
                     new_reset,
                     prev_used,
                     new_used,
+                    prev_observed,
                 )| {
                     Ok(WindowRollover {
                         account: account.clone(),
@@ -290,6 +320,7 @@ impl Storage {
                         new_reset_at: new_reset.map(millis_to_ts),
                         prev_used,
                         new_used,
+                        prev_observed_at: prev_observed.map(millis_to_ts),
                     })
                 },
             )
@@ -576,6 +607,7 @@ type RolloverRow = (
     Option<i64>,
     f64,
     f64,
+    Option<i64>,
 );
 
 fn row_to_event(row: EventRow) -> Result<PollEvent, StorageError> {
@@ -659,6 +691,7 @@ mod tests {
             new_reset_at: Some(now + chrono::Duration::hours(5)),
             prev_used: 91.5,
             new_used: 3.0,
+            prev_observed_at: Some(now - chrono::Duration::minutes(minutes_ago + 3)),
         };
         // Two windows on one poll — the composite key must keep both.
         let written = vec![
@@ -707,6 +740,62 @@ mod tests {
             .is_empty());
     }
 
+    /// The upgrade path: a database written before rollovers carried their
+    /// bracket must still open, and its existing rows must read as the
+    /// zero-width brackets they are rather than failing the query.
+    #[test]
+    fn a_database_without_the_bracket_column_gains_it_and_reads_null_as_unknown() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        storage.upsert_account(&account()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        let windows = vec![window("session_5h", 3.0)];
+        let poll = event(PollOutcome::Success {
+            windows: windows.clone(),
+        });
+        storage
+            .record_poll(
+                &poll,
+                &windows,
+                &[WindowRollover {
+                    account: account().id,
+                    window: WindowId::from("session_5h"),
+                    poll: poll.id,
+                    observed_at: now,
+                    kind: RolloverKind::Unannounced,
+                    prev_reset_at: None,
+                    new_reset_at: None,
+                    prev_used: 20.0,
+                    new_used: 0.0,
+                    prev_observed_at: Some(now - chrono::Duration::minutes(3)),
+                }],
+            )
+            .unwrap();
+
+        // Wind the schema back to what shipped before this change, keeping the
+        // row, then reopen the way the daemon does on startup.
+        storage
+            .conn
+            .execute(
+                "ALTER TABLE window_rollover DROP COLUMN prev_observed_at",
+                [],
+            )
+            .unwrap();
+        add_missing_columns(&storage.conn).unwrap();
+        // Idempotent: every open runs it, not only the first.
+        add_missing_columns(&storage.conn).unwrap();
+
+        let found = storage
+            .rollovers(&account().id, None, now - chrono::Duration::hours(1), now)
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].prev_observed_at, None);
+        // Which reads as "it happened when we noticed", the answer this code
+        // gave before it knew to ask.
+        let start = crate::rollover::ObservedStart::from_rollover(&found[0]);
+        assert_eq!(start.estimate(), now);
+        assert_eq!(start.uncertainty(), chrono::Duration::zero());
+    }
+
     /// A rollover is only meaningful next to the reading that justified it, so
     /// it must never outlive a poll insert that failed.
     #[test]
@@ -728,6 +817,7 @@ mod tests {
             new_reset_at: None,
             prev_used: 90.0,
             new_used: 1.0,
+            prev_observed_at: None,
         }];
         storage.record_poll(&poll, &windows, &rollovers).unwrap();
         // Re-recording the same poll violates the primary key and rolls back.

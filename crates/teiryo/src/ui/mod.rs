@@ -112,9 +112,9 @@ mod tests {
         WindowId, WindowScope,
     };
     use teiryo_core::{
-        Account, AccountHealth, AccountStatus, BarStyle, ConfigState, ConfigView, PollEvent,
-        PollId, ProviderHealth, ProviderSettings, QuotaSnapshot, RenderHint, RolloverKind,
-        WindowRollover, WindowView,
+        Account, AccountHealth, AccountStatus, BarStyle, ConfigState, ConfigView, ObservedStart,
+        PollEvent, PollId, ProviderHealth, ProviderSettings, QuotaSnapshot, RenderHint,
+        RolloverKind, WindowRollover, WindowView,
     };
 
     use crate::app::{DetailTab, Overlay, Trend};
@@ -137,6 +137,7 @@ mod tests {
                 critical_threshold: 0.95,
                 note: note.map(str::to_owned),
             },
+            observed_start: None,
         }
     }
 
@@ -253,6 +254,7 @@ mod tests {
                 new_reset_at: Some(Utc::now() + Duration::hours(3)),
                 prev_used: 90.0,
                 new_used: 2.0,
+                prev_observed_at: Some(Utc::now() - Duration::minutes(minutes_ago + 3)),
             })
             .collect(),
             snapshots: (0..points)
@@ -466,6 +468,88 @@ mod tests {
     }
 
     /// Empty state: connected but the daemon has discovered nothing yet.
+    /// Anchor every window on a restart the daemon saw between `oldest` and
+    /// `newest` minutes ago, bracketed exactly that widely.
+    ///
+    /// `view` hard-codes `observed_start: None`, and so does every other
+    /// construction site outside `metrics`' own tests — which left the whole
+    /// render path unexercised against an anchored window, including the claim
+    /// that the chart's rule and the row's numbers describe the same one.
+    fn anchor_every_window(app: &mut App, oldest: i64, newest: i64) {
+        for status in &mut app.statuses {
+            for window in &mut status.windows {
+                window.observed_start = Some(ObservedStart {
+                    not_before: Utc::now() - Duration::minutes(oldest),
+                    not_after: Utc::now() - Duration::minutes(newest),
+                });
+            }
+        }
+    }
+
+    /// The row's numbers are measured against the window that actually ran.
+    ///
+    /// Every fixture window publishes a reset two hours out on a 5-hour span,
+    /// so the provider's arithmetic starts them three hours back. A restart
+    /// seen an hour ago makes the effective window three hours long and one
+    /// hour in — a third elapsed, where the published span said five sixths.
+    #[test]
+    fn an_anchored_row_measures_against_the_window_that_actually_ran() {
+        let mut app = populated();
+        anchor_every_window(&mut app, 61, 59);
+        let out = rendered(&mut app, 120, 40);
+
+        // 62% spent a third of the way in is 1.86×, against the 0.74× the
+        // published span would have given.
+        assert!(
+            out.contains("1.86× pace"),
+            "expected the anchored pace:\n{out}"
+        );
+        assert!(
+            !out.contains("0.74× pace"),
+            "the nominal start is gone:\n{out}"
+        );
+        // A two-minute bracket on a three-hour window is precise, so none of
+        // the fields measured from the start is marked as an estimate. Checked
+        // per field rather than on the frame: the header's `next ~39s`
+        // countdown carries a `~` of its own and always will.
+        assert!(
+            !out.contains("~1.86× pace"),
+            "a tight bracket needs no mark:\n{out}"
+        );
+        assert!(!out.contains("cap in ~"), "{out}");
+        assert!(!out.contains("→~"), "{out}");
+    }
+
+    /// The same number, resting on a bracket wide enough to matter, says so.
+    ///
+    /// `start_uncertainty` was computed, carried across the whole metrics
+    /// surface, and read by nothing: a pace anchored to a bracket minutes wide
+    /// and one anchored to a bracket comparable to the window itself printed
+    /// identically.
+    #[test]
+    fn a_row_marks_the_numbers_that_rest_on_a_wide_bracket() {
+        let mut app = populated();
+        // Restart seen somewhere in a whole hour, on a three-hour window.
+        anchor_every_window(&mut app, 90, 30);
+        let out = rendered(&mut app, 120, 40);
+
+        // Same midpoint, so the same pace as the tight bracket above — the
+        // mark is the only difference, which is the point.
+        assert!(
+            out.contains("~1.86× pace"),
+            "expected a marked pace:\n{out}"
+        );
+        assert!(out.contains("cap in ~"), "expected a marked runway:\n{out}");
+        assert!(out.contains("→~"), "expected a marked projection:\n{out}");
+        // `afford` divides the remaining budget by the time left to the reset
+        // and never touches the start, so it is not an estimate and is not
+        // marked. Without this the mark could be blanket-applied and pass.
+        assert!(
+            out.contains("afford 0."),
+            "afford rests on reset_at, not on the start:\n{out}"
+        );
+    }
+
     #[test]
     fn every_row_carries_its_derived_numbers_when_the_pane_is_tall_enough() {
         let mut app = populated();
@@ -508,6 +592,22 @@ mod tests {
             .collect()
     }
 
+    /// Readings every two minutes over the last `minutes`, climbing linearly
+    /// from `from` to `to` — an account polling on cadence with nothing
+    /// dropped, which is what a rate labelled "now" is allowed to be read from.
+    fn recent_ramp(id: &str, minutes: i64, from: f64, to: f64) -> Vec<QuotaSnapshot> {
+        let steps = minutes / 2;
+        let readings: Vec<(i64, f64)> = (0..=steps)
+            .map(|k| {
+                (
+                    minutes - k * 2,
+                    from + (to - from) * k as f64 / steps as f64,
+                )
+            })
+            .collect();
+        recent_series(id, &readings)
+    }
+
     #[test]
     fn a_row_reports_a_recent_burst_beside_the_average_that_hides_it() {
         let mut app = populated();
@@ -515,7 +615,7 @@ mod tests {
         // average — but 20 of those points went in the last 20 minutes.
         app.set_recent(
             &AccountId::from("claude:default"),
-            recent_series("session_5h", &[(20, 42.0), (0, 62.0)]),
+            recent_ramp("session_5h", 20, 42.0, 62.0),
         );
         let out = rendered(&mut app, 120, 40);
 
@@ -526,6 +626,30 @@ mod tests {
         );
         // Windows with no history behind them simply omit the field.
         assert_eq!(out.matches("× now").count(), 1, "only one series:\n{out}");
+    }
+
+    #[test]
+    fn a_row_drops_the_now_rate_rather_than_printing_a_stale_one() {
+        let mut app = populated();
+        // The same burst, but the daemon stopped half an hour ago — well past
+        // four missed polls at this account's 60-second cadence. The average
+        // since the window opened is still a fact; the current rate is not.
+        let stale: Vec<QuotaSnapshot> = recent_ramp("session_5h", 20, 42.0, 62.0)
+            .into_iter()
+            .map(|mut p| {
+                p.ts -= Duration::minutes(30);
+                p
+            })
+            .collect();
+        app.set_recent(&AccountId::from("claude:default"), stale);
+        let out = rendered(&mut app, 120, 40);
+
+        assert!(out.contains("1.03× pace"), "expected the average:\n{out}");
+        assert_eq!(
+            out.matches("× now").count(),
+            0,
+            "a rate measured half an hour ago is not a rate now:\n{out}"
+        );
     }
 
     #[test]

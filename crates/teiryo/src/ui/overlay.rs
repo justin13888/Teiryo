@@ -76,6 +76,7 @@ const NUMBERS: &[(&str, &str)] = &[
     ),
     ("→103% at reset", "where the current pace lands"),
     ("▲ ▼ =", "above, below, or level with what it affords"),
+    ("~", "measured from a start we could only bracket"),
 ];
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {

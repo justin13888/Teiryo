@@ -7,9 +7,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use teiryo_core::{
-    rollover, Account, AccountHealth, AccountId, AccountStatus, BarStyle, ConfigState, PollEvent,
-    PollOutcome, PollTrigger, ProviderAdapter, ProviderHealth, ProviderId, QuotaWindow, RenderHint,
-    Storage, WindowView,
+    is_collapse, rollover, Account, AccountHealth, AccountId, AccountStatus, BarStyle, ConfigState,
+    ObservedStart, PollEvent, PollOutcome, PollTrigger, ProviderAdapter, ProviderHealth,
+    ProviderId, QuotaWindow, RenderHint, RolloverKind, Storage, WindowId, WindowRollover,
+    WindowView,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -61,6 +62,130 @@ pub struct SharedState {
     /// attaches each window's render hint so the TUI never hardcodes
     /// provider-specific thresholds.
     pub presenters: HashMap<ProviderId, Rc<dyn ProviderAdapter>>,
+    /// Most recent observed restart per window, published on `Status`.
+    ///
+    /// Held here rather than recomputed per request because deriving it means
+    /// walking the stored rollovers, and because the client cannot derive it
+    /// at all: the reset that anchors a weekly window is routinely older than
+    /// any history a dashboard fetches.
+    pub observed_starts: HashMap<(AccountId, WindowId), ObservedStart>,
+}
+
+/// How far back [`Daemon::hydrate_account`] looks for the reset that anchors a
+/// window. Longer than the longest window any adapter publishes (7 days), so
+/// the anchor for a weekly quota survives a restart, and bounded so a database
+/// kept for months is not scanned on every startup.
+const ANCHOR_LOOKBACK: chrono::Duration = chrono::Duration::days(21);
+
+/// Whether a rollover is one the provider failed to announce, and so the only
+/// kind that can say anything `reset_at` does not already say.
+///
+/// Every other kind moved `reset_at`, which makes `reset_at - span` the
+/// provider's own statement of where the new window began — exact, and better
+/// than anything inferred here. Anchoring on those would actively make things
+/// worse: a restart seen across a weekend outage carries a bracket days wide,
+/// and its midpoint would override a start the provider had told us precisely.
+fn unannounced(rollover: &WindowRollover) -> bool {
+    matches!(rollover.kind, RolloverKind::Unannounced)
+}
+
+/// Drop anchors that can no longer describe a window currently running.
+///
+/// An anchor is retired directly only by a later *announced* rollover, which
+/// is a signal a provider that never moves `reset_at` never sends — and that
+/// provider is exactly the one this feature exists for. `effective_window`'s
+/// `estimate() > reset_at - span` guard is no substitute: that boundary moves
+/// only when `reset_at` does. Without a second bound the map keeps every
+/// bracket it has ever recorded, including for windows the payload has since
+/// stopped carrying, for as long as the process runs.
+///
+/// The bound is the window's own length. A rolling window of span `S` that
+/// began at `T` has ended by `T + S`, so a bracket older than that describes
+/// an instance that is over.
+///
+/// A window missing from this payload is *not* judged. It has no span left to
+/// ask for, and borrowing another window's would delete a live anchor: an
+/// account with a 5-hour and a weekly window, three days into an observed
+/// weekly restart, loses that anchor the first time one payload omits `weekly`
+/// — after which the pace falls back to `reset_at - 7d`, an instant inside a
+/// window that already ended, and stays there until the next observed restart.
+/// A window absent from a payload is evidence about the payload, which is
+/// exactly what `rollover::detect` says about the same case.
+///
+/// `docs/domain.md` calls the related risk "bounded by the window's length",
+/// of a restart missed entirely. This is the same bound applied to the anchor
+/// map's own contents, which nothing previously expressed at all.
+fn prune_anchors(
+    st: &mut SharedState,
+    account: &AccountId,
+    windows: &[QuotaWindow],
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let mut spans: HashMap<&WindowId, chrono::Duration> = HashMap::new();
+    let mut longest = chrono::Duration::zero();
+    for w in windows {
+        if let Some(span) = w.span() {
+            spans.insert(&w.id, span);
+            longest = longest.max(span);
+        }
+    }
+    if longest <= chrono::Duration::zero() {
+        return;
+    }
+    st.observed_starts.retain(|(owner, window), start| {
+        if owner != account {
+            return true;
+        }
+        match spans.get(window) {
+            Some(span) => now - start.estimate() <= *span,
+            None => true,
+        }
+    });
+}
+
+/// Whether a *stored* row still reads as an unannounced reset under the rule
+/// compiled in here.
+///
+/// [`unannounced`] asks only what the row says it is, which is the right
+/// question for a rollover this process detected a moment ago: the detector
+/// wrote it under this rule. It is the wrong question for a row read back out
+/// of the database, because rows outlive the rule that classified them.
+///
+/// Rows written before the ratio guard existed were judged by a bare
+/// `prev - new > 0.25` drop. A provider correcting 90% → 60% satisfies that,
+/// and [`is_collapse`] — deliberately — does not: 60 is not far enough below
+/// 90 to be a restart rather than a correction. Replaying such a row installs
+/// an anchor for an instant nothing restarted at, and nothing downstream
+/// rejects it: the bracket sits *inside* the live window, so it clears every
+/// filter `effective_window` applies. The window then reads as far shorter
+/// than it ran, and `pace`, `cap in` and the projection are all measured
+/// against a span that never happened — the over-reporting direction, which is
+/// the costly one, and it survives until the next announced rollover retires
+/// it. For a provider that does not move `reset_at`, that is days.
+///
+/// `window` supplies the scale. [`is_collapse`] is stated over *utilizations*
+/// — it needs a ratio to judge "far enough" against — while the row stores
+/// both readings in the window's own unit and carries neither the unit nor the
+/// limit. Feeding it `prev_used`/`new_used` raw would compare a percentage
+/// against a threshold meant for a fraction, so a 0.08% → 0.03% wobble would
+/// read as a restart. The live window's unit and limit are the provider's
+/// schema and do not move between polls, so they are the right scale to
+/// re-judge an old row with; without one, no row replays.
+fn replays_as_a_reset(rollover: &WindowRollover, window: &QuotaWindow) -> bool {
+    if !unannounced(rollover) {
+        return false;
+    }
+    let scaled = |used: f64| {
+        let mut scale = window.clone();
+        scale.used = used;
+        scale.utilization()
+    };
+    match (scaled(rollover.prev_used), scaled(rollover.new_used)) {
+        (Some(prev), Some(new)) => is_collapse(prev, new),
+        // No scale, so no judgement — and `detect` would not have written the
+        // row either, since its own rule needs both utilizations too.
+        _ => false,
+    }
 }
 
 /// Cadence in whole seconds. `0` means "no next poll to expect": either the
@@ -156,6 +281,7 @@ impl Daemon {
                 config_state,
                 known_providers,
                 presenters: HashMap::new(),
+                observed_starts: HashMap::new(),
             })),
             watch_tx,
             config_tx,
@@ -247,8 +373,29 @@ impl Daemon {
             previous_windows(st.latest_success.get(&event.account)),
             &windows,
             event.id,
+            st.latest_success.get(&event.account).map(|e| e.ts),
             event.ts,
         );
+        // An unannounced restart is where the current window began, and the
+        // only evidence there is for it. It counts here even though it is
+        // deliberately not a chart boundary: the two questions are different.
+        // Whether to break a drawn series on a `used`-only signal is about
+        // drawing; where the window a rate is measured against began is about
+        // arithmetic, and on that one the evidence is good enough.
+        //
+        // An announced rollover does the opposite — it retires the anchor,
+        // because `reset_at` has moved and the provider's own arithmetic is
+        // now both correct and more precise than any bracket.
+        //
+        // Applied whatever the write below does. A failed `record_poll` costs
+        // durability, not truth: the restart was still observed, and this is
+        // the only poll pair that can see it. Withholding the anchor until the
+        // row lands looks tidier and is worse — `latest_success` is replaced
+        // regardless a few lines down, so the next poll compares against a
+        // payload that was never persisted, the collapse is never detected
+        // again, and the anchor is lost for the rest of the window instance
+        // rather than for one poll. Nor would it make memory agree with
+        // storage, for the same reason.
         for r in rollovers.iter().filter(|r| r.kind.is_surprise()) {
             tracing::info!(
                 account = %r.account, window = %r.window, kind = r.kind.as_str(),
@@ -257,6 +404,16 @@ impl Daemon {
                 "quota window reset unexpectedly"
             );
         }
+        for r in &rollovers {
+            let key = (r.account.clone(), r.window.clone());
+            if unannounced(r) {
+                st.observed_starts
+                    .insert(key, ObservedStart::from_rollover(r));
+            } else {
+                st.observed_starts.remove(&key);
+            }
+        }
+        prune_anchors(&mut st, &event.account, &windows, event.ts);
         if let Err(e) = st.storage.record_poll(event, &windows, &rollovers) {
             tracing::error!(error = %e, poll = %event.id, "failed to persist poll event");
         }
@@ -307,6 +464,60 @@ impl Daemon {
                 tracing::warn!(account = %account.id, error = %e, "failed to restore last success")
             }
         }
+        // Restore the anchor too: without it the first status after a restart
+        // would fall back to the provider's arithmetic and report a pace the
+        // daemon already knew to be wrong.
+        let now = chrono::Utc::now();
+        // The scale each stored row has to be re-judged against, taken from the
+        // newest successful poll restored just above: a rollover row carries
+        // two readings but not the unit or limit that make them a ratio.
+        let scales: HashMap<WindowId, QuotaWindow> = match st
+            .latest_success
+            .get(&account.id)
+            .map(|event| &event.outcome)
+        {
+            Some(PollOutcome::Success { windows }) => {
+                windows.iter().map(|w| (w.id.clone(), w.clone())).collect()
+            }
+            _ => HashMap::new(),
+        };
+        match st
+            .storage
+            .rollovers(&account.id, None, now - ANCHOR_LOOKBACK, now)
+        {
+            // Oldest first, replayed in order, so an announced rollover after
+            // an unannounced one retires it exactly as it did when live.
+            Ok(found) => {
+                for r in &found {
+                    let key = (r.account.clone(), r.window.clone());
+                    let replay = scales
+                        .get(&r.window)
+                        .is_some_and(|scale| replays_as_a_reset(r, scale));
+                    if replay {
+                        st.observed_starts
+                            .insert(key, ObservedStart::from_rollover(r));
+                    } else if unannounced(r) {
+                        // Recorded as unannounced by an older rule, and not a
+                        // reset under this one. Skipped rather than retired:
+                        // the current detector would not have written the row
+                        // at all, so replaying it must neither anchor the
+                        // window nor clear an anchor an earlier row set.
+                        tracing::debug!(
+                            account = %r.account, window = %r.window,
+                            prev_used = r.prev_used, new_used = r.new_used,
+                            "ignoring a stored unannounced rollover that is not a reset under the current rule"
+                        );
+                    } else {
+                        st.observed_starts.remove(&key);
+                    }
+                }
+                let live: Vec<QuotaWindow> = scales.values().cloned().collect();
+                prune_anchors(&mut st, &account.id, &live, now);
+            }
+            Err(e) => {
+                tracing::warn!(account = %account.id, error = %e, "failed to restore window anchors")
+            }
+        }
         let failures = match st.storage.consecutive_failures_for(&account.id) {
             Ok(n) => n,
             Err(e) => {
@@ -348,6 +559,10 @@ impl Daemon {
                         .map(|window| WindowView {
                             hint: presenter
                                 .map_or_else(default_hint, |adapter| adapter.render_hint(window)),
+                            observed_start: st
+                                .observed_starts
+                                .get(&(a.id.clone(), window.id.clone()))
+                                .copied(),
                             window: window.clone(),
                         })
                         .collect(),
@@ -634,6 +849,394 @@ mod tests {
         assert!(rejected.error.is_some());
         // Still a new generation, or a client would never learn about it.
         assert!(rejected.generation > applied.generation);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Write a rollover row straight to storage, the way an *older* binary
+    /// would have.
+    ///
+    /// Deliberately not via `record_event`: that runs the detector compiled in
+    /// here, which by construction will not produce the rows these tests are
+    /// about. A pre-upgrade database is exactly a set of rows the current rule
+    /// would not have written.
+    fn store_rollover(
+        daemon: &Daemon,
+        kind: RolloverKind,
+        prev_used: f64,
+        new_used: f64,
+        minutes_ago: i64,
+    ) {
+        store_rollover_of(daemon, window(), kind, prev_used, new_used, minutes_ago);
+    }
+
+    /// As [`store_rollover`], for a window whose span the test chooses.
+    fn store_rollover_of(
+        daemon: &Daemon,
+        window: QuotaWindow,
+        kind: RolloverKind,
+        prev_used: f64,
+        new_used: f64,
+        minutes_ago: i64,
+    ) {
+        let observed_at = chrono::Utc::now() - chrono::Duration::minutes(minutes_ago);
+        let ev = event(PollOutcome::Success {
+            windows: vec![window.clone()],
+        });
+        let rollover = WindowRollover {
+            account: account().id,
+            window: window.id.clone(),
+            poll: ev.id,
+            observed_at,
+            kind,
+            prev_reset_at: None,
+            new_reset_at: None,
+            prev_used,
+            new_used,
+            prev_observed_at: Some(observed_at - chrono::Duration::minutes(5)),
+        };
+        daemon
+            .state
+            .borrow_mut()
+            .storage
+            .record_poll(&ev, std::slice::from_ref(&window), &[rollover])
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    fn anchors(daemon: &Daemon) -> Vec<(AccountId, WindowId)> {
+        let mut keys: Vec<_> = daemon
+            .state
+            .borrow()
+            .observed_starts
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// The upgrade hazard: rows written under the retired rule must not be
+    /// replayed as anchors under the new one.
+    ///
+    /// The old binary called any drop over 0.25 an unannounced reset, with no
+    /// ratio guard, so a provider correcting 90% → 60% was recorded as one.
+    /// This rule rejects that as a correction, and its own test at
+    /// `rollover.rs` pins `detected(window(90), window(50)) == None`. Replaying
+    /// the stored row anyway would anchor the window to an instant nothing
+    /// restarted at — and nothing downstream would catch it, because the
+    /// bracket sits inside the live window and clears every filter
+    /// `effective_window` applies.
+    #[test]
+    fn a_stored_rollover_the_current_rule_rejects_is_not_replayed_as_an_anchor() {
+        let dir = std::env::temp_dir().join(format!("teiryod-replay-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("teiryo.db");
+
+        {
+            let old = seeded(&path);
+            store_rollover(&old, RolloverKind::Unannounced, 90.0, 60.0, 60);
+        }
+
+        let restarted = seeded(&path);
+        restarted.hydrate_account(&account());
+        assert!(
+            anchors(&restarted).is_empty(),
+            "a 90% → 60% correction is not a restart under this rule"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half of the same judgement: a row that *is* a reset under the
+    /// current rule still hydrates, or the re-check would have thrown out the
+    /// feature along with the bad rows.
+    #[test]
+    fn a_stored_rollover_the_current_rule_accepts_is_replayed_as_an_anchor() {
+        let dir = std::env::temp_dir().join(format!("teiryod-replay-ok-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("teiryo.db");
+
+        {
+            let old = seeded(&path);
+            store_rollover(&old, RolloverKind::Unannounced, 90.0, 2.0, 60);
+        }
+
+        let restarted = seeded(&path);
+        restarted.hydrate_account(&account());
+        assert_eq!(anchors(&restarted), vec![(account().id, window().id)]);
+        // And it carries the bracket the row recorded, not the instant of the
+        // poll that noticed: five minutes wide, per `store_rollover`.
+        let st = restarted.state.borrow();
+        let start = st.observed_starts[&(account().id, window().id)];
+        assert_eq!(start.uncertainty(), chrono::Duration::minutes(5));
+        drop(st);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Replay is oldest-first so it lands where the live path would have: an
+    /// announced rollover *after* an unannounced one retires it, and the same
+    /// two rows in the other order leave the anchor standing.
+    ///
+    /// Both halves are needed. Without the second, deleting the retire branch
+    /// entirely still passes, since nothing would have been anchored anyway.
+    #[test]
+    fn replay_retires_an_anchor_in_the_order_the_rollovers_happened() {
+        let dir = std::env::temp_dir().join(format!("teiryod-order-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let retired = dir.join("retired.db");
+        {
+            let old = seeded(&retired);
+            store_rollover(&old, RolloverKind::Unannounced, 90.0, 2.0, 60);
+            store_rollover(&old, RolloverKind::Early, 40.0, 1.0, 30);
+        }
+        let restarted = seeded(&retired);
+        restarted.hydrate_account(&account());
+        assert!(
+            anchors(&restarted).is_empty(),
+            "the later announced rollover retires the anchor"
+        );
+
+        let standing = dir.join("standing.db");
+        {
+            let old = seeded(&standing);
+            store_rollover(&old, RolloverKind::Early, 40.0, 1.0, 60);
+            store_rollover(&old, RolloverKind::Unannounced, 90.0, 2.0, 30);
+        }
+        let restarted = seeded(&standing);
+        restarted.hydrate_account(&account());
+        assert_eq!(
+            anchors(&restarted),
+            vec![(account().id, window().id)],
+            "the announced rollover came first and retires nothing after it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The live counterpart of the replay above: an announced rollover retires
+    /// an anchor that an unannounced one set.
+    ///
+    /// Deleting the retire branch left the whole suite green. The existing
+    /// coverage reaches the announced arm only in scenarios where no anchor
+    /// had ever been set, so there was never anything there for it to remove —
+    /// the branch was executed and asserted by nothing.
+    #[test]
+    fn an_announced_rollover_retires_a_live_anchor() {
+        let dir = std::env::temp_dir().join(format!("teiryod-retire-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = seeded(&dir.join("teiryo.db"));
+
+        let reset = chrono::Utc::now() + chrono::Duration::hours(2);
+        let reading = |used: f64, reset_at| {
+            let mut w = window();
+            w.used = used;
+            w.reset_at = Some(reset_at);
+            w
+        };
+
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![reading(90.0, reset)],
+        }));
+        std::thread::sleep(Duration::from_millis(2));
+        // `reset_at` held still and usage collapsed: an unannounced restart,
+        // and the only evidence there is for where this window began.
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![reading(2.0, reset)],
+        }));
+        assert_eq!(
+            anchors(&daemon),
+            vec![(account().id, window().id)],
+            "precondition: the silent restart anchored the window"
+        );
+
+        std::thread::sleep(Duration::from_millis(2));
+        // Now `reset_at` moves. The provider has stated where the new window
+        // ends, so `reset_at - span` is its own account of where that window
+        // began — exact, and better than any bracket. The anchor must go.
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![reading(5.0, reset + chrono::Duration::hours(5))],
+        }));
+        assert!(
+            anchors(&daemon).is_empty(),
+            "an announced rollover must retire the anchor, not sit beside it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bound `docs/domain.md` describes — "bounded by the window's
+    /// length" — enforced on the anchor map rather than left to prose.
+    ///
+    /// Nothing else expresses it. An anchor is retired directly only by a
+    /// later announced rollover, and the provider this feature targets never
+    /// sends one; `effective_window`'s `estimate() > reset_at - span` guard
+    /// moves only when `reset_at` does, which for that provider is never.
+    #[test]
+    fn an_anchor_older_than_its_window_is_pruned() {
+        let dir = std::env::temp_dir().join(format!("teiryod-prune-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // `window()` is a 5-hour window, so a bracket six hours old describes
+        // an instance that has already ended.
+        let expired = dir.join("expired.db");
+        {
+            let old = seeded(&expired);
+            store_rollover(&old, RolloverKind::Unannounced, 90.0, 2.0, 6 * 60);
+        }
+        let restarted = seeded(&expired);
+        restarted.hydrate_account(&account());
+        assert!(anchors(&restarted).is_empty(), "older than its own span");
+
+        // Four hours old is still inside the window it anchors, and survives —
+        // without this half, pruning everything would also pass.
+        let live = dir.join("live.db");
+        {
+            let old = seeded(&live);
+            store_rollover(&old, RolloverKind::Unannounced, 90.0, 2.0, 4 * 60);
+        }
+        let restarted = seeded(&live);
+        restarted.hydrate_account(&account());
+        assert_eq!(anchors(&restarted), vec![(account().id, window().id)]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `ANCHOR_LOOKBACK` bounds the replay. A reset older than it belongs to a
+    /// window instance long finished, and reading further back would scan a
+    /// database kept for months on every startup.
+    ///
+    /// The fixture window is 30 days long on purpose. With the 5-hour one,
+    /// `prune_anchors` drops the anchor for being older than its own window
+    /// before the lookback is ever consulted — so widening the query to ten
+    /// years left this test green and it pinned nothing. The row has to be
+    /// older than the lookback and younger than the window it anchors.
+    #[test]
+    fn replay_ignores_rollovers_older_than_the_anchor_lookback() {
+        let dir = std::env::temp_dir().join(format!("teiryod-lookback-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("teiryo.db");
+        let long = || {
+            let mut w = window();
+            w.reset_kind = ResetKind::Rolling(Duration::from_secs(30 * 24 * 3600));
+            w
+        };
+
+        {
+            let old = seeded(&path);
+            let past = ANCHOR_LOOKBACK.num_minutes() + 60;
+            store_rollover_of(&old, long(), RolloverKind::Unannounced, 90.0, 2.0, past);
+        }
+        let restarted = seeded(&path);
+        restarted.hydrate_account(&account());
+        assert!(anchors(&restarted).is_empty(), "older than the lookback");
+
+        // A day inside the lookback, and well inside the 30-day window, so the
+        // lookback is the only thing that could have excluded the one above.
+        let inside = dir.join("inside.db");
+        {
+            let old = seeded(&inside);
+            let recent = ANCHOR_LOOKBACK.num_minutes() - 24 * 60;
+            store_rollover_of(&old, long(), RolloverKind::Unannounced, 90.0, 2.0, recent);
+        }
+        let restarted = seeded(&inside);
+        restarted.hydrate_account(&account());
+        assert_eq!(anchors(&restarted), vec![(account().id, window().id)]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The live pruning path, which only `hydrate_account`'s was covering —
+    /// and the live one is the whole point: the doc is about a process that
+    /// keeps running, which is exactly where hydration never happens again.
+    #[test]
+    fn a_running_daemon_prunes_an_anchor_its_window_outlived() {
+        let dir = std::env::temp_dir().join(format!("teiryod-liveprune-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = seeded(&dir.join("teiryo.db"));
+
+        let at = |used: f64, reset_at| {
+            let mut w = window();
+            w.used = used;
+            w.reset_at = Some(reset_at);
+            w
+        };
+        let reset = chrono::Utc::now() + chrono::Duration::hours(2);
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![at(90.0, reset)],
+        }));
+        std::thread::sleep(Duration::from_millis(2));
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![at(2.0, reset)],
+        }));
+        assert_eq!(
+            anchors(&daemon),
+            vec![(account().id, window().id)],
+            "precondition: the silent restart anchored the window"
+        );
+
+        // Six hours on, past the 5-hour window the anchor belongs to. No
+        // announced rollover ever arrives — the provider does not move
+        // `reset_at`, which is the case this bound exists for.
+        std::thread::sleep(Duration::from_millis(2));
+        let mut later = event(PollOutcome::Success {
+            windows: vec![at(3.0, reset)],
+        });
+        later.ts = chrono::Utc::now() + chrono::Duration::hours(6);
+        daemon.record_event(&later);
+        assert!(
+            anchors(&daemon).is_empty(),
+            "a running daemon must not keep an anchor its window outlived"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A window missing from one payload must not cost its anchor.
+    ///
+    /// Judging it against the longest span the account still publishes deletes
+    /// a live anchor: three days into an observed weekly restart, the first
+    /// payload that omits `weekly` leaves only the 5-hour span to compare
+    /// against, and the weekly anchor is older than that. The pace then falls
+    /// back to an instant inside a window that already ended — the exact
+    /// under-reporting this branch exists to fix.
+    #[test]
+    fn a_window_absent_from_one_payload_keeps_its_anchor() {
+        let dir = std::env::temp_dir().join(format!("teiryod-partial-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = seeded(&dir.join("teiryo.db"));
+
+        let weekly = |used: f64| {
+            let mut w = window();
+            w.id = WindowId::from("weekly");
+            w.reset_kind = ResetKind::Rolling(Duration::from_secs(7 * 24 * 3600));
+            w.used = used;
+            w.reset_at = Some(chrono::Utc::now() + chrono::Duration::days(4));
+            w
+        };
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![window(), weekly(90.0)],
+        }));
+        std::thread::sleep(Duration::from_millis(2));
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![window(), weekly(2.0)],
+        }));
+        let anchored = (account().id, WindowId::from("weekly"));
+        assert!(anchors(&daemon).contains(&anchored), "precondition");
+
+        // Three days on, one payload omits the weekly window entirely.
+        std::thread::sleep(Duration::from_millis(2));
+        let mut partial = event(PollOutcome::Success {
+            windows: vec![window()],
+        });
+        partial.ts = chrono::Utc::now() + chrono::Duration::days(3);
+        daemon.record_event(&partial);
+        assert!(
+            anchors(&daemon).contains(&anchored),
+            "a payload omitting a window says nothing about that window's anchor"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

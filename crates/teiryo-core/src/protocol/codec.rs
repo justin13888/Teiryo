@@ -59,7 +59,7 @@ mod tests {
         AccountHealth, AccountStatus, ConfigEdit, ConfigState, ConfigView, HistoryPage,
         ProviderHealth, ProviderSettings, Request, Response, WindowView,
     };
-    use crate::rollover::{RolloverKind, WindowRollover};
+    use crate::rollover::{ObservedStart, RolloverKind, WindowRollover};
 
     fn sample_window() -> QuotaWindow {
         QuotaWindow {
@@ -92,6 +92,138 @@ mod tests {
         let bytes = encode_frame(value).expect("encode");
         let back: T = decode_frame(&bytes).expect("decode");
         assert_eq!(&back, value);
+    }
+
+    /// One `WindowView` frame, recorded byte for byte at `PROTOCOL_VERSION` 6.
+    ///
+    /// Every other test in this module encodes and decodes in the same
+    /// process, which is self-consistency: rename a field, reorder a variant,
+    /// change a representation, and both sides move together and the test
+    /// stays green. That is exactly the change a protocol version exists to
+    /// announce, and until this fixture existed nothing in the workspace could
+    /// see one. The version's own tests cannot either — the mismatch tests use
+    /// a literal, and the accepting test asks `Hello::current()` on both sides
+    /// — so `PROTOCOL_VERSION` could be reverted to 5 with the whole suite
+    /// green.
+    ///
+    /// `WindowView` is the type this window-anchoring work put on the wire, so
+    /// it is the one recorded here.
+    ///
+    /// **If this fails, the wire format changed.** Do not re-record the bytes
+    /// on their own: bump `PROTOCOL_VERSION`, update `docs/protocol.md` as
+    /// `AGENTS.md` requires, and then re-record.
+    const GOLDEN_WINDOW_VIEW: &[u8] = &[
+        0x0f, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f, 0x6e, 0x5f, 0x35, 0x68, 0x5f, 0x6f, 0x70, 0x75,
+        0x73, 0x0f, 0x4f, 0x70, 0x75, 0x73, 0x20, 0xe2, 0x80, 0x94, 0x20, 0x35, 0x20, 0x68, 0x6f,
+        0x75, 0x72, 0x01, 0x04, 0x6f, 0x70, 0x75, 0x73, 0x00, 0xfb, 0x50, 0x46, 0x00, 0x03, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x40, 0x45, 0x40, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x44,
+        0x40, 0x01, 0x14, 0x32, 0x30, 0x32, 0x36, 0x2d, 0x30, 0x38, 0x2d, 0x31, 0x35, 0x54, 0x31,
+        0x32, 0x3a, 0x30, 0x30, 0x3a, 0x30, 0x30, 0x5a, 0x00, 0xcd, 0xcc, 0x4c, 0x3f, 0x33, 0x33,
+        0x73, 0x3f, 0x01, 0x16, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x73, 0x20, 0x65, 0x6e, 0x74, 0x69,
+        0x72, 0x65, 0x6c, 0x79, 0x20, 0x61, 0x74, 0x20, 0x63, 0x61, 0x70, 0x01, 0x14, 0x32, 0x30,
+        0x32, 0x36, 0x2d, 0x30, 0x38, 0x2d, 0x31, 0x35, 0x54, 0x30, 0x37, 0x3a, 0x33, 0x30, 0x3a,
+        0x30, 0x30, 0x5a, 0x14, 0x32, 0x30, 0x32, 0x36, 0x2d, 0x30, 0x38, 0x2d, 0x31, 0x35, 0x54,
+        0x30, 0x37, 0x3a, 0x34, 0x35, 0x3a, 0x30, 0x30, 0x5a,
+    ];
+
+    /// The value `GOLDEN_WINDOW_VIEW` was recorded from.
+    ///
+    /// `QuotaUnit::Hours` rather than the `Percent` every other fixture uses,
+    /// deliberately: `Percent` is the first variant, so bincode encodes it as
+    /// zero and reordering the enum leaves the bytes identical. A variant
+    /// reordered is exactly the change `docs/protocol.md` says must bump the
+    /// version, so the recorded value has to sit somewhere the discriminant
+    /// can move.
+    fn golden_window_view() -> WindowView {
+        WindowView {
+            window: QuotaWindow {
+                unit: QuotaUnit::Hours,
+                limit: Some(40.0),
+                ..sample_window()
+            },
+            hint: RenderHint {
+                style: BarStyle::Percent,
+                warn_threshold: 0.8,
+                critical_threshold: 0.95,
+                note: Some("blocks entirely at cap".into()),
+            },
+            observed_start: Some(ObservedStart {
+                not_before: Utc.with_ymd_and_hms(2026, 8, 15, 7, 30, 0).unwrap(),
+                not_after: Utc.with_ymd_and_hms(2026, 8, 15, 7, 45, 0).unwrap(),
+            }),
+        }
+    }
+
+    /// Every wire enum's discriminants, recorded.
+    ///
+    /// One frame can only ever pin the variants it happens to contain, so a
+    /// single golden value is not enough: with `QuotaUnit::Hours` recorded,
+    /// swapping `Messages` and `Tokens` leaves its bytes identical. Reordering
+    /// variants is one of the changes `docs/protocol.md` says must bump the
+    /// version, so each one is written down rather than sampled.
+    ///
+    /// **If this fails, variants were reordered, renumbered, or inserted
+    /// mid-list.** Bump `PROTOCOL_VERSION` and update `docs/protocol.md`
+    /// before re-recording. Appending a variant at the end is the one change
+    /// that leaves these bytes alone.
+    #[test]
+    fn wire_enum_discriminants_are_recorded_not_derived() {
+        use crate::domain::{QuotaUnit, WindowScope};
+        use crate::rollover::RolloverKind;
+
+        for (unit, want) in [
+            (QuotaUnit::Percent, 0u8),
+            (QuotaUnit::Messages, 1),
+            (QuotaUnit::Tokens, 2),
+            (QuotaUnit::Hours, 3),
+        ] {
+            assert_eq!(
+                encode_frame(&unit).expect("encode").as_ref(),
+                [want],
+                "QuotaUnit::{unit:?}"
+            );
+        }
+        for (kind, want) in [
+            (RolloverKind::Scheduled, 0u8),
+            (RolloverKind::Early, 1),
+            (RolloverKind::Retracted, 2),
+            (RolloverKind::Unannounced, 3),
+        ] {
+            assert_eq!(
+                encode_frame(&kind).expect("encode").as_ref(),
+                [want],
+                "RolloverKind::{kind:?}"
+            );
+        }
+        assert_eq!(
+            encode_frame(&WindowScope::AccountWide)
+                .expect("encode")
+                .as_ref(),
+            [0u8]
+        );
+        assert_eq!(
+            encode_frame(&WindowScope::Model("opus".into()))
+                .expect("encode")
+                .as_ref(),
+            [1u8, 4, b'o', b'p', b'u', b's']
+        );
+    }
+
+    #[test]
+    fn recorded_bytes_still_decode_to_what_they_were_recorded_from() {
+        let decoded: WindowView = decode_frame(GOLDEN_WINDOW_VIEW).expect("golden frame decodes");
+        assert_eq!(decoded, golden_window_view());
+    }
+
+    #[test]
+    fn this_build_still_encodes_to_the_recorded_bytes() {
+        let bytes = encode_frame(&golden_window_view()).expect("encode");
+        assert_eq!(
+            bytes.as_ref(),
+            GOLDEN_WINDOW_VIEW,
+            "the wire format moved; bump PROTOCOL_VERSION and update docs/protocol.md \
+             before re-recording"
+        );
     }
 
     #[test]
@@ -161,6 +293,10 @@ mod tests {
                         critical_threshold: 0.95,
                         note: Some("blocks entirely at cap".into()),
                     },
+                    observed_start: Some(ObservedStart {
+                        not_before: Utc::now(),
+                        not_after: Utc::now(),
+                    }),
                 }],
                 last_poll: Some(sample_event(PollOutcome::Success {
                     windows: vec![sample_window()],
@@ -197,6 +333,7 @@ mod tests {
                     new_reset_at: Some(Utc::now()),
                     prev_used: 88.0,
                     new_used: 1.0,
+                    prev_observed_at: Some(Utc::now()),
                 }],
             }),
             Response::History(HistoryPage {
