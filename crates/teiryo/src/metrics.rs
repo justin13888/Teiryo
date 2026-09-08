@@ -1146,8 +1146,18 @@ mod properties {
                 // restricted generator carries on. `elapsed = span - remaining
                 // - early_by`, and the effective length is `elapsed +
                 // remaining`.
-                let early_by =
-                    3600i64..(span_secs - remaining_secs - youngest_measurable(remaining_secs));
+                let hi = span_secs - remaining_secs - youngest_measurable(remaining_secs);
+                // An empty `Range` handed to proptest *panics* at generation
+                // time rather than failing a case, and it would take out every
+                // property drawing from here. Four numeric ranges across three
+                // stages are coupled with nothing linking them, so a future
+                // widening of any one of them fails loudly here instead of at
+                // random.
+                debug_assert!(
+                    hi > 3600,
+                    "early_by is empty: 3600..{hi} (span {span_secs}, remaining {remaining_secs})"
+                );
+                let early_by = 3600i64..hi;
                 (
                     Just(span_secs),
                     Just(used),
@@ -1204,7 +1214,10 @@ mod properties {
                 // midpoint *earlier* than `start` only adds headroom — makes
                 // the guarantee hold at the instant that is actually used.
                 //
-                // `elapsed = span - remaining - early_by - shift`, and the
+                // The true displacement is `(after - before) / 2`, and `shift`
+                // is its ceiling clamped at zero — so `elapsed` is
+                // `span - remaining - early_by` less that displacement, and
+                // subtracting `shift` instead concedes at most a second. The
                 // effective length is `elapsed + remaining`. The range stays
                 // non-empty for every input the earlier stages admit:
                 // `span - remaining > span / 2 >= 9000`,
@@ -1212,8 +1225,15 @@ mod properties {
                 // against that floor, and `shift` is at most `1770`, leaving
                 // at least 31 seconds of width in the worst case.
                 let shift = ((after - before + 1) / 2).max(0);
-                let early_by = 3600i64
-                    ..(span_secs - remaining_secs - youngest_measurable(remaining_secs) - shift);
+                let hi = span_secs - remaining_secs - youngest_measurable(remaining_secs) - shift;
+                // As above, and tighter here by the width of `shift`: the
+                // narrowest admitted case leaves 31 seconds of range.
+                debug_assert!(
+                    hi > 3600,
+                    "early_by is empty: 3600..{hi} (span {span_secs}, \
+                     remaining {remaining_secs}, shift {shift})"
+                );
+                let early_by = 3600i64..hi;
                 (
                     Just(span_secs),
                     Just(used),
@@ -1224,6 +1244,80 @@ mod properties {
                 )
             })
             .prop_map(assemble)
+    }
+
+    /// A window whose *anchor* leaves it under [`MIN_ELAPSED_FRACTION`] — the
+    /// band where `pace` and everything measured from the start are `None`.
+    ///
+    /// [`early_reset`] reaches this band too, in roughly six draws in ten
+    /// thousand, and the split exists to keep it able to. But
+    /// `derived_numbers_stay_in_range` cannot *see* it when it gets there:
+    /// every arm of that property is an `if let Some(..)`, and a shape defined
+    /// by its `None`s gives those arms nothing to hold. Deleting both of
+    /// `pace`'s blanking gates leaves it green at 200,000 cases. So the band
+    /// is generated directly here, and the absences are asserted as absences.
+    ///
+    /// The ranges are picked to land in the band reliably rather than to
+    /// mirror `early_reset`'s. `not_after <= now` requires the bracket's far
+    /// end to have passed already, which puts a floor under the elapsed
+    /// stretch; the band is only comfortably reachable where a twentieth of
+    /// the window clears that floor, so the gaps are narrower and `remaining`
+    /// is longer than the unrestricted generator draws.
+    fn early_reset_too_young_to_pace() -> impl Strategy<Value = EarlyReset> {
+        (
+            26_000i64..14 * 24 * 3600,
+            0.01f64..0.95,
+            60i64..600,
+            60i64..600,
+        )
+            .prop_flat_map(|(span_secs, used, before, after)| {
+                let remaining = 12_000i64..(span_secs / 2);
+                (
+                    Just(span_secs),
+                    Just(used),
+                    remaining,
+                    Just(before),
+                    Just(after),
+                )
+            })
+            .prop_flat_map(|(span_secs, used, remaining_secs, before, after)| {
+                // Where the anchor sits relative to `start`: the same midpoint
+                // arithmetic `ObservedStart::estimate` does.
+                let displacement = (after - before) / 2;
+                // Under this many seconds elapsed there is no pace.
+                // `youngest_measurable` floors its answer at an hour, which is
+                // the wrong end of the question here, so the fraction is
+                // applied directly.
+                let floor = (remaining_secs as f64 * MIN_ELAPSED_FRACTION
+                    / (1.0 - MIN_ELAPSED_FRACTION))
+                    .ceil() as i64;
+                // And at least this many, or the bracket's far end has not
+                // passed and `effective_window` drops the anchor entirely.
+                let least = (after - displacement).max(1);
+                debug_assert!(
+                    floor > least,
+                    "the sub-floor band is empty: {least}..{floor} (remaining {remaining_secs})"
+                );
+                (
+                    Just(span_secs),
+                    Just(used),
+                    Just(remaining_secs),
+                    least..floor,
+                    Just(before),
+                    Just(after),
+                )
+            })
+            .prop_map(
+                |(span_secs, used, remaining_secs, elapsed, before, after)| {
+                    let displacement = (after - before) / 2;
+                    let early_by = span_secs - remaining_secs - elapsed - displacement;
+                    debug_assert!(
+                        early_by >= 3600,
+                        "no headroom below the nominal start: {early_by}"
+                    );
+                    assemble((span_secs, used, remaining_secs, early_by, before, after))
+                },
+            )
     }
 
     /// A generated series of readings of one window: an older stretch, an
@@ -1461,6 +1555,39 @@ mod properties {
         /// a projected cap lies between now and the reset — which is the whole
         /// content of `eta_to_cap` returning `Some`.
         #[test]
+        /// **P11 — a window too young to pace withholds every number measured
+        /// from its start, and only those.**
+        ///
+        /// The shape a user meets right after an outage: the daemon knows the
+        /// window restarted and the restart is recent enough that dividing by
+        /// the elapsed fraction would report a figure in the tens. `pace`,
+        /// `cap in` and the projection are all withheld; `afford`, which
+        /// divides the remaining budget by the time left to `reset_at` and
+        /// never touches the start, still answers.
+        ///
+        /// Stated as absences deliberately. This is the one shape
+        /// `derived_numbers_stay_in_range` structurally cannot check — its
+        /// arms are all `if let Some(..)` — so without this property, deleting
+        /// both of `pace`'s blanking gates passes the whole suite.
+        #[test]
+        fn a_window_too_young_to_pace_withholds_what_rests_on_its_start(
+            w in early_reset_too_young_to_pace(),
+        ) {
+            let effective = effective_window(&w.view(), now()).expect("a reset instant");
+            // The anchor was honoured, not dropped back to `reset_at - span`.
+            prop_assert_eq!(effective.start, w.observed().estimate(), "anchor dropped");
+            let f = elapsed_fraction(&effective, now()).expect("a positive span");
+            prop_assert!(f < MIN_ELAPSED_FRACTION, "elapsed fraction {f} clears the floor");
+
+            prop_assert_eq!(pace(&effective, now()), None, "pace at {} elapsed", f);
+            prop_assert_eq!(runway(&effective, now()), None, "runway at {} elapsed", f);
+            prop_assert_eq!(eta_to_cap(&effective, now()), None, "eta at {} elapsed", f);
+            prop_assert!(
+                affordable_pace(&effective, now()).is_some(),
+                "afford rests on reset_at, not on the start, and must still answer"
+            );
+        }
+
         fn derived_numbers_stay_in_range(w in early_reset()) {
             let effective = effective_window(&w.view(), now()).expect("a reset instant");
             prop_assert!(effective.start < effective.reset_at, "window runs backwards");
