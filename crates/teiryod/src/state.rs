@@ -996,6 +996,57 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The live counterpart of the replay above: an announced rollover retires
+    /// an anchor that an unannounced one set.
+    ///
+    /// Deleting the retire branch left the whole suite green. The existing
+    /// coverage reaches the announced arm only in scenarios where no anchor
+    /// had ever been set, so there was never anything there for it to remove —
+    /// the branch was executed and asserted by nothing.
+    #[test]
+    fn an_announced_rollover_retires_a_live_anchor() {
+        let dir = std::env::temp_dir().join(format!("teiryod-retire-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = seeded(&dir.join("teiryo.db"));
+
+        let reset = chrono::Utc::now() + chrono::Duration::hours(2);
+        let reading = |used: f64, reset_at| {
+            let mut w = window();
+            w.used = used;
+            w.reset_at = Some(reset_at);
+            w
+        };
+
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![reading(90.0, reset)],
+        }));
+        std::thread::sleep(Duration::from_millis(2));
+        // `reset_at` held still and usage collapsed: an unannounced restart,
+        // and the only evidence there is for where this window began.
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![reading(2.0, reset)],
+        }));
+        assert_eq!(
+            anchors(&daemon),
+            vec![(account().id, window().id)],
+            "precondition: the silent restart anchored the window"
+        );
+
+        std::thread::sleep(Duration::from_millis(2));
+        // Now `reset_at` moves. The provider has stated where the new window
+        // ends, so `reset_at - span` is its own account of where that window
+        // began — exact, and better than any bracket. The anchor must go.
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![reading(5.0, reset + chrono::Duration::hours(5))],
+        }));
+        assert!(
+            anchors(&daemon).is_empty(),
+            "an announced rollover must retire the anchor, not sit beside it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The bound `docs/dashboard.md` promises — "bounded by the window's
     /// length" — enforced rather than asserted.
     ///
