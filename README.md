@@ -4,6 +4,8 @@ Teiryō (定量) probes and records LLM subscription quotas for you.
 
 A headless daemon (`teiryod`) polls subscription usage across multiple LLM providers and accounts, persists history in SQLite, and serves it over a Unix domain socket. A terminal UI (`teiryo`) renders live quota dashboards on top. See [docs/](docs/) for the architecture.
 
+> Status (Sept 8, 2026): This is currently just for myself so no releases are made. Feature requests are accepted as long as it is actionable.
+
 ## Prerequisites
 
 - [Rust (rustup)](https://rustup.rs) — toolchain, pinned via `rust-toolchain.toml`
