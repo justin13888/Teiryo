@@ -455,7 +455,8 @@ impl Daemon {
     }
 }
 
-/// Report per-model windows whose stored history has just been orphaned.
+/// Report per-model windows that have stopped being reported under the id
+/// their history is stored under.
 ///
 /// A `weekly_<model>` id is a durable storage key — `quota_snapshot` and
 /// `window_rollover` are both keyed on it — derived from what the server calls
@@ -468,10 +469,14 @@ impl Daemon {
 /// The condition reported is a scoped window **vanishing**, not a rename.
 /// Pairing an old id to a new one is not possible from here — the server sends
 /// no continuity information, and guessing it from the names is how the
-/// parser's own dedupe went wrong. What *is* certain is that a vanished id's
-/// series is now unreachable: nothing prunes it and there is no migration
-/// path. That is true whether or not something else appeared, which is also
-/// why a window merely *arriving* says nothing and stays quiet.
+/// parser's own dedupe went wrong. So the claim stays at what a single poll
+/// establishes: this id was reported before and is not now, and whatever
+/// history is stored under it is not reachable under any new id. A one-poll
+/// absence — an unreadable row, or a plan dropping a cap — reads the same from
+/// here and is deliberately reported the same, which is exactly why nothing is
+/// said about the loss being permanent: whether the id returns next poll is not
+/// knowable here. That is true whether or not something else appeared, which is
+/// also why a window merely *arriving* says nothing and stays quiet.
 ///
 /// Reporting the vanish alone rather than a vanish-and-appear pair is what
 /// makes it both honest and complete: the pair fired on a plan simply
@@ -489,14 +494,14 @@ fn warn_on_orphaned_window_history(previous: &[QuotaWindow], current: &[QuotaWin
             .map(|w| w.id.0.clone())
             .collect::<Vec<String>>()
     };
-    let orphaned = only_in(previous, current);
-    if orphaned.is_empty() {
+    let no_longer_reported = only_in(previous, current);
+    if no_longer_reported.is_empty() {
         return;
     }
     let now_reported = only_in(current, previous);
     tracing::warn!(
-        ?orphaned, ?now_reported,
-        "per-model windows are no longer reported; the history stored under their ids is unreachable and nothing prunes it"
+        ?no_longer_reported, ?now_reported,
+        "per-model window ids stopped being reported; history stored under them is not reachable under a new id"
     );
 }
 
@@ -767,18 +772,20 @@ mod tests {
         // that both strings appear anywhere would pass just as well with the
         // fields swapped, which states the opposite: that the new id is the one
         // whose history was lost.
-        let orphaned = logs.find("orphaned=").expect("an orphaned field");
+        let lost = logs
+            .find("no_longer_reported=")
+            .expect("a no_longer_reported field");
         let reported = logs.find("now_reported=").expect("a now_reported field");
-        assert!(orphaned < reported, "{logs}");
+        assert!(lost < reported, "{logs}");
         assert!(
-            logs[orphaned..reported].contains("weekly_fable"),
-            "the old id is what was lost:\n{logs}"
+            logs[lost..reported].contains("weekly_fable"),
+            "the old id is what stopped being reported:\n{logs}"
         );
         assert!(
             logs[reported..].contains("weekly_claude_fable_5_1"),
             "the new id is context, not the loss:\n{logs}"
         );
-        assert!(logs.contains("unreachable"), "{logs}");
+        assert!(logs.contains("not reachable"), "{logs}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -797,7 +804,7 @@ mod tests {
                 windows: vec![model_window("weekly_fable", "fable", 40.0)],
             }));
         });
-        assert!(!arrival.contains("unreachable"), "{arrival}");
+        assert!(!arrival.contains("not reachable"), "{arrival}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -808,7 +815,7 @@ mod tests {
     /// The fixed buckets' ids are compiled-in constants and cannot rename, so
     /// one going missing means the payload lost a bucket — a different problem,
     /// already visible as the window disappearing from the dashboard, and not
-    /// something to report as unreachable history.
+    /// something to report as history no id reaches.
     #[test]
     fn a_fixed_bucket_disappearing_is_not_reported_as_orphaned() {
         let dir = std::env::temp_dir().join(format!("teiryod-ident4-{}", ulid::Ulid::new()));
@@ -827,14 +834,14 @@ mod tests {
                 windows: vec![window()],
             }));
         });
-        assert!(!logs.contains("unreachable"), "{logs}");
+        assert!(!logs.contains("not reachable"), "{logs}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The half a matched pair could not see: a rename straddling a poll where
     /// the window is briefly absent. Reporting the vanish on its own is what
-    /// makes it visible at the moment the history actually became unreachable.
+    /// makes it visible at the moment the stored series stopped being reachable.
     #[test]
     fn a_rename_across_an_absent_poll_is_still_reported() {
         let dir = std::env::temp_dir().join(format!("teiryod-ident3-{}", ulid::Ulid::new()));
@@ -852,7 +859,7 @@ mod tests {
             }));
         });
         assert!(
-            gone.contains("weekly_fable") && gone.contains("unreachable"),
+            gone.contains("weekly_fable") && gone.contains("not reachable"),
             "the vanish is reported on its own:\n{gone}"
         );
 
@@ -867,7 +874,7 @@ mod tests {
                 ],
             }));
         });
-        assert!(!back.contains("unreachable"), "{back}");
+        assert!(!back.contains("not reachable"), "{back}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
