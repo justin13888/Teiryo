@@ -251,13 +251,24 @@ pub(crate) fn parse(raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
     })?;
 
     let mut windows = Vec::new();
-    // The models the fixed buckets already account for. Only these suppress a
-    // `limits[]` row: a row is never suppressed by another row, because two
-    // scoped rows are two caps until their ids actually collide, and the exact
-    // check below catches that.
+    // The models the fixed buckets already account for — every bucket the
+    // payload carries, readable or not. Only these suppress a `limits[]` row:
+    // a row is never suppressed by another row, because two scoped rows are
+    // two caps until their ids actually collide, and the exact check below
+    // catches that.
     let mut fixed_models: Vec<String> = Vec::new();
     for (spec, get) in specs() {
         let Some(bucket) = get(&usage) else { continue };
+        // The bucket being *present* is what suppresses a `limits[]` row for
+        // the same model, not whether this poll's reading parsed. Otherwise a
+        // reading the server got wrong once moved the model's cap to a second
+        // id — `weekly_opus` on one poll, `weekly_claude_opus_4_5` on the
+        // next, from payloads differing only in a field neither id is built
+        // from. `rollover::detect` records nothing across an id change, so the
+        // chart and the burn rate start over each time it flips.
+        if let WindowScope::Model(model) = &spec.scope {
+            fixed_models.push(model.clone());
+        }
         let Some(used) = readable::<f64>(bucket.utilization.as_deref()) else {
             // The same trade a `limits[]` row gets, and for the same reason:
             // one reading the server did not send must not cost the poll every
@@ -272,9 +283,6 @@ pub(crate) fn parse(raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
             );
             continue;
         };
-        if let WindowScope::Model(model) = &spec.scope {
-            fixed_models.push(model.clone());
-        }
         windows.push(QuotaWindow {
             id: WindowId::from(spec.id),
             label: spec.label.to_owned(),
@@ -1284,6 +1292,46 @@ mod tests {
         // Named well enough to find the row: the discarded 90 and its label.
         assert!(logs.contains("Opus-4-1"), "{logs}");
         assert!(logs.contains("weekly_opus_4_1"), "{logs}");
+    }
+
+    /// Two consecutive polls differing only in whether `seven_day_opus`
+    /// carries a reading. The Opus cap must never appear under a second id
+    /// because of that: the id keys stored history, `rollover::detect` records
+    /// nothing across an id change, and a set that flips each poll restarts the
+    /// chart and the burn rate every time.
+    ///
+    /// The second poll reporting one window fewer is the intended trade — a
+    /// reading the server did not send is a window absent for that poll, which
+    /// the rest of the codebase already handles. A *different* id for the same
+    /// cap is not.
+    #[test]
+    fn an_unreadable_fixed_bucket_still_suppresses_its_scoped_row() {
+        let poll = |opus: &str| {
+            format!(
+                r#"{{"five_hour":{{"utilization":27}},
+                     "seven_day_opus":{opus},
+                     "limits":[{{"kind":"weekly_scoped","percent":30,
+                                 "scope":{{"model":{{"display_name":"Claude Opus 4.5"}}}}}}]}}"#
+            )
+        };
+        let ids = |body: &str| {
+            parse(&raw(200, body))
+                .unwrap()
+                .iter()
+                .map(|w| w.id.0.clone())
+                .collect::<Vec<String>>()
+        };
+
+        let read = ids(&poll(r#"{"utilization":30}"#));
+        assert_eq!(read, ["session_5h", "weekly_opus"]);
+
+        // Identical payload but for a reading the parser cannot read.
+        let unread = ids(&poll(r#"{"resets_at":null}"#));
+        assert_eq!(unread, ["session_5h"]);
+        assert!(
+            !unread.iter().any(|id| id == "weekly_claude_opus_4_5"),
+            "the Opus cap must not move to a second id: {unread:?}"
+        );
     }
 
     #[test]
