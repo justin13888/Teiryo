@@ -351,7 +351,7 @@ mod tests {
     fn a_label_of_wide_glyphs_stays_inside_its_column() {
         let label = "Weekly — Opus 東京東京東京東京";
         let column = 24;
-        let drawn = pad_to_cells(&truncate(&label, column - 1), column);
+        let drawn = pad_to_cells(&truncate(label, column - 1), column);
         assert_eq!(cells(&drawn), column, "the column is exactly its budget");
     }
 

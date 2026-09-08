@@ -513,9 +513,6 @@ mod tests {
             fn render_hint(&self, _: &teiryo_core::QuotaWindow) -> RenderHint {
                 default_hint()
             }
-            fn group_order(&self) -> &[teiryo_core::WindowId] {
-                &[]
-            }
         }
         impl teiryo_core::QuotaParser for NoAdapter {
             fn parse(

@@ -83,9 +83,6 @@ impl WindowPresenter for StubAdapter {
             note: Some("stub caveat".to_owned()),
         }
     }
-    fn group_order(&self) -> &[WindowId] {
-        &[]
-    }
 }
 
 impl ProviderAdapter for StubAdapter {
@@ -632,9 +629,6 @@ impl WindowPresenter for RollingAdapter {
             critical_threshold: 0.95,
             note: None,
         }
-    }
-    fn group_order(&self) -> &[WindowId] {
-        &[]
     }
 }
 

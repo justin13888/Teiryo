@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Account, ProviderId, QuotaWindow, WindowId};
+use crate::domain::{Account, ProviderId, QuotaWindow};
 use crate::error::{AuthError, ParseError, ProbeError};
 
 /// A provider credential. Wraps [`SecretString`] so secrets are zeroized on
@@ -71,12 +71,17 @@ pub trait QuotaParser: Send + Sync {
 }
 
 /// Provider-specific rendering rules, so the TUI stays provider-agnostic.
+///
+/// Deliberately only the per-window hint. A `group_order` sat here too, giving
+/// providers a second channel for display order — declared, implemented, and
+/// consumed by nothing: windows reach the client in the order the parser
+/// emitted them and are drawn in that order. Two orderings with one enforced
+/// is a trap for whoever tries to use the other, so the parser's order is the
+/// only one, and a provider that wants a different display order emits its
+/// windows in it.
 pub trait WindowPresenter: Send + Sync {
     /// How one window should be rendered.
     fn render_hint(&self, window: &QuotaWindow) -> RenderHint;
-
-    /// Display grouping/order of the provider's windows.
-    fn group_order(&self) -> &[WindowId];
 }
 
 /// A complete provider: all four concerns plus a stable id.

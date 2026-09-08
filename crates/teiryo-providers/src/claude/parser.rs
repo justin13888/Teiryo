@@ -103,14 +103,6 @@ fn specs() -> [(BucketSpec, BucketGetter); 4] {
     ]
 }
 
-/// Display order for Claude windows: session first, then weekly buckets.
-pub(crate) fn group_order() -> Vec<WindowId> {
-    specs()
-        .into_iter()
-        .map(|(s, _)| WindowId::from(s.id))
-        .collect()
-}
-
 /// Parse one usage response into quota windows.
 pub(crate) fn parse(raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
     if raw.status != 200 {
