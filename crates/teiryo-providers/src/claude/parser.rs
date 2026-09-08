@@ -329,15 +329,28 @@ pub(crate) fn parse(raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
             continue;
         }
         let id = WindowId(format!("weekly_{slug}"));
+        // An id already used is one window's worth of history, so the second
+        // row cannot have it. Which row that is comes down to array order —
+        // "Opus 4.1" and "Opus-4-1" slug alike, and the second one's reading is
+        // simply not reported. The drop says so: silence here meant a cap the
+        // server sent went missing from the dashboard with nothing anywhere to
+        // explain it.
+        if windows.iter().any(|w| w.id == id) {
+            tracing::warn!(
+                row = %value,
+                model = name,
+                window = %id.0,
+                "skipping {WEEKLY_SCOPED_KIND} row for a window id already reported; \
+                 the first row carrying a percent wins"
+            );
+            continue;
+        }
         // A fixed bucket for the same model (e.g. `seven_day_opus`) wins: the
         // id keys stored history, so one cap must not appear twice. Matched by
         // alias rather than by exact slug — the server names the same cap
         // "Opus", "Claude Opus 4.5" and whatever it renames it to next, and an
         // exact comparison catches only the first, listing one cap twice under
         // two confusable labels.
-        if windows.iter().any(|w| w.id == id) {
-            continue;
-        }
         if let Some(covered) = fixed_models.iter().find(|m| same_model(&slug, m)) {
             tracing::warn!(
                 row = %value,
@@ -1240,6 +1253,37 @@ mod tests {
         ] {
             assert!(is_server_derived(&WindowId::from(id)), "{id} is derived");
         }
+    }
+
+    /// Issue #10, exactly as reported: two labels for one model slug to one
+    /// id, and the second row's reading — the larger one — is discarded by
+    /// array order. Which row wins is unchanged; that it is now said out loud
+    /// is the fix, since the number the server sent is otherwise absent from
+    /// the dashboard with nothing to explain it.
+    #[test]
+    fn a_second_row_for_one_id_is_dropped_with_a_reason() {
+        let mut windows = Vec::new();
+        let logs = captured_logs(|| {
+            windows = parse(&raw(
+                200,
+                r#"{"five_hour":{"utilization":5},
+                    "limits":[
+                        {"kind":"weekly_scoped","percent":10,
+                         "scope":{"model":{"display_name":"Opus 4.1"}}},
+                        {"kind":"weekly_scoped","percent":90,
+                         "scope":{"model":{"display_name":"Opus-4-1"}}}
+                    ]}"#,
+            ))
+            .unwrap();
+        });
+        let ids: Vec<_> = windows.iter().map(|w| w.id.0.as_str()).collect();
+        assert_eq!(ids, ["session_5h", "weekly_opus_4_1"]);
+        // Precedence is unchanged: the first row carrying a percent wins.
+        assert_eq!(windows[1].used, 10.0);
+        assert!(logs.contains("already reported"), "{logs}");
+        // Named well enough to find the row: the discarded 90 and its label.
+        assert!(logs.contains("Opus-4-1"), "{logs}");
+        assert!(logs.contains("weekly_opus_4_1"), "{logs}");
     }
 
     #[test]
