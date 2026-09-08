@@ -154,11 +154,15 @@ pub fn outcome_text(event: &PollEvent) -> (String, bool) {
 /// each column after it to the right and clips the last one — with the data
 /// still correct, which is what makes it hard to see.
 ///
-/// Measured per *grapheme*, which is what ratatui does. Summing per `char`
-/// gets emoji wrong in the widening direction: `U+FE0F`, the variation
-/// selector that makes `❤` render as an emoji, is zero cells on its own and
-/// makes the pair two — so a char-wise sum reads 1 where the terminal draws 2,
-/// and a column of them overruns by its own length again.
+/// Summed per *grapheme*, because that is the measurement ratatui makes:
+/// `Buffer::set_stringn` segments the string and charges each grapheme its own
+/// `symbol.width()` (ratatui 0.29, `buffer.rs:345-352`). A whole-string
+/// `UnicodeWidthStr::width(text)` is a different measure and disagrees with it
+/// — for `"👨\u{200D}🇯🇵"` it reports 2 where ratatui draws 4 — so only the
+/// per-grapheme sum is a faithful replica of the budget the terminal actually
+/// spends. Simplifying this to whole-string width is therefore a regression,
+/// not a tidy-up; `cells_replicates_ratatui_rather_than_measuring_the_whole_string`
+/// is what catches it.
 pub fn cells(text: &str) -> usize {
     drawn(text).map(|(_, w)| w).sum()
 }
@@ -410,6 +414,31 @@ mod tests {
         let column = 24;
         let drawn = pad_to_cells(&truncate(&heart.repeat(13), column - 1), column);
         assert_eq!(cells(&drawn), column);
+    }
+
+    /// `cells` sums per grapheme because ratatui does — not because a
+    /// whole-string width is merely imprecise. The two are different measures
+    /// and they disagree.
+    ///
+    /// The obvious simplification, `UnicodeWidthStr::width(text)` with control
+    /// characters filtered out, passes every other test in this module while
+    /// being silently wrong for ZWJ and skin-tone sequences: whole-string
+    /// width collapses atoms that ratatui segments and charges separately.
+    /// Pinned here so the simplification is caught by a test that names the
+    /// hazard rather than by a column drifting in someone's terminal.
+    #[test]
+    fn cells_replicates_ratatui_rather_than_measuring_the_whole_string() {
+        // Two graphemes each: a person carrying a dangling ZWJ, then a flag.
+        // ratatui charges 2 + 2; whole-string width reports 2 for the lot.
+        for text in ["👨\u{200D}🇯🇵", "👨\u{1F3FD}\u{200D}🇯🇵"] {
+            assert_eq!(text.graphemes(true).count(), 2, "{text:?}");
+            assert_eq!(cells(text), 4, "{text:?} is what ratatui draws");
+            assert_eq!(
+                UnicodeWidthStr::width(text),
+                2,
+                "{text:?} is not a whole-string width"
+            );
+        }
     }
 
     /// A control character is discarded by ratatui rather than drawn, so it
