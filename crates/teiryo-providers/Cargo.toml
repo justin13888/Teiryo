@@ -20,3 +20,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# The parser's operator signal is a `tracing` warning, so asserting it needs a
+# subscriber to capture. Without one those warnings are executed and checked by
+# nothing — deleting them left the whole suite green.
+tracing-subscriber.workspace = true
