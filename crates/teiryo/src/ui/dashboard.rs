@@ -491,6 +491,7 @@ fn pace_span(view: &WindowView, now: DateTime<Utc>) -> Span<'static> {
 mod tests {
     use super::*;
     use teiryo_core::domain::{QuotaUnit, QuotaWindow, ResetKind, WindowId, WindowScope};
+    use teiryo_core::rollover::ObservedStart;
     use teiryo_core::{BarStyle, RenderHint};
 
     use crate::ui::format::cells;
@@ -514,6 +515,20 @@ mod tests {
                 note: None,
             },
             observed_start: None,
+        }
+    }
+
+    /// The same window, but with its start known only to a twelve-hour
+    /// bracket — wide enough against a seven-day span for
+    /// `metrics::start_is_uncertain`, so every field measured from the start
+    /// carries the `~` mark and costs a cell more than the plain view's.
+    fn uncertain_view(label: &str) -> WindowView {
+        WindowView {
+            observed_start: Some(ObservedStart {
+                not_before: Utc::now() - chrono::Duration::hours(20),
+                not_after: Utc::now() - chrono::Duration::hours(8),
+            }),
+            ..view(label)
         }
     }
 
@@ -551,11 +566,15 @@ mod tests {
     fn the_derived_line_budgets_in_cells() {
         // Wide enough for every field, then narrow enough that the budget has
         // to shed some: the line must never exceed the width it was given.
-        for width in [120, 60, 44, 30] {
-            let line = derived_line(&view("Weekly"), &[], 60, width, Utc::now())
-                .expect("a window with a reset instant has derived numbers");
-            let drawn: usize = line.spans.iter().map(|s| cells(&s.content)).sum();
-            assert!(drawn <= width, "drew {drawn} cells into {width}");
+        // Both marked and unmarked, since the `~` on a bracketed start costs
+        // a cell per field that the budget still has to fit.
+        for view in [view("Weekly"), uncertain_view("Weekly")] {
+            for width in [120, 60, 44, 30] {
+                let line = derived_line(&view, &[], 60, width, Utc::now())
+                    .expect("a window with a reset instant has derived numbers");
+                let drawn: usize = line.spans.iter().map(|s| cells(&s.content)).sum();
+                assert!(drawn <= width, "drew {drawn} cells into {width}");
+            }
         }
     }
 }
