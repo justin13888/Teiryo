@@ -1208,6 +1208,74 @@ mod tests {
     /// here, which by construction will not produce the rows these tests are
     /// about. A pre-upgrade database is exactly a set of rows the current rule
     /// would not have written.
+    /// A derived window rolls over like any other, through a real `limits[]`
+    /// payload.
+    ///
+    /// Every rollover test above builds its windows by hand and uses the
+    /// compiled-in ids, so nothing established that a `weekly_<model>` id
+    /// reaches `rollover::detect` at all. The gap is not hypothetical: the
+    /// orphan filter carried a `starts_with("weekly_")` guard until it was
+    /// replaced with `id_is_server_derived`, and an id-shape guard anywhere on
+    /// this path would be caught by nothing else.
+    #[test]
+    fn a_derived_window_rolls_over_like_any_other() {
+        use teiryo_core::QuotaParser;
+
+        let dir = std::env::temp_dir().join(format!("teiryod-derived-roll-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let daemon = seeded(&dir.join("teiryo.db"));
+        let adapter = teiryo_providers::claude::ClaudeAdapter::with_config(
+            dir.join("credentials.json"),
+            "http://127.0.0.1:1".to_owned(),
+        );
+
+        // The second poll's reading collapses while its reset instant stays
+        // where it was, which is the shape `reset_at` arithmetic cannot see.
+        let poll = |fable: u32| {
+            let body = format!(
+                r#"{{"five_hour":{{"utilization":27}},
+                     "limits":[{{"kind":"weekly_scoped","percent":{fable},
+                                 "scope":{{"model":{{"id":null,"display_name":"Fable"}}}}}}]}}"#
+            );
+            adapter
+                .parse(&teiryo_core::RawResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: body.into_bytes(),
+                    fetched_at: chrono::Utc::now(),
+                })
+                .expect("parses")
+        };
+
+        daemon.record_event(&event(PollOutcome::Success { windows: poll(88) }));
+        std::thread::sleep(Duration::from_millis(2));
+        daemon.record_event(&event(PollOutcome::Success { windows: poll(1) }));
+
+        let st = daemon.state.borrow();
+        let found = st
+            .storage
+            .rollovers(&account().id, None, since, chrono::Utc::now())
+            .unwrap();
+        assert_eq!(
+            found.iter().map(|r| &r.window).collect::<Vec<_>>(),
+            vec![&WindowId::from("weekly_fable")],
+            "the derived window is the one that restarted"
+        );
+        assert_eq!(found[0].prev_used, 88.0);
+        assert_eq!(found[0].new_used, 1.0);
+        drop(st);
+
+        // And it anchors, so the dashboard measures the new instance from the
+        // restart rather than from the provider's arithmetic.
+        assert_eq!(
+            anchors(&daemon),
+            vec![(account().id, WindowId::from("weekly_fable"))]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn store_rollover(
         daemon: &Daemon,
         kind: RolloverKind,
