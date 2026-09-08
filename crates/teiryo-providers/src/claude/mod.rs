@@ -186,6 +186,10 @@ impl QuotaParser for ClaudeAdapter {
     fn parse(&self, raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
         parser::parse(raw)
     }
+
+    fn id_is_server_derived(&self, id: &WindowId) -> bool {
+        parser::is_server_derived(id)
+    }
 }
 
 impl WindowPresenter for ClaudeAdapter {

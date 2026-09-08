@@ -57,9 +57,13 @@ pub struct SharedState {
     /// Compiled-in provider ids, so [`Config::view`] can offer a row for a
     /// provider the config file never mentions.
     pub known_providers: Vec<ProviderId>,
-    /// Adapters kept for their [`teiryo_core::WindowPresenter`] impl: `Status`
-    /// attaches each window's render hint so the TUI never hardcodes
-    /// provider-specific thresholds.
+    /// Adapters kept for the two questions only the provider can answer:
+    /// [`teiryo_core::WindowPresenter::render_hint`], so `Status` can attach
+    /// each window's hint and the TUI never hardcodes provider-specific
+    /// thresholds, and
+    /// [`teiryo_core::QuotaParser::id_is_server_derived`], so
+    /// [`warn_on_orphaned_window_history`] never hardcodes one provider's
+    /// window ids.
     pub presenters: HashMap<ProviderId, Rc<dyn ProviderAdapter>>,
 }
 
@@ -243,6 +247,7 @@ impl Daemon {
         // at once is an outage rather than a rename.
         if matches!(event.outcome, PollOutcome::Success { .. }) {
             warn_on_orphaned_window_history(
+                st.presenters.get(&event.provider).map(Rc::as_ref),
                 previous_windows(st.latest_success.get(&event.account)),
                 &windows,
             );
@@ -414,7 +419,8 @@ impl Daemon {
     }
 
     /// Register a poll task for `account`: open its live schedule channel,
-    /// record the cadence clients see, and keep the adapter for its presenter.
+    /// record the cadence clients see, and keep the adapter for the questions
+    /// `SharedState::presenters` documents.
     /// Returns the receiver to hand to [`crate::scheduler::spawn_poller`].
     pub fn register_poller(
         &self,
@@ -458,15 +464,22 @@ impl Daemon {
 /// Report per-model windows that have stopped being reported under the id
 /// their history is stored under.
 ///
-/// A `weekly_<model>` id is a durable storage key — `quota_snapshot` and
-/// `window_rollover` are both keyed on it — derived from what the server calls
-/// the model. When the server renames a model, or starts sending
-/// `scope.model.id` where it previously sent null, the old id stops appearing
-/// and a new one takes its place. Nothing downstream can see that:
-/// [`rollover::detect`] skips windows present in only one of two polls, which
-/// is right for rollovers and precisely blind here.
+/// A per-model window id derived from server text is a durable storage key —
+/// `quota_snapshot` and `window_rollover` are both keyed on it. When the
+/// server renames a model, or starts sending `scope.model.id` where it
+/// previously sent null, the old id stops appearing and a new one takes its
+/// place. Nothing downstream can see that: [`rollover::detect`] skips windows
+/// present in only one of two polls, which is right for rollovers and
+/// precisely blind here.
 ///
-/// The condition reported is a scoped window **vanishing**, not a rename.
+/// Which ids are derived is the adapter's answer, not this function's:
+/// [`teiryo_core::QuotaParser::id_is_server_derived`]. A compiled-in id cannot
+/// rename, so its absence is a window missing from one payload — a different
+/// problem, already visible on the dashboard. Without an adapter for the
+/// provider the two cannot be told apart, and nothing is reported rather than
+/// guessed.
+///
+/// The condition reported is a derived window **vanishing**, not a rename.
 /// Pairing an old id to a new one is not possible from here — the server sends
 /// no continuity information, and guessing it from the names is how the
 /// parser's own dedupe went wrong. So the claim stays at what a single poll
@@ -482,10 +495,15 @@ impl Daemon {
 /// makes it both honest and complete: the pair fired on a plan simply
 /// exchanging one per-model cap for another, and stayed silent when the rename
 /// straddled a poll where the window was briefly absent.
-fn warn_on_orphaned_window_history(previous: &[QuotaWindow], current: &[QuotaWindow]) {
+fn warn_on_orphaned_window_history(
+    adapter: Option<&dyn ProviderAdapter>,
+    previous: &[QuotaWindow],
+    current: &[QuotaWindow],
+) {
+    let Some(adapter) = adapter else { return };
     let scoped = |w: &&QuotaWindow| {
         matches!(w.scope, teiryo_core::domain::WindowScope::Model(_))
-            && w.id.0.starts_with("weekly_")
+            && adapter.id_is_server_derived(&w.id)
     };
     let only_in = |side: &[QuotaWindow], other: &[QuotaWindow]| {
         side.iter()
@@ -726,6 +744,23 @@ mod tests {
         String::from_utf8(bytes).expect("utf-8 log output")
     }
 
+    /// A daemon whose registered adapter is the real Claude one, so which of
+    /// its window ids count as server-derived is decided by the provider
+    /// rather than restated here. Registered against the stub account because
+    /// `register_poller` keys the adapter by the *account's* provider, and the
+    /// point under test is the daemon asking rather than the account.
+    fn with_claude_adapter(path: &std::path::Path) -> Daemon {
+        let daemon = seeded(path);
+        let _rx = daemon.register_poller(
+            &account(),
+            Rc::new(teiryo_providers::claude::ClaudeAdapter::with_config(
+                path.with_file_name("credentials.json"),
+                "http://127.0.0.1:1".to_owned(),
+            )),
+        );
+        daemon
+    }
+
     fn model_window(id: &str, model: &str, used: f64) -> QuotaWindow {
         QuotaWindow {
             id: WindowId::from(id),
@@ -751,7 +786,7 @@ mod tests {
     fn a_per_model_window_that_stops_being_reported_is_named_as_orphaned() {
         let dir = std::env::temp_dir().join(format!("teiryod-ident-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
-        let daemon = seeded(&dir.join("teiryo.db"));
+        let daemon = with_claude_adapter(&dir.join("teiryo.db"));
 
         daemon.record_event(&event(PollOutcome::Success {
             windows: vec![model_window("weekly_fable", "fable", 40.0)],
@@ -797,7 +832,7 @@ mod tests {
     fn a_per_model_window_merely_arriving_is_not_reported() {
         let dir = std::env::temp_dir().join(format!("teiryod-ident2-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
-        let daemon = seeded(&dir.join("teiryo.db"));
+        let daemon = with_claude_adapter(&dir.join("teiryo.db"));
 
         let arrival = captured_logs(|| {
             daemon.record_event(&event(PollOutcome::Success {
@@ -811,19 +846,24 @@ mod tests {
 
     /// A fixed bucket disappearing is an outage, not a rename.
     ///
-    /// Only `weekly_<model>` ids are derived from a label the server controls.
-    /// The fixed buckets' ids are compiled-in constants and cannot rename, so
-    /// one going missing means the payload lost a bucket — a different problem,
+    /// `weekly_opus` is the id the Claude adapter actually emits for its
+    /// `seven_day_opus` bucket: model-scoped, `weekly_`-prefixed, and a
+    /// compiled-in constant all at once. It cannot rename, so one poll without
+    /// it is that bucket being absent — a bucket the server sent as null, or
+    /// with a reading the parser could not read — which is a different problem,
     /// already visible as the window disappearing from the dashboard, and not
     /// something to report as history no id reaches.
+    ///
+    /// Judging that by the id's shape got this exactly backwards, and the id
+    /// this test used to carry (`session_5h_opus`) is one no adapter emits, so
+    /// it never noticed.
     #[test]
     fn a_fixed_bucket_disappearing_is_not_reported_as_orphaned() {
         let dir = std::env::temp_dir().join(format!("teiryod-ident4-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
-        let daemon = seeded(&dir.join("teiryo.db"));
+        let daemon = with_claude_adapter(&dir.join("teiryo.db"));
 
-        let mut opus = model_window("session_5h_opus", "opus", 30.0);
-        opus.reset_kind = ResetKind::Rolling(Duration::from_secs(5 * 3600));
+        let opus = model_window("weekly_opus", "opus", 30.0);
         daemon.record_event(&event(PollOutcome::Success {
             windows: vec![window(), opus],
         }));
@@ -846,7 +886,7 @@ mod tests {
     fn a_rename_across_an_absent_poll_is_still_reported() {
         let dir = std::env::temp_dir().join(format!("teiryod-ident3-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
-        let daemon = seeded(&dir.join("teiryo.db"));
+        let daemon = with_claude_adapter(&dir.join("teiryo.db"));
 
         daemon.record_event(&event(PollOutcome::Success {
             windows: vec![window(), model_window("weekly_fable", "fable", 40.0)],

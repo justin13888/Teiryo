@@ -226,6 +226,18 @@ pub(crate) fn group_order() -> Vec<WindowId> {
         .collect()
 }
 
+/// Whether `id` is one [`parse`] derived from a name the server chose.
+///
+/// Every window this parser emits is either a fixed bucket, whose id is one of
+/// the compiled-in constants in [`specs`], or a `weekly_<slug>` built from a
+/// `limits[]` row — where the slug comes from `scope.model.id` or the display
+/// name, either of which the server can rewrite under a stored series. So the
+/// question is answered by membership in the fixed set, not by the id's shape:
+/// `weekly_opus` and a derived `weekly_fable` look alike and are not alike.
+pub(crate) fn is_server_derived(id: &WindowId) -> bool {
+    !specs().into_iter().any(|(spec, _)| spec.id == id.0)
+}
+
 /// Parse one usage response into quota windows.
 pub(crate) fn parse(raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
     if raw.status != 200 {
@@ -1206,6 +1218,28 @@ mod tests {
         .unwrap();
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].used, 48.0);
+    }
+
+    /// The distinction an id's shape cannot make, and the daemon's warning
+    /// about stranded history turns on: `weekly_opus` is model-scoped and
+    /// `weekly_`-prefixed exactly like a derived id, and is a compiled-in
+    /// constant that cannot rename underneath its stored series.
+    #[test]
+    fn only_ids_built_from_server_text_count_as_derived() {
+        for id in ["session_5h", "weekly", "weekly_opus", "weekly_sonnet"] {
+            assert!(
+                !is_server_derived(&WindowId::from(id)),
+                "{id} is compiled in"
+            );
+        }
+        // What `parse` builds from `scope.model.id` or a display name.
+        for id in [
+            "weekly_fable",
+            "weekly_claude_fable_5_1",
+            "weekly_opus_mini",
+        ] {
+            assert!(is_server_derived(&WindowId::from(id)), "{id} is derived");
+        }
     }
 
     #[test]
