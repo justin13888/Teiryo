@@ -620,9 +620,43 @@ fn placeholder(text: &str, block: Block<'static>) -> Paragraph<'static> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use teiryo_core::{AccountHealth, AccountId, PollId, PollOutcome, PollTrigger};
+
+    use crate::ui::format::cells;
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap()
+    }
+
+    /// The shapes of provider-supplied text a `char` count reads wrong: CJK at
+    /// two cells a char, a variation-selector pair that is zero cells plus one
+    /// yet draws two, and a ZWJ sequence that is one grapheme of eight. Each
+    /// appears short enough to be padded and long enough to be truncated, so
+    /// both halves of `pad_to_cells(&truncate(..))` are exercised.
+    const WIDE: [&str; 3] = [
+        "東京東京",
+        "\u{2764}\u{FE0F}\u{2764}\u{FE0F}",
+        "👨\u{200D}👩\u{200D}👧\u{200D}👦",
+    ];
+
+    /// Both lengths of each wide input: one that fits a column, one that does
+    /// not.
+    fn wide_inputs(column: usize) -> Vec<String> {
+        WIDE.iter()
+            .flat_map(|w| [(*w).to_owned(), w.repeat(column)])
+            .collect()
+    }
+
+    fn event(account: &str, outcome: PollOutcome) -> PollEvent {
+        PollEvent {
+            id: PollId::zero(),
+            ts: now(),
+            provider: "claude".to_owned(),
+            account: AccountId::from(account),
+            trigger: PollTrigger::Scheduled,
+            outcome,
+            latency_ms: 42,
+        }
     }
 
     /// A 24h chart ending at `now`, mapped the way `render_trend` maps it.
@@ -706,5 +740,79 @@ mod tests {
         // Unextended, the right edge is the present itself.
         let plain = x_labels(left, DAY, now());
         assert_eq!(plain[2].to_string(), "now");
+    }
+
+    /// The activity account column is exactly its budget whatever the account
+    /// id is made of.
+    ///
+    /// Asserted against `activity_line` rather than against the helpers it
+    /// composes, for the same reason `the_label_column_holds_its_width_for_any_label`
+    /// is: proving `pad_to_cells` and `truncate` separately leaves the call
+    /// site free to pair a cell-truncated string with a char-padding
+    /// `format!("{:<22}", ..)`, and no test in the crate notices.
+    #[test]
+    fn the_activity_account_column_holds_its_width_for_any_account() {
+        const COLUMN: usize = 22;
+        for account in wide_inputs(COLUMN) {
+            let event = event(&account, PollOutcome::Success { windows: vec![] });
+            let line = activity_line(&event, now());
+            // The span carries the two-space gutter ahead of the column.
+            let drawn = cells(&line.spans[2].content);
+            assert_eq!(
+                drawn,
+                COLUMN + 2,
+                "account {account:?} drew {drawn} cells in a {COLUMN}-cell column"
+            );
+        }
+    }
+
+    /// The outcome column too — and this one carries provider-controlled text
+    /// verbatim, so it is the field an untrusted string reaches first.
+    #[test]
+    fn the_activity_outcome_column_holds_its_width_for_any_error() {
+        const COLUMN: usize = 40;
+        for message in wide_inputs(COLUMN) {
+            for outcome in [
+                PollOutcome::SchemaDrift(message.clone()),
+                PollOutcome::NetworkError(message.clone()),
+            ] {
+                let line = activity_line(&event("acct", outcome), now());
+                let drawn = cells(&line.spans[3].content);
+                assert_eq!(
+                    drawn, COLUMN,
+                    "error {message:?} drew {drawn} cells in a {COLUMN}-cell column"
+                );
+            }
+        }
+    }
+
+    /// And the Health tab's account column, which is the same pairing at a
+    /// different width.
+    #[test]
+    fn the_health_account_column_holds_its_width_for_any_account() {
+        const COLUMN: usize = 24;
+        for account in wide_inputs(COLUMN) {
+            let health = ProviderHealth {
+                provider: "claude".to_owned(),
+                accounts: vec![AccountHealth {
+                    account: AccountId::from(account.as_str()),
+                    consecutive_failures: 0,
+                    last_error: None,
+                    last_poll_ts: Some(now()),
+                    poll_interval_secs: 300,
+                }],
+                consecutive_failures: 0,
+                last_error: None,
+            };
+            let lines = account_lines(&health, now());
+            // Gutter again: five cells of indent, the ok/fail flag, then the
+            // column behind two spaces.
+            let drawn = cells(&lines[0].spans[2].content);
+            assert_eq!(
+                drawn,
+                COLUMN + 2,
+                "account {account:?} drew {drawn} cells in a {COLUMN}-cell column"
+            );
+        }
     }
 }
