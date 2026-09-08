@@ -16,5 +16,9 @@ directories.workspace = true
 futures.workspace = true
 libc = "0.2"
 ratatui.workspace = true
+# Column budgets are in terminal cells, and a cell is not a `char`: CJK and
+# emoji are two cells wide, combining marks are zero. ratatui charges each span
+# its real width, so counting chars overruns the budget silently.
+unicode-width = "0.2"
 tokio.workspace = true
 tokio-util.workspace = true

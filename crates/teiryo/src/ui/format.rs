@@ -135,6 +135,8 @@ pub fn trigger_glyph(trigger: &PollTrigger) -> &'static str {
     }
 }
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 /// One-word outcome for a poll event, plus whether it was a failure.
 pub fn outcome_text(event: &PollEvent) -> (String, bool) {
     match &event.outcome {
@@ -143,16 +145,55 @@ pub fn outcome_text(event: &PollEvent) -> (String, bool) {
     }
 }
 
+/// Width of `text` in terminal cells.
+///
+/// Not `chars().count()`. A cell is what the terminal draws, and the two part
+/// company exactly where provider-supplied text lives: CJK and most emoji
+/// occupy two cells, combining marks none. ratatui charges every span its real
+/// width against one shared row budget, so a label measured in chars pushes
+/// each column after it to the right and clips the last one — with the data
+/// still correct, which is what makes it hard to see.
+pub fn cells(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
 /// Truncate to `width` display cells, marking elision with an ellipsis.
+///
+/// The result is never wider than `width`, including when a two-cell glyph
+/// straddles the boundary: that glyph is dropped rather than half-drawn, which
+/// can leave the result one cell short of the budget. Short is safe; over is
+/// the bug.
 pub fn truncate(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
+    if cells(text) <= width {
         return text.to_owned();
     }
     if width <= 1 {
         return "…".to_owned();
     }
-    let mut out: String = text.chars().take(width - 1).collect();
+    // One cell reserved for the ellipsis, which is itself one cell wide.
+    let budget = width - 1;
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
     out.push('…');
+    out
+}
+
+/// Pad `text` on the right to `width` display cells.
+///
+/// The counterpart to [`truncate`], and needed for the same reason:
+/// `format!("{:<width$}")` pads by `char` count, so a label holding any
+/// wide glyph is padded too little and the row's later columns shift.
+pub fn pad_to_cells(text: &str, width: usize) -> String {
+    let mut out = text.to_owned();
+    out.extend(std::iter::repeat_n(' ', width.saturating_sub(cells(text))));
     out
 }
 
@@ -278,5 +319,48 @@ mod tests {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("truncate me", 5), "trun…");
         assert_eq!(truncate("abc", 1), "…");
+    }
+
+    /// The budget is cells, which is what `truncate`'s own doc always said and
+    /// what ratatui actually charges. Counting `char`s let a label of wide
+    /// glyphs pass a width check at up to twice its real size.
+    #[test]
+    fn truncate_budgets_display_cells_not_chars() {
+        // Eight chars, sixteen cells. Under the old rule this passed a width
+        // check of 10 and then drew 16 columns.
+        let wide = "東京東京東京東京";
+        assert_eq!(cells(wide), 16);
+        assert!(cells(&truncate(wide, 10)) <= 10);
+        // Nothing is dropped when it already fits.
+        assert_eq!(truncate(wide, 16), wide);
+        // A two-cell glyph straddling the boundary is dropped whole rather
+        // than half-drawn, so the result may come up a cell short.
+        assert_eq!(truncate(wide, 6), "東京…");
+        assert_eq!(cells(&truncate(wide, 6)), 5);
+        // ASCII is unaffected, which is what keeps every existing budget sound.
+        assert_eq!(cells("truncate me"), 11);
+    }
+
+    /// #14's reproduction, at the width the dashboard actually uses: a
+    /// server-supplied model name reaching `QuotaWindow.label` for the first
+    /// time. `truncate(_, 23)` passed the 22-char string through untouched and
+    /// `{:<24}` padded it to 24 chars — 32 cells against a 24-cell column, so
+    /// the bar, usage and reset spans all shifted right and the last was
+    /// clipped.
+    #[test]
+    fn a_label_of_wide_glyphs_stays_inside_its_column() {
+        let label = "Weekly — Opus 東京東京東京東京";
+        let column = 24;
+        let drawn = pad_to_cells(&truncate(&label, column - 1), column);
+        assert_eq!(cells(&drawn), column, "the column is exactly its budget");
+    }
+
+    #[test]
+    fn padding_counts_cells_and_never_shrinks_what_it_is_given() {
+        assert_eq!(pad_to_cells("ab", 5), "ab   ");
+        assert_eq!(cells(&pad_to_cells("東京", 6)), 6);
+        // Already at or over budget: left alone rather than truncated, which
+        // is `truncate`'s job and not this one's.
+        assert_eq!(pad_to_cells("abcdef", 3), "abcdef");
     }
 }

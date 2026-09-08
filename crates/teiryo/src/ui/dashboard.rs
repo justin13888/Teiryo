@@ -12,8 +12,8 @@ use teiryo_core::{AccountStatus, QuotaSnapshot, WindowView};
 use crate::app::{App, Pane, RowRef};
 use crate::metrics;
 use crate::ui::format::{
-    format_countdown, format_elapsed, format_span, outcome_text, text_bar_fine, truncate,
-    usage_short,
+    cells, format_countdown, format_elapsed, format_span, outcome_text, pad_to_cells,
+    text_bar_fine, truncate, usage_short,
 };
 use crate::ui::theme;
 
@@ -300,9 +300,12 @@ fn gauge_line(
         .clamp(MIN_BAR, 48);
 
     let mut spans = vec![Span::raw(" ".repeat(INDENT))];
-    spans.push(Span::raw(format!(
-        "{:<LABEL$}",
-        truncate(&window.label, LABEL - 1)
+    // Padded by cells, not by `format!`'s char count: a label carrying any
+    // wide glyph is otherwise padded too little, and every column after it on
+    // the row shifts right by the difference.
+    spans.push(Span::raw(pad_to_cells(
+        &truncate(&window.label, LABEL - 1),
+        LABEL,
     )));
 
     match metrics::utilization(window) {
@@ -409,14 +412,12 @@ fn derived_line(
     let mut spans = vec![Span::raw(" ".repeat(INDENT))];
     let mut used = INDENT;
     for (text, style) in fields {
-        // Counted in cells, not bytes: the separator's "·" is two bytes wide
-        // and one column, and so are the glyphs inside the fields.
-        let separator = if used > INDENT {
-            SEPARATOR.chars().count()
-        } else {
-            0
-        };
-        let cost = text.chars().count() + separator;
+        // Counted in cells. An earlier pass moved this off `str::len`, which
+        // overstated the separator by a byte; chars understate any field
+        // holding a wide glyph by a cell each, and a provider-supplied model
+        // name reaches these fields.
+        let separator = if used > INDENT { cells(SEPARATOR) } else { 0 };
+        let cost = cells(&text) + separator;
         if used + cost > width {
             break;
         }
