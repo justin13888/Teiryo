@@ -158,8 +158,17 @@ fn trend_footer(app: &App, now: DateTime<Utc>) -> Line<'static> {
             theme::dim(),
         ));
         let effective = metrics::effective_window(view, now);
+        // Same mark the row's own numbers carry: the window's start is known
+        // only to within a bracket comparable to the window itself.
+        let mark = match effective.as_ref() {
+            Some(w) if metrics::start_is_uncertain(w) => "~",
+            _ => "",
+        };
         if let Some(pace) = effective.as_ref().and_then(|w| metrics::pace(w, now)) {
-            spans.push(Span::styled(format!(" · pace {pace:.2}×"), theme::dim()));
+            spans.push(Span::styled(
+                format!(" · pace {mark}{pace:.2}×"),
+                theme::dim(),
+            ));
         }
         // Named for what separates it from the pace beside it: that one is the
         // average since the window opened, this one only the recent end of it.

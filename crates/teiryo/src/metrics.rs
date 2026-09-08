@@ -96,6 +96,34 @@ pub fn elapsed_fraction(window: &EffectiveWindow, now: DateTime<Utc>) -> Option<
     Some((elapsed as f64 / span as f64).clamp(0.0, 1.0))
 }
 
+/// How much of a window's length its start bracket may span before the
+/// numbers measured from that start are marked as estimates.
+///
+/// A fraction rather than a duration, for the reason [`MIN_ELAPSED_FRACTION`]
+/// is one: half an hour is most of a 5-hour window's precision budget and
+/// nothing at all against a weekly one. At a twentieth, an ordinary poll
+/// cadence never trips it and a bracket left by an outage always does.
+const MAX_TRUSTED_BRACKET_FRACTION: f64 = 0.05;
+
+/// Whether the window's start is known loosely enough that the numbers
+/// measured from it should say so.
+///
+/// `start_uncertainty` is the width of the bracket a silent restart was
+/// observed in — one poll interval in normal running, and days across a
+/// daemon outage. A pace resting on each is the same figure with very
+/// different standing, and a caller that prints them identically is reporting
+/// a guess as a measurement.
+///
+/// Only the fields measured *from the start* are affected. `afford` divides
+/// the remaining budget by the time left to `reset_at` and never touches it,
+/// which is why it stays plain while `pace` beside it is marked.
+pub fn start_is_uncertain(window: &EffectiveWindow) -> bool {
+    let span = window.span().num_seconds();
+    span > 0
+        && window.start_uncertainty.num_seconds() as f64 / span as f64
+            > MAX_TRUSTED_BRACKET_FRACTION
+}
+
 /// Consumption relative to the clock: `1.0` is exactly on track, `2.0` means
 /// burning twice as fast as the window can afford.
 ///

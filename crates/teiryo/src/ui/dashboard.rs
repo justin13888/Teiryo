@@ -381,10 +381,22 @@ fn derived_line(
     let window = &metrics::effective_window(view, now)?;
     let mut fields: Vec<(String, Style)> = Vec::new();
 
+    // Marks the fields measured from the window's start when that start is
+    // itself only bracketed — a restart seen across an outage can be days
+    // wide. Marked rather than withheld: the figure is still the best there
+    // is, and hiding it would lose the signal a wide bracket is usually
+    // reporting. `afford` and `now` carry no mark because neither is measured
+    // from the start.
+    let mark = if metrics::start_is_uncertain(window) {
+        "~"
+    } else {
+        ""
+    };
+
     if let Some(pace) = metrics::pace(window, now) {
         let (glyph, color) = pace_style(pace);
         fields.push((
-            format!("{glyph} {pace:.2}× pace"),
+            format!("{glyph} {mark}{pace:.2}× pace"),
             Style::default().fg(color),
         ));
     }
@@ -404,7 +416,7 @@ fn derived_line(
         let text = if runway <= chrono::Duration::zero() {
             "at cap".to_owned()
         } else {
-            format!("cap in {}", format_span(runway))
+            format!("cap in {mark}{}", format_span(runway))
         };
         let color = if binding { theme::WARN } else { theme::DIM };
         fields.push((text, Style::default().fg(color)));
@@ -413,7 +425,10 @@ fn derived_line(
         fields.push((format!("afford {afford:.2}×"), theme::dim()));
     }
     if let Some(pace) = metrics::pace(window, now) {
-        fields.push((format!("→{:.0}% at reset", pace * 100.0), theme::dim()));
+        fields.push((
+            format!("→{mark}{:.0}% at reset", pace * 100.0),
+            theme::dim(),
+        ));
     }
 
     let mut spans = vec![Span::raw(" ".repeat(INDENT))];

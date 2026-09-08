@@ -112,9 +112,9 @@ mod tests {
         WindowId, WindowScope,
     };
     use teiryo_core::{
-        Account, AccountHealth, AccountStatus, BarStyle, ConfigState, ConfigView, PollEvent,
-        PollId, ProviderHealth, ProviderSettings, QuotaSnapshot, RenderHint, RolloverKind,
-        WindowRollover, WindowView,
+        Account, AccountHealth, AccountStatus, BarStyle, ConfigState, ConfigView, ObservedStart,
+        PollEvent, PollId, ProviderHealth, ProviderSettings, QuotaSnapshot, RenderHint,
+        RolloverKind, WindowRollover, WindowView,
     };
 
     use crate::app::{DetailTab, Overlay, Trend};
@@ -468,6 +468,88 @@ mod tests {
     }
 
     /// Empty state: connected but the daemon has discovered nothing yet.
+    /// Anchor every window on a restart the daemon saw between `oldest` and
+    /// `newest` minutes ago, bracketed exactly that widely.
+    ///
+    /// `view` hard-codes `observed_start: None`, and so does every other
+    /// construction site outside `metrics`' own tests — which left the whole
+    /// render path unexercised against an anchored window, including the claim
+    /// that the chart's rule and the row's numbers describe the same one.
+    fn anchor_every_window(app: &mut App, oldest: i64, newest: i64) {
+        for status in &mut app.statuses {
+            for window in &mut status.windows {
+                window.observed_start = Some(ObservedStart {
+                    not_before: Utc::now() - Duration::minutes(oldest),
+                    not_after: Utc::now() - Duration::minutes(newest),
+                });
+            }
+        }
+    }
+
+    /// The row's numbers are measured against the window that actually ran.
+    ///
+    /// Every fixture window publishes a reset two hours out on a 5-hour span,
+    /// so the provider's arithmetic starts them three hours back. A restart
+    /// seen an hour ago makes the effective window three hours long and one
+    /// hour in — a third elapsed, where the published span said five sixths.
+    #[test]
+    fn an_anchored_row_measures_against_the_window_that_actually_ran() {
+        let mut app = populated();
+        anchor_every_window(&mut app, 61, 59);
+        let out = rendered(&mut app, 120, 40);
+
+        // 62% spent a third of the way in is 1.86×, against the 0.74× the
+        // published span would have given.
+        assert!(
+            out.contains("1.86× pace"),
+            "expected the anchored pace:\n{out}"
+        );
+        assert!(
+            !out.contains("0.74× pace"),
+            "the nominal start is gone:\n{out}"
+        );
+        // A two-minute bracket on a three-hour window is precise, so none of
+        // the fields measured from the start is marked as an estimate. Checked
+        // per field rather than on the frame: the header's `next ~39s`
+        // countdown carries a `~` of its own and always will.
+        assert!(
+            !out.contains("~1.86× pace"),
+            "a tight bracket needs no mark:\n{out}"
+        );
+        assert!(!out.contains("cap in ~"), "{out}");
+        assert!(!out.contains("→~"), "{out}");
+    }
+
+    /// The same number, resting on a bracket wide enough to matter, says so.
+    ///
+    /// `start_uncertainty` was computed, carried across the whole metrics
+    /// surface, and read by nothing: a pace anchored to a bracket minutes wide
+    /// and one anchored to a bracket comparable to the window itself printed
+    /// identically.
+    #[test]
+    fn a_row_marks_the_numbers_that_rest_on_a_wide_bracket() {
+        let mut app = populated();
+        // Restart seen somewhere in a whole hour, on a three-hour window.
+        anchor_every_window(&mut app, 90, 30);
+        let out = rendered(&mut app, 120, 40);
+
+        // Same midpoint, so the same pace as the tight bracket above — the
+        // mark is the only difference, which is the point.
+        assert!(
+            out.contains("~1.86× pace"),
+            "expected a marked pace:\n{out}"
+        );
+        assert!(out.contains("cap in ~"), "expected a marked runway:\n{out}");
+        assert!(out.contains("→~"), "expected a marked projection:\n{out}");
+        // `afford` divides the remaining budget by the time left to the reset
+        // and never touches the start, so it is not an estimate and is not
+        // marked. Without this the mark could be blanket-applied and pass.
+        assert!(
+            out.contains("afford 0."),
+            "afford rests on reset_at, not on the start:\n{out}"
+        );
+    }
+
     #[test]
     fn every_row_carries_its_derived_numbers_when_the_pane_is_tall_enough() {
         let mut app = populated();

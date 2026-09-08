@@ -89,6 +89,51 @@ fn unannounced(rollover: &WindowRollover) -> bool {
     matches!(rollover.kind, RolloverKind::Unannounced)
 }
 
+/// Drop anchors that can no longer describe a window currently running.
+///
+/// An anchor is retired directly only by a later *announced* rollover, which
+/// is a signal a provider that never moves `reset_at` never sends — and that
+/// provider is exactly the one this feature exists for. `effective_window`'s
+/// `estimate() > reset_at - span` guard is no substitute: that boundary moves
+/// only when `reset_at` does. Without a second bound the map keeps every
+/// bracket it has ever recorded, including for windows the payload has since
+/// stopped carrying, for as long as the process runs.
+///
+/// The bound is the window's own length. A rolling window of span `S` that
+/// began at `T` has ended by `T + S`, so a bracket older than that describes
+/// an instance that is over. A window the payload no longer carries is judged
+/// against the longest span the account still publishes, there being no span
+/// of its own left to ask for; with no spans at all there is nothing to judge
+/// against, and nothing is pruned.
+///
+/// This is the bound `docs/dashboard.md` claims — "bounded by the window's
+/// length" — expressed in code rather than asserted in prose.
+fn prune_anchors(
+    st: &mut SharedState,
+    account: &AccountId,
+    windows: &[QuotaWindow],
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let mut spans: HashMap<&WindowId, chrono::Duration> = HashMap::new();
+    let mut longest = chrono::Duration::zero();
+    for w in windows {
+        if let Some(span) = w.span() {
+            spans.insert(&w.id, span);
+            longest = longest.max(span);
+        }
+    }
+    if longest <= chrono::Duration::zero() {
+        return;
+    }
+    st.observed_starts.retain(|(owner, window), start| {
+        if owner != account {
+            return true;
+        }
+        let span = spans.get(window).copied().unwrap_or(longest);
+        now - start.estimate() <= span
+    });
+}
+
 /// Whether a *stored* row still reads as an unannounced reset under the rule
 /// compiled in here.
 ///
@@ -332,15 +377,13 @@ impl Daemon {
         // An announced rollover does the opposite — it retires the anchor,
         // because `reset_at` has moved and the provider's own arithmetic is
         // now both correct and more precise than any bracket.
-        for r in &rollovers {
-            let key = (r.account.clone(), r.window.clone());
-            if unannounced(r) {
-                st.observed_starts
-                    .insert(key, ObservedStart::from_rollover(r));
-            } else {
-                st.observed_starts.remove(&key);
-            }
-        }
+        //
+        // Applied only once the poll is on disk. `record_poll` failing is
+        // logged and nothing else, and an anchor kept in memory with no row
+        // behind it is one `hydrate_account` will not rebuild: the map would
+        // then disagree with what any later run reconstructs, for as long as
+        // this process lives. Skipping both arms on a failed write leaves
+        // memory saying exactly what storage does.
         for r in rollovers.iter().filter(|r| r.kind.is_surprise()) {
             tracing::info!(
                 account = %r.account, window = %r.window, kind = r.kind.as_str(),
@@ -349,8 +392,22 @@ impl Daemon {
                 "quota window reset unexpectedly"
             );
         }
-        if let Err(e) = st.storage.record_poll(event, &windows, &rollovers) {
-            tracing::error!(error = %e, poll = %event.id, "failed to persist poll event");
+        match st.storage.record_poll(event, &windows, &rollovers) {
+            Ok(()) => {
+                for r in &rollovers {
+                    let key = (r.account.clone(), r.window.clone());
+                    if unannounced(r) {
+                        st.observed_starts
+                            .insert(key, ObservedStart::from_rollover(r));
+                    } else {
+                        st.observed_starts.remove(&key);
+                    }
+                }
+                prune_anchors(&mut st, &event.account, &windows, event.ts);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, poll = %event.id, "failed to persist poll event")
+            }
         }
         let key = (event.provider.clone(), event.account.clone());
         let health = st.health.entry(key).or_default();
@@ -446,6 +503,8 @@ impl Daemon {
                         st.observed_starts.remove(&key);
                     }
                 }
+                let live: Vec<QuotaWindow> = scales.values().cloned().collect();
+                prune_anchors(&mut st, &account.id, &live, now);
             }
             Err(e) => {
                 tracing::warn!(account = %account.id, error = %e, "failed to restore window anchors")
@@ -933,6 +992,43 @@ mod tests {
             vec![(account().id, window().id)],
             "the announced rollover came first and retires nothing after it"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bound `docs/dashboard.md` promises — "bounded by the window's
+    /// length" — enforced rather than asserted.
+    ///
+    /// Nothing else expresses it. An anchor is retired directly only by a
+    /// later announced rollover, and the provider this feature targets never
+    /// sends one; `effective_window`'s `estimate() > reset_at - span` guard
+    /// moves only when `reset_at` does, which for that provider is never.
+    #[test]
+    fn an_anchor_older_than_its_window_is_pruned() {
+        let dir = std::env::temp_dir().join(format!("teiryod-prune-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // `window()` is a 5-hour window, so a bracket six hours old describes
+        // an instance that has already ended.
+        let expired = dir.join("expired.db");
+        {
+            let old = seeded(&expired);
+            store_rollover(&old, RolloverKind::Unannounced, 90.0, 2.0, 6 * 60);
+        }
+        let restarted = seeded(&expired);
+        restarted.hydrate_account(&account());
+        assert!(anchors(&restarted).is_empty(), "older than its own span");
+
+        // Four hours old is still inside the window it anchors, and survives —
+        // without this half, pruning everything would also pass.
+        let live = dir.join("live.db");
+        {
+            let old = seeded(&live);
+            store_rollover(&old, RolloverKind::Unannounced, 90.0, 2.0, 4 * 60);
+        }
+        let restarted = seeded(&live);
+        restarted.hydrate_account(&account());
+        assert_eq!(anchors(&restarted), vec![(account().id, window().id)]);
 
         std::fs::remove_dir_all(&dir).ok();
     }
