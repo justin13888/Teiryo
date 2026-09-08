@@ -25,6 +25,7 @@ struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-end
 - Client sends the 6-byte Hello. Daemon replies with **one raw byte**: `0x00` accepted, `0x01` version mismatch — then closes the connection on mismatch without ever attempting to decode a `Request`.
 - On mismatch the TUI reports "daemon is vX, client is vY — restart the daemon". **No negotiation, no backward compat** in v1: daemon and TUI ship together; the handshake fails loudly on the unclean case (stale daemon left running across an upgrade), it does not support long-term protocol drift.
 - Any wire-protocol change (variant added/reordered/removed, field change) **must** bump `PROTOCOL_VERSION`.
+- Two recorded fixtures enforce that pairing rather than trusting it: the six Hello bytes are pinned in `handshake.rs`, and one encoded `WindowView` frame is pinned byte for byte in `codec.rs`. A round-trip test cannot see a wire change — both sides move together — so without them a rename, a reorder, or a forgotten bump all passed silently. When either fails legitimately, bump the version, update this file, and re-record the bytes together.
 
 ## Requests & responses
 

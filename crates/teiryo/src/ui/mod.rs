@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn a_row_reports_a_recent_burst_beside_the_average_that_hides_it() {
         let mut app = populated();
-        // The 5-hour window is 3 hours in at 62%, an unremarkable 1.03%
+        // The 5-hour window is 3 hours in at 62%, an unremarkable 1.03×
         // average — but 20 of those points went in the last 20 minutes.
         app.set_recent(
             &AccountId::from("claude:default"),

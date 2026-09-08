@@ -548,6 +548,43 @@ mod tests {
         assert_eq!(w.start_uncertainty, Duration::zero());
     }
 
+    /// `effective_window` applies three filters where the documentation
+    /// describes one, and only the first had a test. Each of the other two is
+    /// a different kind of nonsense to refuse.
+    #[test]
+    fn a_restart_at_or_after_the_reset_is_ignored() {
+        // A bracket whose midpoint lands past `reset_at` describes a window
+        // that begins after it ends. It cannot be the one now running, whatever
+        // produced it — a clock jump, a future-dated row, a provider that
+        // pulled `reset_at` backwards after the rollover was recorded.
+        let ahead = ObservedStart {
+            not_before: now() + Duration::hours(4),
+            not_after: now() + Duration::hours(6),
+        };
+        let w = effective_window(&view(window(30.0, 4), Some(ahead)), now()).unwrap();
+        assert_eq!(w.start, now() - Duration::hours(6), "fell back to nominal");
+        assert_eq!(w.start_uncertainty, Duration::zero());
+    }
+
+    #[test]
+    fn a_restart_not_yet_provably_over_is_ignored() {
+        // `not_after` is the earliest instant the new window was *provably*
+        // running. One in the future has not been proved yet, so the bracket is
+        // not evidence about now — even though its midpoint sits inside the
+        // window and would otherwise be accepted.
+        let unproven = ObservedStart {
+            not_before: now() - Duration::hours(2),
+            not_after: now() + Duration::minutes(30),
+        };
+        assert!(
+            unproven.estimate() > now() - Duration::hours(6) && unproven.estimate() < now(),
+            "precondition: only the not_after clause can reject this"
+        );
+        let w = effective_window(&view(window(30.0, 4), Some(unproven)), now()).unwrap();
+        assert_eq!(w.start, now() - Duration::hours(6), "fell back to nominal");
+        assert_eq!(w.start_uncertainty, Duration::zero());
+    }
+
     #[test]
     fn a_window_without_a_reset_instant_has_no_effective_window() {
         let mut no_reset = window(0.0, 4);

@@ -141,6 +141,24 @@ mod tests {
         }
     }
 
+    /// The six bytes this build opens a connection with, recorded rather than
+    /// recomputed.
+    ///
+    /// Every other test here compares the version against itself:
+    /// `handshake_accepts_matching_version` asks `Hello::current()` on both
+    /// sides, and the mismatch tests use a literal `999`. So the constant that
+    /// exists to announce a wire change could be reverted with the whole suite
+    /// green — the one thing it must never be able to do quietly.
+    ///
+    /// **If this fails, the protocol version moved.** That is correct and
+    /// expected when the wire actually changed: update these bytes and
+    /// `docs/protocol.md` together, as `AGENTS.md` requires. On its own it is
+    /// a revert nobody meant.
+    #[test]
+    fn the_hello_bytes_are_recorded_not_recomputed() {
+        assert_eq!(Hello::current().to_bytes(), [b'T', b'E', b'I', b'R', 6, 0]);
+    }
+
     #[tokio::test]
     async fn handshake_rejects_bad_magic() {
         let (mut client, mut server) = tokio::io::duplex(64);
