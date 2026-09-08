@@ -573,6 +573,174 @@ fn version_mismatch_is_rejected_with_0x01() {
     });
 }
 
+/// An adapter whose window restarts *silently* on its second poll: usage
+/// collapses from 40% to nothing while `reset_at` stays exactly where it was.
+/// This is the shape `reset_at` arithmetic cannot see.
+struct SilentAdapter {
+    polls: std::sync::atomic::AtomicU32,
+    /// Fixed so both polls publish the same instant, which is the point.
+    reset_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[async_trait]
+impl Authenticator for SilentAdapter {
+    async fn discover_accounts(&self) -> Result<Vec<Account>, AuthError> {
+        Ok(vec![stub_account()])
+    }
+    async fn credential_for(&self, _account: &Account) -> Result<Credential, AuthError> {
+        Ok(Credential::ApiKey(SecretString::from("stub-key")))
+    }
+}
+
+#[async_trait]
+impl Prober for SilentAdapter {
+    async fn probe(
+        &self,
+        _account: &Account,
+        _cred: &Credential,
+    ) -> Result<RawResponse, ProbeError> {
+        Ok(RawResponse {
+            status: 200,
+            headers: vec![],
+            body: b"{}".to_vec(),
+            fetched_at: chrono::Utc::now(),
+        })
+    }
+}
+
+impl QuotaParser for SilentAdapter {
+    fn parse(&self, _raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
+        let nth = self
+            .polls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut window = stub_window();
+        window.used = if nth == 0 { 40.0 } else { 0.0 };
+        window.reset_at = Some(self.reset_at);
+        Ok(vec![window])
+    }
+}
+
+impl WindowPresenter for SilentAdapter {
+    fn render_hint(&self, _window: &QuotaWindow) -> RenderHint {
+        RenderHint {
+            style: BarStyle::Percent,
+            warn_threshold: 0.8,
+            critical_threshold: 0.95,
+            note: None,
+        }
+    }
+    fn group_order(&self) -> &[WindowId] {
+        &[]
+    }
+}
+
+impl ProviderAdapter for SilentAdapter {
+    fn id(&self) -> String {
+        "stub".into()
+    }
+}
+
+/// A restart the provider never announced reaches the client as the bracket it
+/// was observed in — the one route by which a dashboard can learn about a
+/// reset older than the handful of hours of series it fetches.
+#[test]
+fn a_silent_restart_reaches_the_client_as_an_observed_start() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let socket = test_socket_path();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let reset_at = chrono::Utc::now() + chrono::Duration::hours(2);
+        let adapters: Vec<Rc<dyn ProviderAdapter>> = vec![Rc::new(SilentAdapter {
+            polls: std::sync::atomic::AtomicU32::new(0),
+            reset_at,
+        })];
+        let config = test_config("poll_interval_secs = 3600\n");
+        let server =
+            tokio::task::spawn_local(teiryod::run(listener, storage, adapters, config.clone()));
+
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        client_handshake(&mut stream).await.expect("handshake");
+        let (mut sink, mut source) = framed(stream).split();
+
+        send_request(
+            &mut sink,
+            &Request::AwaitUpdate {
+                since: PollId::zero(),
+                config_gen: u64::MAX,
+                timeout_ms: 5_000,
+            },
+        )
+        .await;
+        let first = match recv_response(&mut source).await {
+            Response::Update(event) => event,
+            other => panic!("expected startup Update, got {other:?}"),
+        };
+
+        // Spaced off the startup poll for the ULID reason noted above.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        send_request(
+            &mut sink,
+            &Request::PollNow {
+                provider: "stub".into(),
+                account: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_response(&mut source).await,
+            Response::PollAccepted { .. }
+        ));
+        send_request(
+            &mut sink,
+            &Request::AwaitUpdate {
+                since: first.id,
+                config_gen: u64::MAX,
+                timeout_ms: 5_000,
+            },
+        )
+        .await;
+        let second = match recv_response(&mut source).await {
+            Response::Update(event) => event,
+            other => panic!("expected manual Update, got {other:?}"),
+        };
+
+        send_request(
+            &mut sink,
+            &Request::Status {
+                provider: None,
+                account: None,
+            },
+        )
+        .await;
+        match recv_response(&mut source).await {
+            Response::Status(statuses) => {
+                let view = &statuses[0].windows[0];
+                let start = view.observed_start.expect("a restart was observed");
+                // Bracketed by the two polls that straddled it, and estimated
+                // between them — never at either end.
+                assert_eq!(start.not_before, first.ts);
+                assert_eq!(start.not_after, second.ts);
+                assert!(start.estimate() > first.ts && start.estimate() < second.ts);
+                assert_eq!(start.uncertainty(), second.ts - first.ts);
+                // `reset_at` never moved, so nothing else could have said it.
+                assert_eq!(view.window.reset_at, Some(reset_at));
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+
+        send_request(&mut sink, &Request::Shutdown).await;
+        assert!(matches!(recv_response(&mut source).await, Response::Ack));
+        let _ = server.await;
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_file(&config);
+    });
+}
+
 /// An adapter whose window rolls over *early* on its second poll: the first
 /// reading's reset is two hours out, and the next one replaces it anyway.
 struct RollingAdapter {
@@ -738,8 +906,34 @@ fn an_early_rollover_reaches_the_client_with_its_history() {
                 assert_eq!(rollover.prev_used, 88.0);
                 assert_eq!(rollover.new_used, 1.0);
                 assert!(rollover.new_reset_at > rollover.prev_reset_at);
+                // Bracketed by the two polls that straddled it, not stamped
+                // with the instant we happened to notice. Compared in whole
+                // milliseconds: that is the resolution the column stores.
+                assert_eq!(
+                    rollover.prev_observed_at.map(|t| t.timestamp_millis()),
+                    Some(first.ts.timestamp_millis()),
+                );
             }
             other => panic!("expected History, got {other:?}"),
+        }
+
+        // But the live row carries no observed start: this reset moved
+        // `reset_at`, so `reset_at - span` is the provider's own statement of
+        // where the new window began, and it is both correct and more precise
+        // than the bracket. Anchoring on it would only add error.
+        send_request(
+            &mut sink,
+            &Request::Status {
+                provider: None,
+                account: None,
+            },
+        )
+        .await;
+        match recv_response(&mut source).await {
+            Response::Status(statuses) => {
+                assert_eq!(statuses[0].windows[0].observed_start, None);
+            }
+            other => panic!("expected Status, got {other:?}"),
         }
 
         // A window the rollover does not belong to must not inherit it.
