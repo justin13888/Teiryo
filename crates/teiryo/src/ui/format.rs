@@ -178,6 +178,18 @@ fn drawn(text: &str) -> impl Iterator<Item = (&str, usize)> {
     })
 }
 
+/// How many `char`s per cell of budget `truncate` will carry.
+///
+/// A cell budget bounds how wide the result draws but not how long it is: a
+/// grapheme cluster is a base character plus any number of combining marks,
+/// so a single one-cell cluster can be megabytes. The longest cluster real
+/// text produces is a four-person family emoji with per-person skin tones —
+/// eleven `char`s across at least two cells — and Indic clusters run to about
+/// half that rate. Sixteen `char`s per cell is several times that worst case
+/// at every width, so no input a provider could plausibly send is altered;
+/// only text that is padding rather than glyphs reaches the cap.
+const MAX_CHARS_PER_CELL: usize = 16;
+
 /// Truncate to `width` display cells, marking elision with an ellipsis.
 ///
 /// The result is never wider than `width`, including when a two-cell glyph
@@ -185,8 +197,18 @@ fn drawn(text: &str) -> impl Iterator<Item = (&str, usize)> {
 /// can leave the result one cell short of the budget. Short is safe; over is
 /// the bug. A `width` of zero yields the empty string, since even the ellipsis
 /// costs a cell.
+///
+/// Nor is it longer than [`MAX_CHARS_PER_CELL`] per cell of `width`, plus the
+/// ellipsis. `window.label` is server-supplied and the result is cloned into a
+/// `Span` on every frame, so a cell budget alone leaves an unbounded string
+/// being copied sixty times a second to draw one cell.
 pub fn truncate(text: &str, width: usize) -> String {
-    if cells(text) <= width {
+    // `width.max(1)` so that a zero width still admits the ellipsis path
+    // below rather than a cap of zero deciding the answer.
+    let char_cap = MAX_CHARS_PER_CELL.saturating_mul(width.max(1));
+    // Length first, and via `take`, so that a pathological string is never
+    // measured end to end: the loop below stops at the cap too.
+    if text.chars().take(char_cap + 1).count() <= char_cap && cells(text) <= width {
         return text.to_owned();
     }
     if width == 0 {
@@ -199,12 +221,15 @@ pub fn truncate(text: &str, width: usize) -> String {
     let budget = width - 1;
     let mut out = String::new();
     let mut used = 0;
+    let mut chars = 0;
     for (grapheme, w) in drawn(text) {
-        if used + w > budget {
+        let len = grapheme.chars().count();
+        if used + w > budget || chars + len > char_cap {
             break;
         }
         out.push_str(grapheme);
         used += w;
+        chars += len;
     }
     out.push('…');
     out
@@ -404,6 +429,46 @@ mod tests {
         // Even the ellipsis costs a cell, so there is nothing that fits.
         assert_eq!(truncate("abc", 0), "");
         assert_eq!(truncate("", 0), "");
+    }
+
+    /// A cell budget bounds how wide the result draws, not how long it is.
+    ///
+    /// One grapheme cluster carries any number of combining marks and still
+    /// occupies one cell, so `cells(text) <= width` used to hand back the
+    /// input whole however large it was — and `window.label` is server-
+    /// supplied, and the result is cloned into a `Span` every frame.
+    #[test]
+    fn truncate_bounds_the_length_of_what_it_returns() {
+        const WIDTH: usize = 23;
+        let cap = WIDTH * MAX_CHARS_PER_CELL;
+
+        // One grapheme, one cell, a hundred thousand chars.
+        let heavy = "a".to_owned() + &"\u{301}".repeat(100_000);
+        assert_eq!(heavy.graphemes(true).count(), 1);
+        assert_eq!(cells(&heavy), 1);
+        let out = truncate(&heavy, WIDTH);
+        assert!(cells(&out) <= WIDTH, "{} cells", cells(&out));
+        assert!(
+            out.chars().count() <= cap + 1,
+            "returned {} chars for a {WIDTH}-cell column",
+            out.chars().count()
+        );
+
+        // The other way past the cell budget: graphemes that cost nothing, so
+        // the budget never fires however many of them arrive.
+        let controls = "\u{7}".repeat(100_000);
+        assert_eq!(cells(&controls), 0);
+        let out = truncate(&controls, WIDTH);
+        assert!(
+            out.chars().count() <= cap + 1,
+            "returned {} chars for a {WIDTH}-cell column",
+            out.chars().count()
+        );
+
+        // Anything already inside both bounds is returned exactly as before.
+        let ordinary = "Weekly — Opus 東京";
+        assert_eq!(truncate(ordinary, WIDTH), ordinary);
+        assert_eq!(truncate(&"x".repeat(cap), cap), "x".repeat(cap));
     }
 
     /// #14's reproduction, at the width the dashboard actually uses: a
