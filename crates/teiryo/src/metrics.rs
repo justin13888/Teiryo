@@ -101,8 +101,14 @@ pub fn elapsed_fraction(window: &EffectiveWindow, now: DateTime<Utc>) -> Option<
 ///
 /// A fraction rather than a duration, for the reason [`MIN_ELAPSED_FRACTION`]
 /// is one: half an hour is most of a 5-hour window's precision budget and
-/// nothing at all against a weekly one. At a twentieth, an ordinary poll
-/// cadence never trips it and a bracket left by an outage always does.
+/// nothing at all against a weekly one.
+///
+/// At a twentieth, a bracket left by an outage always trips it, and an
+/// ordinary poll cadence trips it only where the effective window is short
+/// enough for one poll interval to be a twentieth of it — under about an hour
+/// at the default three-minute cadence. That is the right answer rather than a
+/// limitation: a start known only to within a poll interval, on a window that
+/// has an hour to run, genuinely is an estimate.
 const MAX_TRUSTED_BRACKET_FRACTION: f64 = 0.05;
 
 /// Whether the window's start is known loosely enough that the numbers
@@ -557,13 +563,61 @@ mod tests {
         // that begins after it ends. It cannot be the one now running, whatever
         // produced it — a clock jump, a future-dated row, a provider that
         // pulled `reset_at` backwards after the rollover was recorded.
-        let ahead = ObservedStart {
-            not_before: now() + Duration::hours(4),
-            not_after: now() + Duration::hours(6),
+        //
+        // Reachable only where `reset_at` is already in the past: while it is
+        // in the future, `not_after <= now < reset_at` forces the estimate
+        // below it, so a bracket ahead of `now` is rejected by *that* clause
+        // and this one is never consulted. A window whose reset has passed and
+        // whose provider has not moved it is the case that gets here.
+        let mut overdue = window(30.0, 4);
+        overdue.reset_at = Some(now() - Duration::hours(1));
+        let after_the_reset = ObservedStart {
+            not_before: now() - Duration::minutes(40),
+            not_after: now() - Duration::minutes(20),
         };
-        let w = effective_window(&view(window(30.0, 4), Some(ahead)), now()).unwrap();
-        assert_eq!(w.start, now() - Duration::hours(6), "fell back to nominal");
+        assert!(
+            after_the_reset.not_after <= now()
+                && after_the_reset.estimate() > now() - Duration::hours(11),
+            "precondition: only the estimate-past-reset clause can reject this"
+        );
+        let w = effective_window(&view(overdue, Some(after_the_reset)), now()).unwrap();
+        assert_eq!(
+            w.start,
+            now() - Duration::hours(11),
+            "fell back to reset_at less the span"
+        );
         assert_eq!(w.start_uncertainty, Duration::zero());
+    }
+
+    /// The threshold `start_is_uncertain` turns on, landed on rather than
+    /// straddled — the same gap this branch closed for the reset constants.
+    #[test]
+    fn a_bracket_exactly_at_the_trusted_fraction_is_still_trusted() {
+        // A restart observed 5 hours ago on a window resetting in 4 leaves an
+        // effective span of 9 hours, a twentieth of which is 27 minutes. The
+        // anchor sits an hour after `reset_at - span`, which the filter needs:
+        // it admits a start strictly later than the provider's arithmetic, so
+        // a bracket centred exactly there is rejected for a different reason
+        // and would test nothing.
+        let exact = ObservedStart {
+            not_before: now() - Duration::hours(5) - Duration::seconds(810),
+            not_after: now() - Duration::hours(5) + Duration::seconds(810),
+        };
+        let w = effective_window(&view(window(30.0, 4), Some(exact)), now()).unwrap();
+        assert_eq!(w.start_uncertainty, Duration::seconds(1620));
+        assert_eq!(w.span(), Duration::hours(9));
+        assert!(
+            !start_is_uncertain(&w),
+            "exactly a twentieth is not over it"
+        );
+
+        // One second wider is.
+        let over = ObservedStart {
+            not_before: exact.not_before - Duration::seconds(1),
+            not_after: exact.not_after,
+        };
+        let w = effective_window(&view(window(30.0, 4), Some(over)), now()).unwrap();
+        assert!(start_is_uncertain(&w));
     }
 
     #[test]
@@ -1318,35 +1372,43 @@ mod properties {
                 )
             })
             .prop_flat_map(|(span_secs, used, remaining_secs, before, after)| {
-                // Where the anchor sits relative to `start`: the same midpoint
-                // arithmetic `ObservedStart::estimate` does.
-                let displacement = (after - before) / 2;
-                // Under this many seconds elapsed there is no pace.
-                // `youngest_measurable` floors its answer at an hour, which is
-                // the wrong end of the question here, so the fraction is
-                // applied directly.
-                let floor = (remaining_secs as f64 * MIN_ELAPSED_FRACTION
-                    / (1.0 - MIN_ELAPSED_FRACTION))
-                    .ceil() as i64;
+                // Where the anchor sits relative to `start`, mirroring
+                // `ObservedStart::estimate` exactly: it adds half the bracket
+                // to `not_before`, which *floors*. Deriving the same quantity
+                // as `(after - before) / 2` truncates toward zero instead, and
+                // is one second out whenever the midpoint falls before `start`
+                // on an odd-width bracket — enough to push a draw one second
+                // past the band and fail the property about one run in a
+                // thousand.
+                let displacement = (before + after) / 2 - before;
+                // Strictly under a twentieth of the effective window is where
+                // `pace` withholds, and `elapsed / (elapsed + remaining) <
+                // 1/20` is `20 * elapsed < elapsed + remaining`, so an elapsed
+                // stretch of at most `remaining / 20` is inside the band with
+                // room to spare. Computed in integers: the same bound taken as
+                // `ceil(remaining * f / (1 - f))` in `f64` rounds *up* when
+                // `remaining` is a multiple of 19, admitting the one draw that
+                // lands exactly on the floor rather than under it.
+                let highest = remaining_secs / 20;
                 // And at least this many, or the bracket's far end has not
                 // passed and `effective_window` drops the anchor entirely.
                 let least = (after - displacement).max(1);
                 debug_assert!(
-                    floor > least,
-                    "the sub-floor band is empty: {least}..{floor} (remaining {remaining_secs})"
+                    highest > least,
+                    "the sub-floor band is empty: {least}..{highest} (remaining {remaining_secs})"
                 );
                 (
                     Just(span_secs),
                     Just(used),
                     Just(remaining_secs),
-                    least..floor,
+                    least..highest,
                     Just(before),
                     Just(after),
                 )
             })
             .prop_map(
                 |(span_secs, used, remaining_secs, elapsed, before, after)| {
-                    let displacement = (after - before) / 2;
+                    let displacement = (before + after) / 2 - before;
                     let early_by = span_secs - remaining_secs - elapsed - displacement;
                     debug_assert!(
                         early_by >= 3600,
@@ -1623,6 +1685,20 @@ mod properties {
                 (got - want).abs() < 1e-9,
                 "reset_between={reset_between}: got {got}, want {want}"
             );
+
+            // Four of the six seeds this replaces belonged to properties about
+            // *order*, so pinning the shape without shuffling it would drop
+            // exactly what they were standing in for. Reversed and duplicated,
+            // the answer must not move: the rate is a property of the readings,
+            // not of the order they arrived off the wire in.
+            let mut jumbled = s.points();
+            jumbled.reverse();
+            jumbled.extend(s.points());
+            let shuffled = recent_pace(&window, &jumbled, gap, now()).expect("a rate");
+            assert!(
+                (shuffled - got).abs() < 1e-9,
+                "reset_between={reset_between}: reordering moved the rate, {shuffled} vs {got}"
+            );
         }
     }
 
@@ -1679,8 +1755,12 @@ mod properties {
         ///
         /// Stated as absences deliberately. This is the one shape
         /// `derived_numbers_stay_in_range` structurally cannot check — its
-        /// arms are all `if let Some(..)` — so without this property, deleting
-        /// both of `pace`'s blanking gates passes the whole suite.
+        /// arms are all `if let Some(..)`, so it draws from this band and
+        /// asserts nothing when it lands there, and deleting both of `pace`'s
+        /// gates leaves *it* green at 200,000 cases. Two hand-written unit
+        /// tests do catch that mutation; what none of them cover is the band
+        /// reached through `effective_window` from a generated bracket, which
+        /// is the path the anchoring feature actually takes.
         #[test]
         fn a_window_too_young_to_pace_withholds_what_rests_on_its_start(
             w in early_reset_too_young_to_pace(),

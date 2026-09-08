@@ -101,13 +101,20 @@ fn unannounced(rollover: &WindowRollover) -> bool {
 ///
 /// The bound is the window's own length. A rolling window of span `S` that
 /// began at `T` has ended by `T + S`, so a bracket older than that describes
-/// an instance that is over. A window the payload no longer carries is judged
-/// against the longest span the account still publishes, there being no span
-/// of its own left to ask for; with no spans at all there is nothing to judge
-/// against, and nothing is pruned.
+/// an instance that is over.
 ///
-/// This is the bound `docs/dashboard.md` claims — "bounded by the window's
-/// length" — expressed in code rather than asserted in prose.
+/// A window missing from this payload is *not* judged. It has no span left to
+/// ask for, and borrowing another window's would delete a live anchor: an
+/// account with a 5-hour and a weekly window, three days into an observed
+/// weekly restart, loses that anchor the first time one payload omits `weekly`
+/// — after which the pace falls back to `reset_at - 7d`, an instant inside a
+/// window that already ended, and stays there until the next observed restart.
+/// A window absent from a payload is evidence about the payload, which is
+/// exactly what `rollover::detect` says about the same case.
+///
+/// `docs/domain.md` calls the related risk "bounded by the window's length",
+/// of a restart missed entirely. This is the same bound applied to the anchor
+/// map's own contents, which nothing previously expressed at all.
 fn prune_anchors(
     st: &mut SharedState,
     account: &AccountId,
@@ -129,8 +136,10 @@ fn prune_anchors(
         if owner != account {
             return true;
         }
-        let span = spans.get(window).copied().unwrap_or(longest);
-        now - start.estimate() <= span
+        match spans.get(window) {
+            Some(span) => now - start.estimate() <= *span,
+            None => true,
+        }
     });
 }
 
@@ -378,12 +387,15 @@ impl Daemon {
         // because `reset_at` has moved and the provider's own arithmetic is
         // now both correct and more precise than any bracket.
         //
-        // Applied only once the poll is on disk. `record_poll` failing is
-        // logged and nothing else, and an anchor kept in memory with no row
-        // behind it is one `hydrate_account` will not rebuild: the map would
-        // then disagree with what any later run reconstructs, for as long as
-        // this process lives. Skipping both arms on a failed write leaves
-        // memory saying exactly what storage does.
+        // Applied whatever the write below does. A failed `record_poll` costs
+        // durability, not truth: the restart was still observed, and this is
+        // the only poll pair that can see it. Withholding the anchor until the
+        // row lands looks tidier and is worse — `latest_success` is replaced
+        // regardless a few lines down, so the next poll compares against a
+        // payload that was never persisted, the collapse is never detected
+        // again, and the anchor is lost for the rest of the window instance
+        // rather than for one poll. Nor would it make memory agree with
+        // storage, for the same reason.
         for r in rollovers.iter().filter(|r| r.kind.is_surprise()) {
             tracing::info!(
                 account = %r.account, window = %r.window, kind = r.kind.as_str(),
@@ -392,22 +404,18 @@ impl Daemon {
                 "quota window reset unexpectedly"
             );
         }
-        match st.storage.record_poll(event, &windows, &rollovers) {
-            Ok(()) => {
-                for r in &rollovers {
-                    let key = (r.account.clone(), r.window.clone());
-                    if unannounced(r) {
-                        st.observed_starts
-                            .insert(key, ObservedStart::from_rollover(r));
-                    } else {
-                        st.observed_starts.remove(&key);
-                    }
-                }
-                prune_anchors(&mut st, &event.account, &windows, event.ts);
+        for r in &rollovers {
+            let key = (r.account.clone(), r.window.clone());
+            if unannounced(r) {
+                st.observed_starts
+                    .insert(key, ObservedStart::from_rollover(r));
+            } else {
+                st.observed_starts.remove(&key);
             }
-            Err(e) => {
-                tracing::error!(error = %e, poll = %event.id, "failed to persist poll event")
-            }
+        }
+        prune_anchors(&mut st, &event.account, &windows, event.ts);
+        if let Err(e) = st.storage.record_poll(event, &windows, &rollovers) {
+            tracing::error!(error = %e, poll = %event.id, "failed to persist poll event");
         }
         let key = (event.provider.clone(), event.account.clone());
         let health = st.health.entry(key).or_default();
@@ -859,13 +867,25 @@ mod tests {
         new_used: f64,
         minutes_ago: i64,
     ) {
+        store_rollover_of(daemon, window(), kind, prev_used, new_used, minutes_ago);
+    }
+
+    /// As [`store_rollover`], for a window whose span the test chooses.
+    fn store_rollover_of(
+        daemon: &Daemon,
+        window: QuotaWindow,
+        kind: RolloverKind,
+        prev_used: f64,
+        new_used: f64,
+        minutes_ago: i64,
+    ) {
         let observed_at = chrono::Utc::now() - chrono::Duration::minutes(minutes_ago);
         let ev = event(PollOutcome::Success {
-            windows: vec![window()],
+            windows: vec![window.clone()],
         });
         let rollover = WindowRollover {
             account: account().id,
-            window: window().id,
+            window: window.id.clone(),
             poll: ev.id,
             observed_at,
             kind,
@@ -879,7 +899,7 @@ mod tests {
             .state
             .borrow_mut()
             .storage
-            .record_poll(&ev, &[window()], &[rollover])
+            .record_poll(&ev, std::slice::from_ref(&window), &[rollover])
             .unwrap();
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -1047,8 +1067,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The bound `docs/dashboard.md` promises — "bounded by the window's
-    /// length" — enforced rather than asserted.
+    /// The bound `docs/domain.md` describes — "bounded by the window's
+    /// length" — enforced on the anchor map rather than left to prose.
     ///
     /// Nothing else expresses it. An anchor is retired directly only by a
     /// later announced rollover, and the provider this feature targets never
@@ -1087,21 +1107,136 @@ mod tests {
     /// `ANCHOR_LOOKBACK` bounds the replay. A reset older than it belongs to a
     /// window instance long finished, and reading further back would scan a
     /// database kept for months on every startup.
+    ///
+    /// The fixture window is 30 days long on purpose. With the 5-hour one,
+    /// `prune_anchors` drops the anchor for being older than its own window
+    /// before the lookback is ever consulted — so widening the query to ten
+    /// years left this test green and it pinned nothing. The row has to be
+    /// older than the lookback and younger than the window it anchors.
     #[test]
     fn replay_ignores_rollovers_older_than_the_anchor_lookback() {
         let dir = std::env::temp_dir().join(format!("teiryod-lookback-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("teiryo.db");
+        let long = || {
+            let mut w = window();
+            w.reset_kind = ResetKind::Rolling(Duration::from_secs(30 * 24 * 3600));
+            w
+        };
 
         {
             let old = seeded(&path);
             let past = ANCHOR_LOOKBACK.num_minutes() + 60;
-            store_rollover(&old, RolloverKind::Unannounced, 90.0, 2.0, past);
+            store_rollover_of(&old, long(), RolloverKind::Unannounced, 90.0, 2.0, past);
         }
-
         let restarted = seeded(&path);
         restarted.hydrate_account(&account());
-        assert!(anchors(&restarted).is_empty());
+        assert!(anchors(&restarted).is_empty(), "older than the lookback");
+
+        // A day inside the lookback, and well inside the 30-day window, so the
+        // lookback is the only thing that could have excluded the one above.
+        let inside = dir.join("inside.db");
+        {
+            let old = seeded(&inside);
+            let recent = ANCHOR_LOOKBACK.num_minutes() - 24 * 60;
+            store_rollover_of(&old, long(), RolloverKind::Unannounced, 90.0, 2.0, recent);
+        }
+        let restarted = seeded(&inside);
+        restarted.hydrate_account(&account());
+        assert_eq!(anchors(&restarted), vec![(account().id, window().id)]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The live pruning path, which only `hydrate_account`'s was covering —
+    /// and the live one is the whole point: the doc is about a process that
+    /// keeps running, which is exactly where hydration never happens again.
+    #[test]
+    fn a_running_daemon_prunes_an_anchor_its_window_outlived() {
+        let dir = std::env::temp_dir().join(format!("teiryod-liveprune-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = seeded(&dir.join("teiryo.db"));
+
+        let at = |used: f64, reset_at| {
+            let mut w = window();
+            w.used = used;
+            w.reset_at = Some(reset_at);
+            w
+        };
+        let reset = chrono::Utc::now() + chrono::Duration::hours(2);
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![at(90.0, reset)],
+        }));
+        std::thread::sleep(Duration::from_millis(2));
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![at(2.0, reset)],
+        }));
+        assert_eq!(
+            anchors(&daemon),
+            vec![(account().id, window().id)],
+            "precondition: the silent restart anchored the window"
+        );
+
+        // Six hours on, past the 5-hour window the anchor belongs to. No
+        // announced rollover ever arrives — the provider does not move
+        // `reset_at`, which is the case this bound exists for.
+        std::thread::sleep(Duration::from_millis(2));
+        let mut later = event(PollOutcome::Success {
+            windows: vec![at(3.0, reset)],
+        });
+        later.ts = chrono::Utc::now() + chrono::Duration::hours(6);
+        daemon.record_event(&later);
+        assert!(
+            anchors(&daemon).is_empty(),
+            "a running daemon must not keep an anchor its window outlived"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A window missing from one payload must not cost its anchor.
+    ///
+    /// Judging it against the longest span the account still publishes deletes
+    /// a live anchor: three days into an observed weekly restart, the first
+    /// payload that omits `weekly` leaves only the 5-hour span to compare
+    /// against, and the weekly anchor is older than that. The pace then falls
+    /// back to an instant inside a window that already ended — the exact
+    /// under-reporting this branch exists to fix.
+    #[test]
+    fn a_window_absent_from_one_payload_keeps_its_anchor() {
+        let dir = std::env::temp_dir().join(format!("teiryod-partial-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = seeded(&dir.join("teiryo.db"));
+
+        let weekly = |used: f64| {
+            let mut w = window();
+            w.id = WindowId::from("weekly");
+            w.reset_kind = ResetKind::Rolling(Duration::from_secs(7 * 24 * 3600));
+            w.used = used;
+            w.reset_at = Some(chrono::Utc::now() + chrono::Duration::days(4));
+            w
+        };
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![window(), weekly(90.0)],
+        }));
+        std::thread::sleep(Duration::from_millis(2));
+        daemon.record_event(&event(PollOutcome::Success {
+            windows: vec![window(), weekly(2.0)],
+        }));
+        let anchored = (account().id, WindowId::from("weekly"));
+        assert!(anchors(&daemon).contains(&anchored), "precondition");
+
+        // Three days on, one payload omits the weekly window entirely.
+        std::thread::sleep(Duration::from_millis(2));
+        let mut partial = event(PollOutcome::Success {
+            windows: vec![window()],
+        });
+        partial.ts = chrono::Utc::now() + chrono::Duration::days(3);
+        daemon.record_event(&partial);
+        assert!(
+            anchors(&daemon).contains(&anchored),
+            "a payload omitting a window says nothing about that window's anchor"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

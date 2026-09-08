@@ -66,9 +66,13 @@ restart it actually saw (see [domain.md](domain.md#window-rollovers)), and
   than the clock alone suggests. `pace`, `cap in`, `afford` and `→…% at reset`
   all move together with it.
 - `start_uncertainty` carries the bracket's width — a poll interval in normal
-  running, as wide as a daemon outage otherwise. Nothing renders it yet; it is
-  there so a field derived from a days-wide bracket can be dimmed rather than
-  presented as measured.
+  running, as wide as a daemon outage otherwise. A field measured from a start
+  known only that loosely is marked `~` rather than presented as measured:
+  `~1.86× pace`, `cap in ~2h`, `→~186% at reset`. The threshold is a twentieth
+  of the effective window, a fraction for the same reason the pace floor is
+  one. `afford` carries no mark, because it divides the remaining budget by the
+  time left to `reset_at` and never touches the start; nor does `now`, which is
+  measured over the recent series. The help overlay lists the mark.
 
 Only the daemon can supply this. The TUI fetches 12 hours of series, and the
 reset anchoring a weekly window is routinely days older than that, so there is
