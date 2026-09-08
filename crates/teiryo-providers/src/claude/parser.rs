@@ -1184,8 +1184,10 @@ mod tests {
 
     #[test]
     fn malformed_limits_rows_are_ignored() {
-        let windows = parse(&raw(
-            200,
+        let mut windows = Vec::new();
+        let logs = captured_logs(|| {
+            windows = parse(&raw(
+                200,
             r#"{"five_hour":{"utilization":5},
                 "limits":[
                     "not an object",
@@ -1197,12 +1199,21 @@ mod tests {
                     {"kind":"weekly_scoped","percent":6,
                      "scope":{"model":{"display_name":"Fable 5.1"}}}
                 ]}"#,
-        ))
-        .unwrap();
+            ))
+            .unwrap();
+        });
         let ids: Vec<_> = windows.iter().map(|w| w.id.0.as_str()).collect();
         assert_eq!(ids, ["session_5h", "weekly_fable_5_1"]);
         assert_eq!(windows[1].scope, WindowScope::Model("fable_5_1".to_owned()));
         assert_eq!(windows[1].label, "Weekly — Fable 5.1");
+        // The two rows this parser cannot decode at all — the bare string and
+        // the one whose `scope` is a string — are the only silent losses left
+        // if the warning goes: nothing about them reaches the ids above.
+        assert_eq!(
+            logs.matches("skipping unreadable limits[] row").count(),
+            2,
+            "{logs}"
+        );
     }
 
     #[test]
