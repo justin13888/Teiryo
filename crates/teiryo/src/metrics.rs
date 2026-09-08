@@ -1667,12 +1667,6 @@ mod properties {
             );
         }
 
-        /// **P10 — every derived number is well-formed.** Whatever the window's
-        /// shape, a `Some` is finite and in range: a pace is non-negative, an
-        /// elapsed fraction is a fraction, a runway does not run backwards, and
-        /// a projected cap lies between now and the reset — which is the whole
-        /// content of `eta_to_cap` returning `Some`.
-        #[test]
         /// **P11 — a window too young to pace withholds every number measured
         /// from its start, and only those.**
         ///
@@ -1706,6 +1700,12 @@ mod properties {
             );
         }
 
+        /// **P10 — every derived number is well-formed.** Whatever the window's
+        /// shape, a `Some` is finite and in range: a pace is non-negative, an
+        /// elapsed fraction is a fraction, a runway does not run backwards, and
+        /// a projected cap lies between now and the reset — which is the whole
+        /// content of `eta_to_cap` returning `Some`.
+        #[test]
         fn derived_numbers_stay_in_range(w in early_reset()) {
             let effective = effective_window(&w.view(), now()).expect("a reset instant");
             prop_assert!(effective.start < effective.reset_at, "window runs backwards");
