@@ -20,7 +20,8 @@ use crate::app::{App, DetailTab, Pane, TimeRange, Trend};
 use crate::metrics;
 use crate::metrics::{Boundary, BoundaryKind};
 use crate::ui::format::{
-    format_countdown, format_elapsed, outcome_text, trigger_glyph, truncate, usage_text,
+    format_countdown, format_elapsed, outcome_text, pad_to_cells, trigger_glyph, truncate,
+    usage_text,
 };
 use crate::ui::theme;
 
@@ -494,12 +495,15 @@ fn activity_line(event: &PollEvent, now: DateTime<Utc>) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!(" {} ", trigger_glyph(&event.trigger)), theme::dim()),
         Span::styled(event.ts.format("%H:%M:%S").to_string(), theme::dim()),
+        // Padded in cells like the label column, not by `format!`'s char
+        // count: mixing the two is how a cell-truncated string ends up
+        // char-padded and the row's later columns shift.
         Span::raw(format!(
-            "  {:<22}",
-            truncate(&event.account.to_string(), 21)
+            "  {}",
+            pad_to_cells(&truncate(&event.account.to_string(), 21), 22)
         )),
         Span::styled(
-            format!("{:<40}", truncate(&text, 39)),
+            pad_to_cells(&truncate(&text, 39), 40),
             Style::default().fg(if failed { theme::CRIT } else { theme::OK }),
         ),
         Span::styled(format!("{:>7}ms", event.latency_ms), theme::dim()),
@@ -571,8 +575,8 @@ fn account_lines(provider: &ProviderHealth, now: DateTime<Utc>) -> Vec<Line<'sta
                 Style::default().fg(if healthy { theme::OK } else { theme::CRIT }),
             ),
             Span::raw(format!(
-                "  {:<24}",
-                truncate(&account.account.to_string(), 23)
+                "  {}",
+                pad_to_cells(&truncate(&account.account.to_string(), 23), 24)
             )),
         ];
         if !healthy {

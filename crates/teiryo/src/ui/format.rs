@@ -2,6 +2,8 @@
 //! value-in, string-out function so it can be tested directly.
 
 use chrono::{DateTime, Utc};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use teiryo_core::domain::{PollOutcome, PollTrigger, QuotaUnit, QuotaWindow};
 use teiryo_core::PollEvent;
@@ -135,8 +137,6 @@ pub fn trigger_glyph(trigger: &PollTrigger) -> &'static str {
     }
 }
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
 /// One-word outcome for a poll event, plus whether it was a failure.
 pub fn outcome_text(event: &PollEvent) -> (String, bool) {
     match &event.outcome {
@@ -153,8 +153,29 @@ pub fn outcome_text(event: &PollEvent) -> (String, bool) {
 /// width against one shared row budget, so a label measured in chars pushes
 /// each column after it to the right and clips the last one — with the data
 /// still correct, which is what makes it hard to see.
+///
+/// Measured per *grapheme*, which is what ratatui does. Summing per `char`
+/// gets emoji wrong in the widening direction: `U+FE0F`, the variation
+/// selector that makes `❤` render as an emoji, is zero cells on its own and
+/// makes the pair two — so a char-wise sum reads 1 where the terminal draws 2,
+/// and a column of them overruns by its own length again.
 pub fn cells(text: &str) -> usize {
-    UnicodeWidthStr::width(text)
+    drawn(text).map(|(_, w)| w).sum()
+}
+
+/// The graphemes of `text` with the width each will actually be drawn at.
+///
+/// A grapheme carrying a control character is charged nothing, because ratatui
+/// discards it rather than drawing it. Charging it a cell would shed a field
+/// that fits.
+fn drawn(text: &str) -> impl Iterator<Item = (&str, usize)> {
+    text.graphemes(true).map(|g| {
+        if g.chars().any(char::is_control) {
+            (g, 0)
+        } else {
+            (g, UnicodeWidthStr::width(g))
+        }
+    })
 }
 
 /// Truncate to `width` display cells, marking elision with an ellipsis.
@@ -162,24 +183,27 @@ pub fn cells(text: &str) -> usize {
 /// The result is never wider than `width`, including when a two-cell glyph
 /// straddles the boundary: that glyph is dropped rather than half-drawn, which
 /// can leave the result one cell short of the budget. Short is safe; over is
-/// the bug.
+/// the bug. A `width` of zero yields the empty string, since even the ellipsis
+/// costs a cell.
 pub fn truncate(text: &str, width: usize) -> String {
     if cells(text) <= width {
         return text.to_owned();
     }
-    if width <= 1 {
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
         return "…".to_owned();
     }
     // One cell reserved for the ellipsis, which is itself one cell wide.
     let budget = width - 1;
     let mut out = String::new();
     let mut used = 0;
-    for c in text.chars() {
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+    for (grapheme, w) in drawn(text) {
         if used + w > budget {
             break;
         }
-        out.push(c);
+        out.push_str(grapheme);
         used += w;
     }
     out.push('…');
@@ -339,6 +363,47 @@ mod tests {
         assert_eq!(cells(&truncate(wide, 6)), 5);
         // ASCII is unaffected, which is what keeps every existing budget sound.
         assert_eq!(cells("truncate me"), 11);
+    }
+
+    /// The other class of glyph a per-char sum gets wrong, and in the
+    /// dangerous direction.
+    ///
+    /// `U+FE0F` is the variation selector that renders `❤` as an emoji. On its
+    /// own it is zero cells, so a char-wise sum reads the pair as 1 — while
+    /// ratatui measures the grapheme and draws 2. A column of them therefore
+    /// overran by its own length again, which is #14's symptom reached through
+    /// a different input.
+    #[test]
+    fn truncate_charges_an_emoji_sequence_what_the_terminal_draws() {
+        let heart = "\u{2764}\u{FE0F}";
+        assert_eq!(cells(heart), 2, "one grapheme, two cells");
+        assert_eq!(cells(&heart.repeat(5)), 10);
+        assert!(cells(&truncate(&heart.repeat(5), 6)) <= 6);
+        // The keycap sequence is the same shape: three chars, two cells.
+        assert_eq!(cells("1\u{FE0F}\u{20E3}"), 2);
+        // And the label column holds, which a per-char sum did not.
+        let column = 24;
+        let drawn = pad_to_cells(&truncate(&heart.repeat(13), column - 1), column);
+        assert_eq!(cells(&drawn), column);
+    }
+
+    /// A control character is discarded by ratatui rather than drawn, so it
+    /// costs no cells. Charging it one sheds a field that would have fit.
+    #[test]
+    fn a_control_character_costs_no_cells() {
+        assert_eq!(cells("\u{7}"), 0);
+        assert_eq!(cells("ab\u{7}c"), 3);
+        // Consistent with the budget check, which used to disagree with the
+        // loop: `cells` said 10 while the loop charged 0, so the early return
+        // was skipped and every control character was emitted anyway.
+        assert_eq!(truncate(&"\u{7}".repeat(10), 6), "\u{7}".repeat(10));
+    }
+
+    #[test]
+    fn truncate_to_no_width_yields_nothing() {
+        // Even the ellipsis costs a cell, so there is nothing that fits.
+        assert_eq!(truncate("abc", 0), "");
+        assert_eq!(truncate("", 0), "");
     }
 
     /// #14's reproduction, at the width the dashboard actually uses: a

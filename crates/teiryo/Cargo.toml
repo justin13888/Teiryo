@@ -20,5 +20,9 @@ ratatui.workspace = true
 # emoji are two cells wide, combining marks are zero. ratatui charges each span
 # its real width, so counting chars overruns the budget silently.
 unicode-width = "0.2"
+# Widths are charged per *grapheme*, which is how ratatui measures: an emoji
+# and its variation selector are one drawn cell-pair, not two independent
+# chars whose widths sum.
+unicode-segmentation = "1"
 tokio.workspace = true
 tokio-util.workspace = true
