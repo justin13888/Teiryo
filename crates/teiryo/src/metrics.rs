@@ -102,12 +102,17 @@ pub fn elapsed_fraction(window: &EffectiveWindow, now: DateTime<Utc>) -> Option<
 /// Under a linear model this is also the projected utilization at reset — a
 /// pace of `1.3` says you would finish the window at 130%, i.e. hit the cap
 /// early. The two are deliberately not separate functions.
+///
+/// [`MIN_ELAPSED_FRACTION`] is the only floor, deliberately. An absolute one
+/// beside it would blank the number past the point `docs/dashboard.md`
+/// promises it returns, and it would bite exactly where this module's own
+/// feature makes it reachable: an effective span is `reset_at` less an
+/// *observed* start, so a restart seen an hour before the reset leaves a
+/// window whose twentieth is three minutes. Flooring the fraction is what
+/// bounds the result, at `1 / MIN_ELAPSED_FRACTION`.
 pub fn pace(window: &EffectiveWindow, now: DateTime<Utc>) -> Option<f64> {
     let elapsed = elapsed_fraction(window, now)?;
     if elapsed < MIN_ELAPSED_FRACTION {
-        return None;
-    }
-    if now - window.start < Duration::seconds(MIN_SAMPLE_SECS) {
         return None;
     }
     Some(window.used? / elapsed)
@@ -532,6 +537,33 @@ mod tests {
         assert_eq!(pace(&effective(30.0, 4), now()), Some(0.5));
         // A window that just started cannot be extrapolated from.
         assert_eq!(pace(&effective(0.0, 10), now()), None);
+    }
+
+    #[test]
+    fn a_short_effective_span_pays_the_fraction_and_no_absolute_floor() {
+        // The case an observed start makes reachable, and the one an absolute
+        // seconds floor would have blanked: a 5-hour window whose restart was
+        // seen an hour before its reset runs for an effective 3600 s, so the
+        // documented twentieth is 180 s. At 225 s elapsed the window is past
+        // it and the number is owed, even though 225 s is a short stretch in
+        // absolute terms — which is the whole argument `docs/dashboard.md`
+        // makes for a fraction over a duration.
+        let mut short = window(25.0, 0);
+        short.reset_kind = ResetKind::Rolling(std::time::Duration::from_secs(5 * 3600));
+        short.reset_at = Some(now() + Duration::seconds(3375));
+        let observed = ObservedStart {
+            not_before: now() - Duration::seconds(255),
+            not_after: now() - Duration::seconds(195),
+        };
+        let w = effective_window(&view(short, Some(observed)), now()).unwrap();
+        assert_eq!(w.start, now() - Duration::seconds(225));
+        assert_eq!(w.span(), Duration::seconds(3600));
+        // 225/3600 is 0.0625, comfortably over the 0.05 floor, so a quarter of
+        // the budget spent a sixteenth of the way in is 4× the affordable rate.
+        assert_eq!(elapsed_fraction(&w, now()), Some(0.0625));
+        assert_eq!(pace(&w, now()), Some(4.0));
+        // And the fraction floor still bounds it: one second in, nothing.
+        assert_eq!(pace(&w, w.start + Duration::seconds(1)), None);
     }
 
     #[test]

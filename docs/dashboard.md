@@ -85,9 +85,12 @@ The five derived fields, and why each is not the others:
   extrapolated from five minutes. The threshold is a *fraction* rather than a
   duration because the same five minutes is a twentieth of a short window and
   a fourteen-hundredth of a weekly one; flooring the fraction is what bounds
-  the number, at `1 / MIN_ELAPSED_FRACTION`. `now` is unaffected and carries
-  the signal over that stretch, which is where a burst right after a reset
-  shows.
+  the number, at `1 / MIN_ELAPSED_FRACTION`. There is deliberately no absolute
+  floor beside it: an effective span is `reset_at` less an *observed* start, so
+  a restart seen an hour before the reset leaves a window whose twentieth is
+  three minutes, and a seconds threshold would blank the row past the point
+  this rule promises it returns. `now` is unaffected and carries the signal
+  over that stretch, which is where a burst right after a reset shows.
 - **`now`** — `recent_pace`, the same scale over a lookback of a tenth of the
   window. This is the one that moves when the user does. It is the only field
   needing history, and it stays blank until enough of it exists.
