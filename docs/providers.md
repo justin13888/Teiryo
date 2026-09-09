@@ -23,7 +23,8 @@ trait QuotaParser: Send + Sync {
 
 trait WindowPresenter: Send + Sync {
     fn render_hint(&self, window: &QuotaWindow) -> RenderHint; // TUI stays provider-agnostic
-    fn group_order(&self) -> &[WindowId];                      // display grouping/order
+    // No display-order method: windows are drawn in the order the parser
+    // emits them, which is the only ordering anything reads.
 }
 
 trait ProviderAdapter: Authenticator + Prober + QuotaParser + WindowPresenter {

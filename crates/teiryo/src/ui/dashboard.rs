@@ -12,8 +12,8 @@ use teiryo_core::{AccountStatus, QuotaSnapshot, WindowView};
 use crate::app::{App, Pane, RowRef};
 use crate::metrics;
 use crate::ui::format::{
-    format_countdown, format_elapsed, format_span, outcome_text, text_bar_fine, truncate,
-    usage_short,
+    cells, format_countdown, format_elapsed, format_span, outcome_text, pad_to_cells,
+    text_bar_fine, truncate, usage_short,
 };
 use crate::ui::theme;
 
@@ -308,9 +308,12 @@ fn gauge_line(
         .clamp(MIN_BAR, 48);
 
     let mut spans = vec![Span::raw(" ".repeat(INDENT))];
-    spans.push(Span::raw(format!(
-        "{:<LABEL$}",
-        truncate(&window.label, LABEL - 1)
+    // Padded by cells, not by `format!`'s char count: a label carrying any
+    // wide glyph is otherwise padded too little, and every column after it on
+    // the row shifts right by the difference.
+    spans.push(Span::raw(pad_to_cells(
+        &truncate(&window.label, LABEL - 1),
+        LABEL,
     )));
 
     match metrics::utilization(window) {
@@ -434,14 +437,16 @@ fn derived_line(
     let mut spans = vec![Span::raw(" ".repeat(INDENT))];
     let mut used = INDENT;
     for (text, style) in fields {
-        // Counted in cells, not bytes: the separator's "·" is two bytes wide
-        // and one column, and so are the glyphs inside the fields.
-        let separator = if used > INDENT {
-            SEPARATOR.chars().count()
-        } else {
-            0
-        };
-        let cost = text.chars().count() + separator;
+        // Counted in cells, for consistency with every other budget here
+        // rather than to fix a live defect: every field on this line is
+        // formatted locally from numbers, and `▲ ▼ × → ·` are all one cell, so
+        // today a char count gives the same answer. An earlier pass moved this
+        // off `str::len`, which did overstate the separator by a byte. Chars
+        // are simply the wrong unit for a budget ratatui charges in cells, and
+        // the day a field here carries provider text — the label column
+        // already does — the units have to already agree.
+        let separator = if used > INDENT { cells(SEPARATOR) } else { 0 };
+        let cost = cells(&text) + separator;
         if used + cost > width {
             break;
         }
@@ -479,5 +484,97 @@ fn pace_span(view: &WindowView, now: DateTime<Utc>) -> Span<'static> {
             )
         }
         None => Span::raw(""),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use teiryo_core::domain::{QuotaUnit, QuotaWindow, ResetKind, WindowId, WindowScope};
+    use teiryo_core::rollover::ObservedStart;
+    use teiryo_core::{BarStyle, RenderHint};
+
+    use crate::ui::format::cells;
+
+    fn view(label: &str) -> WindowView {
+        WindowView {
+            window: QuotaWindow {
+                id: WindowId::from("weekly_model"),
+                label: label.to_owned(),
+                scope: WindowScope::Model("model".into()),
+                reset_kind: ResetKind::Rolling(std::time::Duration::from_secs(7 * 24 * 3600)),
+                unit: QuotaUnit::Percent,
+                used: 62.0,
+                limit: Some(100.0),
+                reset_at: Some(Utc::now() + chrono::Duration::hours(2)),
+            },
+            hint: RenderHint {
+                style: BarStyle::Percent,
+                warn_threshold: 0.8,
+                critical_threshold: 0.95,
+                note: None,
+            },
+            observed_start: None,
+        }
+    }
+
+    /// The same window, but with its start known only to a twelve-hour
+    /// bracket — wide enough against a seven-day span for
+    /// `metrics::start_is_uncertain`, so every field measured from the start
+    /// carries the `~` mark and costs a cell more than the plain view's.
+    fn uncertain_view(label: &str) -> WindowView {
+        WindowView {
+            observed_start: Some(ObservedStart {
+                not_before: Utc::now() - chrono::Duration::hours(20),
+                not_after: Utc::now() - chrono::Duration::hours(8),
+            }),
+            ..view(label)
+        }
+    }
+
+    /// The label column is exactly its budget whatever the label is made of.
+    ///
+    /// Asserted against `gauge_line` rather than against the two helpers it
+    /// composes: measuring `pad_to_cells(&truncate(..))` inline proves the
+    /// helpers and leaves the call site free to use either one wrongly, which
+    /// is what it did — reverting this line to `format!("{:<LABEL$}", ..)` left
+    /// every test in the crate green.
+    #[test]
+    fn the_label_column_holds_its_width_for_any_label() {
+        const LABEL: usize = 24;
+        for label in [
+            "Weekly",
+            "Weekly — a fairly long model name that will not fit",
+            // A server-supplied model name is the reason any of this matters,
+            // and these are the three shapes a char count gets wrong.
+            "Weekly — Opus 東京東京東京東京",
+            "Weekly — \u{2764}\u{FE0F}\u{2764}\u{FE0F}\u{2764}\u{FE0F}\u{2764}\u{FE0F}",
+            "Weekly — Ope\u{301}ra",
+        ] {
+            let line = gauge_line(&view(label), 120, Utc::now(), false);
+            let drawn = cells(&line.spans[1].content);
+            assert_eq!(
+                drawn, LABEL,
+                "label {label:?} drew {drawn} cells in a {LABEL}-cell column"
+            );
+        }
+    }
+
+    /// The derived line's own budget is in cells too, so a wide field costs
+    /// what it draws rather than what it counts.
+    #[test]
+    fn the_derived_line_budgets_in_cells() {
+        // Wide enough for every field, then narrow enough that the budget has
+        // to shed some: the line must never exceed the width it was given.
+        // Both marked and unmarked, since the `~` on a bracketed start costs
+        // a cell per field that the budget still has to fit.
+        for view in [view("Weekly"), uncertain_view("Weekly")] {
+            for width in [120, 60, 44, 30] {
+                let line = derived_line(&view, &[], 60, width, Utc::now())
+                    .expect("a window with a reset instant has derived numbers");
+                let drawn: usize = line.spans.iter().map(|s| cells(&s.content)).sum();
+                assert!(drawn <= width, "drew {drawn} cells into {width}");
+            }
+        }
     }
 }

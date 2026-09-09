@@ -53,7 +53,6 @@ pub struct ClaudeAdapter {
     /// One persistent HTTP client per account — separate accounts must not
     /// share a connection pool; reuse across probes keeps connection fidelity.
     clients: Mutex<HashMap<AccountId, reqwest::Client>>,
-    group_order: Vec<WindowId>,
 }
 
 impl Default for ClaudeAdapter {
@@ -79,7 +78,6 @@ impl ClaudeAdapter {
             credentials_path,
             base_url,
             clients: Mutex::new(HashMap::new()),
-            group_order: parser::group_order(),
         }
     }
 
@@ -201,10 +199,6 @@ impl WindowPresenter for ClaudeAdapter {
             note: Some("Blocks entirely at cap".to_owned()),
         }
     }
-
-    fn group_order(&self) -> &[WindowId] {
-        &self.group_order
-    }
 }
 
 impl ProviderAdapter for ClaudeAdapter {
@@ -227,17 +221,31 @@ mod tests {
         assert_eq!(hint.note.as_deref(), Some("Blocks entirely at cap"));
     }
 
+    /// The ordering `group_order` used to declare, asserted where it is now
+    /// the only one: the order `parse` emits windows in *is* the display
+    /// order, because that is the order the daemon stores and the TUI draws.
+    ///
+    /// Kept rather than deleted with the method. The guarantee was real; what
+    /// was wrong was expressing it through a second channel nothing read.
     #[test]
-    fn group_order_lists_session_before_weekly() {
+    fn windows_are_parsed_session_first_then_weekly_buckets() {
         let adapter = ClaudeAdapter::with_config(PathBuf::from("/nonexistent"), String::new());
-        let order = adapter.group_order();
-        let pos = |id: &str| {
-            order
-                .iter()
-                .position(|w| w.0 == id)
-                .unwrap_or_else(|| panic!("{id} missing from group order"))
-        };
-        assert!(pos("session_5h") < pos("weekly"));
-        assert!(pos("weekly") < pos("weekly_opus"));
+        let windows = adapter
+            .parse(&RawResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: br#"{"five_hour":{"utilization":10},
+                           "seven_day":{"utilization":20},
+                           "seven_day_opus":{"utilization":30},
+                           "seven_day_sonnet":{"utilization":40}}"#
+                    .to_vec(),
+                fetched_at: chrono::Utc::now(),
+            })
+            .expect("parses");
+        let ids: Vec<_> = windows.iter().map(|w| w.id.0.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["session_5h", "weekly", "weekly_opus", "weekly_sonnet"]
+        );
     }
 }

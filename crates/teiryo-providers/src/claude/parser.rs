@@ -216,16 +216,6 @@ fn specs() -> [(BucketSpec, BucketGetter); 4] {
     ]
 }
 
-/// Display order for Claude windows: session first, then weekly buckets.
-/// Only the fixed buckets have a fixed place; [`parse`] emits the windows it
-/// derives from `limits[]` after them, in server order.
-pub(crate) fn group_order() -> Vec<WindowId> {
-    specs()
-        .into_iter()
-        .map(|(s, _)| WindowId::from(s.id))
-        .collect()
-}
-
 /// Whether `id` is one [`parse`] derived from a name the server chose.
 ///
 /// Every window this parser emits is either a fixed bucket, whose id is one of
