@@ -18,8 +18,11 @@
 //! ones. The `limits[]` array is newer and is the only place some per-model
 //! weekly caps appear: on plans where a model such as Fable has its own weekly
 //! allowance, the server emits a `weekly_scoped` row naming the model instead
-//! of a dedicated top-level bucket. Rows of other kinds (`session`,
-//! `weekly_all`) restate the fixed buckets and are skipped.
+//! of a dedicated top-level bucket. Only `weekly_scoped` rows are read; every
+//! other kind is skipped. `session` and `weekly_all` are the two seen so far,
+//! and both restate a fixed bucket — but the guard is on the kind being
+//! `weekly_scoped`, not on a closed list, so a kind nobody has seen is skipped
+//! rather than guessed at.
 //!
 //! A derived window's id comes from `scope.model.id` where the server sends
 //! one, and from the display name's slug otherwise. The id is a durable
@@ -53,8 +56,13 @@ use teiryo_core::{
 /// }
 /// ```
 ///
-/// `seven_day_opus`/`seven_day_sonnet` appear only on Max plans (separate
-/// per-model buckets); Pro exposes the shared `five_hour`/`seven_day` pool.
+/// `seven_day_opus`/`seven_day_sonnet` are understood to appear only on Max
+/// plans (separate per-model buckets), with Pro exposing the shared
+/// `five_hour`/`seven_day` pool — from the provider's published description,
+/// not from a captured response: the one capture is a Max 20x account with
+/// both of those buckets `null`, and no Pro response has been seen. The
+/// parser does not depend on it either way; it reads whichever buckets the
+/// payload carries.
 /// A model whose weekly allowance is included with the plan but has no
 /// top-level bucket (Fable, on Max) shows up only as a `weekly_scoped` row in
 /// `limits[]`, labelled by the server.
@@ -138,7 +146,7 @@ struct LimitModel {
     /// silently: `rollover::detect` skips windows present in only one of two
     /// polls, so there is no rollover, no warning, and no repair path.
     ///
-    /// Every response seen so far sends `null` here, which is why the slug is
+    /// The one captured response sends `null` here, which is why the slug is
     /// still the fallback rather than the other way round — and why adopting
     /// this costs exactly one rename, on the first poll that populates it.
     #[serde(default)]
@@ -807,6 +815,34 @@ mod tests {
         );
         // The caption still reads as the server writes it.
         assert_eq!(windows[1].label, "Weekly — Fable 5.1");
+    }
+
+    /// A row the server named with an id but no caption still gets a caption:
+    /// the slug, rather than a "Weekly — " with nothing after it.
+    ///
+    /// The three shapes are the same case to the parser — `display_name`
+    /// absent, `null`, and the empty string all read as no name — and each
+    /// needs a sluggable `scope.model.id` beside it, which is what carries the
+    /// row past the empty-slug guard and into the fallback.
+    #[test]
+    fn a_model_with_an_id_but_no_name_is_captioned_by_its_slug() {
+        for model in [
+            r#"{"id":"claude-fable-5-1"}"#,
+            r#"{"id":"claude-fable-5-1","display_name":null}"#,
+            r#"{"id":"claude-fable-5-1","display_name":""}"#,
+        ] {
+            let windows = parse(&raw(
+                200,
+                &format!(
+                    r#"{{"five_hour":{{"utilization":5}},
+                         "limits":[{{"kind":"weekly_scoped","percent":48,
+                                     "scope":{{"model":{model}}}}}]}}"#
+                ),
+            ))
+            .unwrap();
+            assert_eq!(windows[1].id.0, "weekly_claude_fable_5_1", "{model}");
+            assert_eq!(windows[1].label, "Weekly — claude_fable_5_1", "{model}");
+        }
     }
 
     #[test]
