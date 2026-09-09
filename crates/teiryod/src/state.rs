@@ -1201,13 +1201,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Write a rollover row straight to storage, the way an *older* binary
-    /// would have.
-    ///
-    /// Deliberately not via `record_event`: that runs the detector compiled in
-    /// here, which by construction will not produce the rows these tests are
-    /// about. A pre-upgrade database is exactly a set of rows the current rule
-    /// would not have written.
     /// A derived window rolls over like any other, through a real `limits[]`
     /// payload.
     ///
@@ -1276,6 +1269,13 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Write a rollover row straight to storage, the way an *older* binary
+    /// would have.
+    ///
+    /// Deliberately not via `record_event`: that runs the detector compiled in
+    /// here, which by construction will not produce the rows these tests are
+    /// about. A pre-upgrade database is exactly a set of rows the current rule
+    /// would not have written.
     fn store_rollover(
         daemon: &Daemon,
         kind: RolloverKind,
