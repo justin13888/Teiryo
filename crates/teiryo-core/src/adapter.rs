@@ -54,6 +54,15 @@ pub trait Authenticator: Send + Sync {
     async fn discover_accounts(&self) -> Result<Vec<Account>, AuthError>;
 
     /// Resolve the credential for one discovered account.
+    ///
+    /// **Must be cheap, idempotent, and free of user-visible side effects.**
+    /// The daemon calls this once per poll, and additionally on a short
+    /// recheck cadence for as long as a previous call failed: a credential the
+    /// adapter cannot resolve pauses probing entirely, and re-resolving it is
+    /// how the daemon notices the user has logged in again. An implementation
+    /// that cannot meet this — one that would prompt, spend a network
+    /// round-trip, or rotate anything — must fail fast instead, because the
+    /// cost is paid repeatedly and unattended.
     async fn credential_for(&self, account: &Account) -> Result<Credential, AuthError>;
 }
 
