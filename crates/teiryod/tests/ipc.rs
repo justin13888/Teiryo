@@ -1023,7 +1023,7 @@ impl ProviderAdapter for StaleCredentialAdapter {
 /// credential has always gated the probe, and no rearrangement of this path may
 /// quietly put a request on the wire ahead of it.
 #[test]
-fn an_unusable_credential_is_reported_without_ever_probing() {
+fn an_unusable_credential_is_reported_with_no_countdown_to_offer() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1037,8 +1037,9 @@ fn an_unusable_credential_is_reported_without_ever_probing() {
             probes: std::sync::atomic::AtomicU32::new(0),
         });
         let adapters: Vec<Rc<dyn ProviderAdapter>> = vec![adapter.clone()];
-        // Short enough that a scheduler which kept probing would have done so
-        // several times over by the end of this test.
+        // The floor `MIN_POLL_INTERVAL_SECS` allows, so the cadence this
+        // account would otherwise advertise is as far from `0` as the config
+        // permits.
         let config = test_config("poll_interval_secs = 10\n");
         let server =
             tokio::task::spawn_local(teiryod::run(listener, storage, adapters, config.clone()));
@@ -1067,8 +1068,10 @@ fn an_unusable_credential_is_reported_without_ever_probing() {
             other => panic!("expected startup Update, got {other:?}"),
         }
 
-        // Long enough for several polls at the configured cadence, if the
-        // paused account were still polling.
+        // Enough for the task to settle past its startup poll and publish
+        // what it decided. Not enough for a second poll either way — the
+        // cadence floor is 10 s — so this pins the published cadence, not the
+        // absence of polling, which the unit tests own.
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         send_request(

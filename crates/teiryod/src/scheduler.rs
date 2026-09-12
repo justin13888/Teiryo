@@ -203,8 +203,8 @@ impl Gate {
             (true, false) => Some(Transition::Resumed),
             _ => None,
         };
-        // A poll that stopped at the credential cannot reach this: it leaves
-        // the throttle untouched, so the edge cannot be crossed.
+        // Always `None` for a poll that stopped at the credential: that poll
+        // leaves the throttle exactly as it was, so there is no edge to cross.
         let throttled =
             (self.throttle.is_throttled() && !was_throttled).then_some(Transition::Throttled);
         [credential, throttled]
@@ -246,20 +246,31 @@ impl Gate {
     }
 }
 
-/// The cadence clients should count down to for `step`; `None` leaves the
-/// published value alone because something else owns it.
+/// The cadence clients should count down to for `step`, given the wait the
+/// task will settle back to once it is polling normally again. `None` leaves
+/// the published value alone because something else owns it.
 ///
 /// A paused account reports `0`, the value `AccountStatus.poll_interval_secs`
 /// already uses for "no next poll to count down to". Reporting the re-check
 /// cadence instead would promise a poll that is not scheduled — nothing is
 /// polled while paused, and the re-check may find nothing for hours.
-fn reported_interval(step: Step) -> Option<Duration> {
+///
+/// `PollNow` reports `resting` rather than nothing, because the poll it is
+/// about to run is what *wakes* the clients: `record_event` returns every open
+/// `AwaitUpdate`, and the TUI's only refresh is that wakeup — it runs no timer
+/// of its own. Leaving the published value alone here would hand the client
+/// whichever cadence the previous step wrote, and the previous step on the
+/// path this whole change exists to create is a pause, which writes `0`. A
+/// freshly recovered account would have reported "no next poll" for a full
+/// cadence, having just started polling again.
+fn reported_interval(step: Step, resting: Duration) -> Option<Duration> {
     match step {
         Step::Recheck { .. } => Some(Duration::ZERO),
         Step::Wait { after } => Some(after),
-        // `Park` is the config's business and `apply_config` already publishes
-        // it; `PollNow` is over before a countdown would mean anything.
-        Step::Park | Step::PollNow => None,
+        Step::PollNow => Some(resting),
+        // The config's business: `apply_config` publishes `0` for a disabled
+        // provider as it parks it.
+        Step::Park => None,
     }
 }
 
@@ -333,12 +344,26 @@ pub fn spawn_poller(
             // wakes every `AwaitUpdate` client as it records, and a client
             // that got in between would latch the old cadence and not learn
             // better until the next poll — which, while paused, may be hours.
-            if let Some(interval) = reported_interval(step) {
+            if let Some(interval) = reported_interval(step, gate.throttle.delay(schedule.interval))
+            {
                 daemon.set_reported_interval(&account.id, interval);
             }
             match step {
                 Step::Park => {
                     poll_immediately = true;
+                    // Parking ends a pause too, and the edge is still owed a
+                    // closing line — seeing the warning and disabling the
+                    // provider is a plausible thing to do about it, and that
+                    // path would otherwise leave the stall open in the log
+                    // forever.
+                    if gate.credential_stale {
+                        tracing::info!(
+                            provider = %account.provider,
+                            account = %account.id,
+                            paused_secs = paused_since.map_or(0, |t| t.elapsed().as_secs()),
+                            "provider disabled while its credential was unusable — pause ended"
+                        );
+                    }
                     paused_since = None;
                     gate.park();
                     tokio::select! {
@@ -726,7 +751,32 @@ mod tests {
         let mut g = Gate::default();
         g.record(&unusable_credential());
         let step = g.next_step(enabled(180), false);
-        assert_eq!(reported_interval(step), Some(Duration::ZERO));
+        assert_eq!(reported_interval(step, BASE), Some(Duration::ZERO));
+    }
+
+    /// The poll that ends a pause is the one that wakes every client, and the
+    /// value standing at that moment is `0` — the pause published it. Leaving
+    /// it alone would hand a freshly recovered account "no next poll" for a
+    /// whole cadence, because the TUI refreshes on poll events and runs no
+    /// timer of its own.
+    #[test]
+    fn the_poll_that_ends_a_pause_publishes_the_cadence_it_returns_to() {
+        let mut g = Gate::default();
+        g.record(&unusable_credential());
+        assert_eq!(
+            reported_interval(g.next_step(enabled(180), false), BASE),
+            Some(Duration::ZERO),
+            "a paused account should offer no countdown"
+        );
+
+        g.credential_ok();
+        let step = g.next_step(enabled(180), true);
+        assert_eq!(step, Step::PollNow);
+        assert_eq!(
+            reported_interval(step, g.throttle.delay(enabled(180).interval)),
+            Some(BASE),
+            "recovery left the client counting down to nothing"
+        );
     }
 
     /// The half that already worked, kept working: a countdown that reflects
@@ -738,7 +788,7 @@ mod tests {
         g.record(&limited(None));
         let step = g.next_step(enabled(180), false);
         assert_eq!(step, Step::Wait { after: BASE * 2 });
-        assert_eq!(reported_interval(step), Some(BASE * 2));
+        assert_eq!(reported_interval(step, BASE * 2), Some(BASE * 2));
     }
 
     /// One line in, one line out — however long the stall lasts between them.
