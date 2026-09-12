@@ -33,6 +33,30 @@ const BACKOFF_FACTOR: u32 = 2;
 /// beyond this — that is the provider's own answer, not our guess.
 const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 
+/// How far a poll got before it produced its outcome.
+///
+/// Not on the wire, and deliberately not part of [`PollOutcome`]: a client
+/// needs to know *what* happened, while the scheduler needs to know *where it
+/// stopped*. The two questions have different answers for the same outcome —
+/// an `AuthError` raised resolving the local credential and one raised by the
+/// provider rejecting it are the same message and entirely different events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// The local credential could not be resolved, so nothing was sent.
+    Credential,
+    /// A request reached the provider, or failed trying to.
+    Provider,
+}
+
+/// One completed poll: its outcome, and how far it got.
+#[derive(Debug, Clone, PartialEq)]
+struct Polled {
+    /// What the client is told.
+    outcome: PollOutcome,
+    /// What the scheduler reasons about.
+    stage: Stage,
+}
+
 /// Consecutive rate-limited polls, and the wait they buy.
 ///
 /// A 429 is the provider saying we ask too often. Continuing at the configured
@@ -49,9 +73,20 @@ struct Throttle {
 }
 
 impl Throttle {
-    /// Fold in the outcome of a poll that just finished.
-    fn record(&mut self, outcome: &PollOutcome) {
-        match outcome {
+    /// Fold in the poll that just finished.
+    fn record(&mut self, polled: &Polled) {
+        // A poll that stopped at the local credential never reached the
+        // provider, so it learned nothing about the provider's mood and must
+        // not speak for it — neither adding a strike nor clearing one. Letting
+        // it clear one silently discarded a backoff the provider had asked
+        // for: 429s built a long wait, the access token then expired, and the
+        // next poll failed without sending a byte and reset the strikes. The
+        // user re-logged in hours later and the daemon resumed at full cadence
+        // straight back into the rate limit it had already been told about.
+        if polled.stage == Stage::Credential {
+            return;
+        }
+        match &polled.outcome {
             PollOutcome::RateLimited { retry_after } => {
                 self.strikes = self.strikes.saturating_add(1);
                 self.retry_after = *retry_after;
@@ -124,9 +159,9 @@ pub fn spawn_poller(
             }
             if !was_enabled {
                 was_enabled = true;
-                let outcome =
+                let polled =
                     poll_once(&daemon, adapter.as_ref(), &account, PollTrigger::Startup).await;
-                throttle.record(&outcome);
+                throttle.record(&polled);
                 continue;
             }
             let interval = throttle.delay(schedule.interval);
@@ -146,16 +181,16 @@ pub fn spawn_poller(
             let sleep = tokio::time::sleep(jittered(interval));
             tokio::select! {
                 _ = sleep => {
-                    let outcome =
+                    let polled =
                         poll_once(&daemon, adapter.as_ref(), &account, PollTrigger::Scheduled).await;
-                    throttle.record(&outcome);
+                    throttle.record(&polled);
                 }
                 // A manual trigger is not held back by the throttle: the user
                 // asked for this one, and if it succeeds the backoff was stale
                 // and clears.
                 Some(trigger) = rx.recv() => {
-                    let outcome = poll_once(&daemon, adapter.as_ref(), &account, trigger).await;
-                    throttle.record(&outcome);
+                    let polled = poll_once(&daemon, adapter.as_ref(), &account, trigger).await;
+                    throttle.record(&polled);
                 }
                 // Re-arms the sleep against the new cadence. A shortened
                 // interval therefore takes effect now, not after the old
@@ -169,23 +204,23 @@ pub fn spawn_poller(
 }
 
 /// Run one poll: resolve credential, probe, parse; persist and publish the
-/// resulting event whatever the outcome. The outcome is handed back so the
+/// resulting event whatever the outcome. The result is handed back so the
 /// caller can adjust its backoff.
 async fn poll_once(
     daemon: &Daemon,
     adapter: &dyn ProviderAdapter,
     account: &Account,
     trigger: PollTrigger,
-) -> PollOutcome {
+) -> Polled {
     let started = Instant::now();
-    let outcome = poll_outcome(adapter, account).await;
+    let polled = poll_outcome(adapter, account).await;
     let event = PollEvent {
         id: PollId::generate(),
         ts: Utc::now(),
         provider: adapter.id(),
         account: account.id.clone(),
         trigger,
-        outcome,
+        outcome: polled.outcome,
         latency_ms: started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32,
     };
     if let Some(err) = event.outcome.error_message() {
@@ -194,27 +229,41 @@ async fn poll_once(
         tracing::debug!(provider = %event.provider, account = %event.account, latency_ms = event.latency_ms, "poll ok");
     }
     daemon.record_event(&event);
-    event.outcome
+    Polled {
+        outcome: event.outcome,
+        stage: polled.stage,
+    }
 }
 
-async fn poll_outcome(adapter: &dyn ProviderAdapter, account: &Account) -> PollOutcome {
+async fn poll_outcome(adapter: &dyn ProviderAdapter, account: &Account) -> Polled {
+    // The one place a poll stops without reaching the provider. Everything
+    // below it has sent a request, whatever it came back with.
     let cred = match adapter.credential_for(account).await {
         Ok(c) => c,
-        Err(e) => return PollOutcome::AuthError(e.to_string()),
+        Err(e) => {
+            return Polled {
+                outcome: PollOutcome::AuthError(e.to_string()),
+                stage: Stage::Credential,
+            }
+        }
+    };
+    let sent = |outcome| Polled {
+        outcome,
+        stage: Stage::Provider,
     };
     let raw = match adapter.probe(account, &cred).await {
         Ok(r) => r,
-        Err(ProbeError::Auth(m)) => return PollOutcome::AuthError(m),
+        Err(ProbeError::Auth(m)) => return sent(PollOutcome::AuthError(m)),
         Err(ProbeError::RateLimited { retry_after }) => {
-            return PollOutcome::RateLimited { retry_after }
+            return sent(PollOutcome::RateLimited { retry_after })
         }
         Err(e @ (ProbeError::Network(_) | ProbeError::Provider(_))) => {
-            return PollOutcome::NetworkError(e.to_string())
+            return sent(PollOutcome::NetworkError(e.to_string()))
         }
     };
     match adapter.parse(&raw) {
-        Ok(windows) => PollOutcome::Success { windows },
-        Err(e) => PollOutcome::SchemaDrift(e.to_string()),
+        Ok(windows) => sent(PollOutcome::Success { windows }),
+        Err(e) => sent(PollOutcome::SchemaDrift(e.to_string())),
     }
 }
 
@@ -235,9 +284,26 @@ fn jittered(base: Duration) -> Duration {
 mod tests {
     use super::*;
 
-    fn limited(retry_after: Option<u64>) -> PollOutcome {
-        PollOutcome::RateLimited {
+    /// A rate limit, which by definition reached the provider.
+    fn limited(retry_after: Option<u64>) -> Polled {
+        reached(PollOutcome::RateLimited {
             retry_after: retry_after.map(Duration::from_secs),
+        })
+    }
+
+    /// A poll that got a request out to the provider.
+    fn reached(outcome: PollOutcome) -> Polled {
+        Polled {
+            outcome,
+            stage: Stage::Provider,
+        }
+    }
+
+    /// A poll that stopped at the local credential, having sent nothing.
+    fn unusable_credential() -> Polled {
+        Polled {
+            outcome: PollOutcome::AuthError("token expired".into()),
+            stage: Stage::Credential,
         }
     }
 
@@ -247,7 +313,7 @@ mod tests {
     fn an_unlimited_poll_waits_exactly_the_configured_cadence() {
         let mut t = Throttle::default();
         assert_eq!(t.delay(BASE), BASE);
-        t.record(&PollOutcome::Success { windows: vec![] });
+        t.record(&reached(PollOutcome::Success { windows: vec![] }));
         assert!(!t.is_throttled());
         assert_eq!(t.delay(BASE), BASE);
     }
@@ -301,7 +367,41 @@ mod tests {
         t.record(&limited(Some(600)));
         t.record(&limited(Some(600)));
         assert!(t.is_throttled());
-        t.record(&PollOutcome::NetworkError("down".into()));
+        t.record(&reached(PollOutcome::NetworkError("down".into())));
+        assert!(!t.is_throttled());
+        assert_eq!(t.delay(BASE), BASE);
+    }
+
+    /// The backoff answers the provider's mood, and only the provider can
+    /// change it. A poll that died resolving the local credential sent no
+    /// request, so it has no standing to say the rate limit is over — and
+    /// clearing it here is how a re-login used to walk straight back into the
+    /// 429s the daemon had already been warned about.
+    #[test]
+    fn a_credential_failure_does_not_clear_a_rate_limit_backoff() {
+        let mut t = Throttle::default();
+        t.record(&limited(Some(600)));
+        t.record(&limited(Some(600)));
+        let backed_off = t.delay(BASE);
+        assert!(t.is_throttled());
+
+        // Hours of an expired token, none of it addressed to the provider.
+        for _ in 0..64 {
+            t.record(&unusable_credential());
+        }
+
+        assert!(t.is_throttled(), "a local failure spoke for the provider");
+        assert_eq!(t.delay(BASE), backed_off, "the backoff moved");
+    }
+
+    /// The other half of the same rule: a rejection *from* the provider is the
+    /// provider talking, so it clears the strikes like any other reply.
+    #[test]
+    fn a_provider_rejection_still_clears_a_rate_limit_backoff() {
+        let mut t = Throttle::default();
+        t.record(&limited(Some(600)));
+        assert!(t.is_throttled());
+        t.record(&reached(PollOutcome::AuthError("401".into())));
         assert!(!t.is_throttled());
         assert_eq!(t.delay(BASE), BASE);
     }
