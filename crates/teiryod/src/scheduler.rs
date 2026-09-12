@@ -125,6 +125,175 @@ impl Throttle {
     }
 }
 
+/// Ceiling on the wait between re-resolving a credential that last failed to
+/// resolve.
+///
+/// This is not a probe and costs the provider nothing — for the Claude adapter
+/// it is a local file read — so it is fast enough to make a re-login feel
+/// immediate without being a poll. The wait is the configured cadence when that
+/// is shorter, so a user who asked to be polled every 10 s is never told about
+/// their new login more slowly than that.
+const CREDENTIAL_RECHECK_MAX: Duration = Duration::from_secs(30);
+
+/// What the poll task does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// The provider is disabled: wait for config to say otherwise.
+    Park,
+    /// Poll now, without waiting.
+    PollNow,
+    /// Re-resolve the credential after this long. Sends nothing.
+    Recheck {
+        /// How long to wait first.
+        after: Duration,
+    },
+    /// Wait this long, then poll.
+    Wait {
+        /// How long to wait first.
+        after: Duration,
+    },
+}
+
+/// Why the task is or is not polling right now.
+///
+/// Two facts rather than one, because they answer to different people and
+/// neither may overwrite the other: the throttle is the provider's verdict on
+/// how often we may ask, and `credential_stale` is the local credential store's
+/// verdict on whether we can ask at all.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Gate {
+    /// The provider's rate limit, and the wait it bought.
+    throttle: Throttle,
+    /// The local credential last failed to resolve, so probing is pointless
+    /// until it resolves again.
+    credential_stale: bool,
+}
+
+/// A change in why the task is polling or not — worth exactly one log line.
+///
+/// Reported on the edge rather than on the level, because the level is what
+/// used to be logged: a stall that lasted three hours wrote a warning for every
+/// cycle inside it, and the 180th copy told nobody anything the first had not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transition {
+    /// The credential stopped resolving; probes are paused until it does.
+    Paused,
+    /// The credential resolved again; polling resumes.
+    Resumed,
+    /// The provider began rate limiting; polls are being spaced out.
+    Throttled,
+}
+
+impl Gate {
+    /// Fold in the poll that just finished, reporting the edge it crossed.
+    fn record(&mut self, polled: &Polled) -> Option<Transition> {
+        let was_stale = self.credential_stale;
+        let was_throttled = self.throttle.is_throttled();
+        self.throttle.record(polled);
+        self.credential_stale = polled.stage == Stage::Credential;
+
+        match (was_stale, self.credential_stale) {
+            (false, true) => Some(Transition::Paused),
+            (true, false) => Some(Transition::Resumed),
+            // Only reachable when the credential is fine, since a poll that
+            // stopped at the credential never touches the throttle.
+            _ if self.throttle.is_throttled() && !was_throttled => Some(Transition::Throttled),
+            _ => None,
+        }
+    }
+
+    /// A re-check resolved the credential, sending nothing.
+    fn credential_ok(&mut self) -> Option<Transition> {
+        let recovered = self.credential_stale;
+        self.credential_stale = false;
+        recovered.then_some(Transition::Resumed)
+    }
+
+    /// A parked provider owes nobody anything: it is not being rate limited,
+    /// and whatever its credential did last is about to be re-established by
+    /// the poll that re-enabling forces.
+    fn park(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The next thing to do. Precedence is load-bearing: a disabled provider
+    /// is excluded before the credential is ever considered, so parking is
+    /// what stops a disabled account re-checking, rather than a guard
+    /// somebody has to remember to write.
+    fn next_step(self, schedule: Schedule, poll_immediately: bool) -> Step {
+        if !schedule.enabled {
+            return Step::Park;
+        }
+        if poll_immediately {
+            return Step::PollNow;
+        }
+        if self.credential_stale {
+            return Step::Recheck {
+                after: schedule.interval.min(CREDENTIAL_RECHECK_MAX),
+            };
+        }
+        Step::Wait {
+            after: self.throttle.delay(schedule.interval),
+        }
+    }
+}
+
+/// The cadence clients should count down to for `step`; `None` leaves the
+/// published value alone because something else owns it.
+///
+/// A paused account reports `0`, the value `AccountStatus.poll_interval_secs`
+/// already uses for "no next poll to count down to". Reporting the re-check
+/// cadence instead would promise a poll that is not scheduled — nothing is
+/// polled while paused, and the re-check may find nothing for hours.
+fn reported_interval(step: Step) -> Option<Duration> {
+    match step {
+        Step::Recheck { .. } => Some(Duration::ZERO),
+        Step::Wait { after } => Some(after),
+        // `Park` is the config's business and `apply_config` already publishes
+        // it; `PollNow` is over before a countdown would mean anything.
+        Step::Park | Step::PollNow => None,
+    }
+}
+
+/// Say once what just changed. `paused_since` is the clock the resume line
+/// reports against, started here and read here so the two lines cannot drift.
+fn log_transition(
+    account: &Account,
+    transition: Transition,
+    schedule: Schedule,
+    gate: Gate,
+    paused_since: &mut Option<Instant>,
+) {
+    match transition {
+        Transition::Paused => {
+            *paused_since = Some(Instant::now());
+            tracing::warn!(
+                provider = %account.provider,
+                account = %account.id,
+                recheck_secs = schedule.interval.min(CREDENTIAL_RECHECK_MAX).as_secs(),
+                "credential unusable — pausing probes until it resolves"
+            );
+        }
+        Transition::Resumed => {
+            tracing::info!(
+                provider = %account.provider,
+                account = %account.id,
+                paused_secs = paused_since.take().map_or(0, |t| t.elapsed().as_secs()),
+                "credential resolved — resuming polls"
+            );
+        }
+        Transition::Throttled => {
+            tracing::warn!(
+                provider = %account.provider,
+                account = %account.id,
+                strikes = gate.throttle.strikes,
+                backoff_secs = gate.throttle.delay(schedule.interval).as_secs(),
+                "rate limited — throttling polls"
+            );
+        }
+    }
+}
+
 /// Spawn the poll task for one (provider, account). Returns the manual
 /// trigger sender; the task itself runs until shutdown. Must be called from
 /// within a `tokio::task::LocalSet`.
@@ -140,63 +309,100 @@ pub fn spawn_poller(
     tokio::task::spawn_local(async move {
         // Tracked rather than assumed: a provider disabled in config.toml must
         // not poll at startup, and re-enabling one should show a reading
-        // immediately rather than after a full interval of nothing.
-        let mut was_enabled = false;
-        // Rate limiting is a property of the credential, not of the config, so
-        // it lives with the task rather than travelling over `schedule_rx`.
-        let mut throttle = Throttle::default();
+        // immediately rather than after a full interval of nothing. A
+        // credential that has just come back sets it for the same reason.
+        let mut poll_immediately = true;
+        // Rate limiting and credential staleness are properties of the
+        // credential, not of the config, so they live with the task rather
+        // than travelling over `schedule_rx`.
+        let mut gate = Gate::default();
+        // When the current pause began, for the one line that reports it.
+        let mut paused_since: Option<Instant> = None;
         loop {
             let schedule = *schedule_rx.borrow_and_update();
-            if !schedule.enabled {
-                was_enabled = false;
-                // A parked provider is not being rate limited by anyone; the
-                // strikes would otherwise apply to a poll hours later.
-                throttle = Throttle::default();
-                tokio::select! {
-                    _ = schedule_rx.changed() => continue,
-                    _ = shutdown_rx.changed() => break,
+            let step = gate.next_step(schedule, poll_immediately);
+            // Published before this iteration's first `.await`: `poll_once`
+            // wakes every `AwaitUpdate` client as it records, and a client
+            // that got in between would latch the old cadence and not learn
+            // better until the next poll — which, while paused, may be hours.
+            if let Some(interval) = reported_interval(step) {
+                daemon.set_reported_interval(&account.id, interval);
+            }
+            match step {
+                Step::Park => {
+                    poll_immediately = true;
+                    paused_since = None;
+                    gate.park();
+                    tokio::select! {
+                        _ = schedule_rx.changed() => continue,
+                        _ = shutdown_rx.changed() => break,
+                    }
                 }
-            }
-            if !was_enabled {
-                was_enabled = true;
-                let polled =
-                    poll_once(&daemon, adapter.as_ref(), &account, PollTrigger::Startup).await;
-                throttle.record(&polled);
-                continue;
-            }
-            let interval = throttle.delay(schedule.interval);
-            if throttle.is_throttled() {
-                tracing::warn!(
-                    provider = %account.provider,
-                    account = %account.id,
-                    strikes = throttle.strikes,
-                    backoff_secs = interval.as_secs(),
-                    "rate limited — throttling polls"
-                );
-            }
-            // Clients count down to the next poll from this; publishing the
-            // configured cadence while throttled would show a countdown that
-            // hits zero and then sits there.
-            daemon.set_reported_interval(&account.id, interval);
-            let sleep = tokio::time::sleep(jittered(interval));
-            tokio::select! {
-                _ = sleep => {
+                Step::PollNow => {
+                    poll_immediately = false;
                     let polled =
-                        poll_once(&daemon, adapter.as_ref(), &account, PollTrigger::Scheduled).await;
-                    throttle.record(&polled);
+                        poll_once(&daemon, adapter.as_ref(), &account, PollTrigger::Startup).await;
+                    if let Some(t) = gate.record(&polled) {
+                        log_transition(&account, t, schedule, gate, &mut paused_since);
+                    }
                 }
-                // A manual trigger is not held back by the throttle: the user
-                // asked for this one, and if it succeeds the backoff was stale
-                // and clears.
-                Some(trigger) = rx.recv() => {
-                    let polled = poll_once(&daemon, adapter.as_ref(), &account, trigger).await;
-                    throttle.record(&polled);
+                // Nothing is sent while paused: the credential we hold cannot
+                // work, and asking anyway is what used to fill the log with
+                // thousands of identical failures over a single expired token.
+                Step::Recheck { after } => {
+                    tokio::select! {
+                        // Jittered like a poll, though no request goes out: a
+                        // future multi-account Claude reads one file from
+                        // several tasks, and recovering them all on the same
+                        // tick would fire simultaneous probes.
+                        _ = tokio::time::sleep(jittered(after)) => {
+                            if adapter.credential_for(&account).await.is_ok() {
+                                if let Some(t) = gate.credential_ok() {
+                                    log_transition(&account, t, schedule, gate, &mut paused_since);
+                                }
+                                poll_immediately = true;
+                            }
+                        }
+                        // A manual trigger is not held back by the pause: the
+                        // user asked for this one, and `poll_once` resolves the
+                        // credential itself, so a recovered login clears the
+                        // pause through the same path a scheduled poll uses.
+                        Some(trigger) = rx.recv() => {
+                            let polled = poll_once(&daemon, adapter.as_ref(), &account, trigger).await;
+                            if let Some(t) = gate.record(&polled) {
+                                log_transition(&account, t, schedule, gate, &mut paused_since);
+                            }
+                        }
+                        _ = schedule_rx.changed() => {}
+                        _ = shutdown_rx.changed() => break,
+                    }
                 }
-                // Re-arms the sleep against the new cadence. A shortened
-                // interval therefore takes effect now, not after the old
-                // (possibly hour-long) one finally elapses.
-                _ = schedule_rx.changed() => {}
-                _ = shutdown_rx.changed() => break,
+                Step::Wait { after } => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(jittered(after)) => {
+                            let polled =
+                                poll_once(&daemon, adapter.as_ref(), &account, PollTrigger::Scheduled).await;
+                            if let Some(t) = gate.record(&polled) {
+                                log_transition(&account, t, schedule, gate, &mut paused_since);
+                            }
+                        }
+                        // A manual trigger is not held back by the throttle:
+                        // the user asked for this one, and if it succeeds the
+                        // backoff was stale and clears.
+                        Some(trigger) = rx.recv() => {
+                            let polled = poll_once(&daemon, adapter.as_ref(), &account, trigger).await;
+                            if let Some(t) = gate.record(&polled) {
+                                log_transition(&account, t, schedule, gate, &mut paused_since);
+                            }
+                        }
+                        // Re-arms the sleep against the new cadence. A
+                        // shortened interval therefore takes effect now, not
+                        // after the old (possibly hour-long) one finally
+                        // elapses.
+                        _ = schedule_rx.changed() => {}
+                        _ = shutdown_rx.changed() => break,
+                    }
+                }
             }
         }
     });
@@ -404,6 +610,148 @@ mod tests {
         t.record(&reached(PollOutcome::AuthError("401".into())));
         assert!(!t.is_throttled());
         assert_eq!(t.delay(BASE), BASE);
+    }
+
+    fn enabled(interval_secs: u64) -> Schedule {
+        Schedule {
+            enabled: true,
+            interval: Duration::from_secs(interval_secs),
+        }
+    }
+
+    /// The whole point: a credential that cannot work stops costing the
+    /// provider requests. Before this, an expired overnight token bought 180
+    /// consecutive probes that could not have succeeded.
+    #[test]
+    fn an_unusable_credential_rechecks_locally_instead_of_probing() {
+        let mut g = Gate::default();
+        assert_eq!(g.record(&unusable_credential()), Some(Transition::Paused));
+        assert_eq!(
+            g.next_step(enabled(180), false),
+            Step::Recheck {
+                after: CREDENTIAL_RECHECK_MAX
+            }
+        );
+    }
+
+    /// A long pause is only tolerable because a re-login ends it, so the
+    /// re-check must never be slower than the polling the user asked for.
+    #[test]
+    fn the_recheck_never_waits_longer_than_the_configured_cadence() {
+        let mut g = Gate::default();
+        g.record(&unusable_credential());
+        assert_eq!(
+            g.next_step(enabled(10), false),
+            Step::Recheck {
+                after: Duration::from_secs(10)
+            },
+            "a 10 s cadence was slowed to the re-check ceiling"
+        );
+        assert_eq!(
+            g.next_step(enabled(3600), false),
+            Step::Recheck {
+                after: CREDENTIAL_RECHECK_MAX
+            }
+        );
+    }
+
+    /// Excluded by precedence rather than by a guard inside the re-check.
+    #[test]
+    fn a_disabled_provider_parks_instead_of_rechecking() {
+        let mut g = Gate::default();
+        g.record(&unusable_credential());
+        let parked = Schedule {
+            enabled: false,
+            interval: Duration::from_secs(180),
+        };
+        assert_eq!(g.next_step(parked, false), Step::Park);
+        g.park();
+        assert_eq!(g, Gate::default(), "parking left state behind");
+    }
+
+    /// Recovery is the `Err` → `Ok` edge, and it polls at once rather than
+    /// waiting out the cadence the user has already been kept waiting by.
+    #[test]
+    fn a_resolved_credential_polls_immediately() {
+        let mut g = Gate::default();
+        g.record(&unusable_credential());
+        assert_eq!(g.credential_ok(), Some(Transition::Resumed));
+        assert_eq!(g.next_step(enabled(180), true), Step::PollNow);
+    }
+
+    /// The edge, not the level. A token the provider rejects still resolves
+    /// locally, so re-checking it reports `Ok` forever; treating that as
+    /// recovery would poll, get rejected, and poll again on the next re-check.
+    #[test]
+    fn a_credential_that_never_failed_locally_does_not_trigger_recovery() {
+        let mut g = Gate::default();
+        assert_eq!(
+            g.record(&reached(PollOutcome::AuthError("401".into()))),
+            None,
+            "a provider rejection was mistaken for a local credential failure"
+        );
+        assert!(!g.credential_stale);
+        for _ in 0..10 {
+            assert_eq!(g.credential_ok(), None, "resolving an unpaused credential");
+        }
+        assert_eq!(
+            g.next_step(enabled(180), false),
+            Step::Wait {
+                after: Duration::from_secs(180)
+            },
+            "a rejected token should keep polling at cadence, not re-check"
+        );
+    }
+
+    /// No poll happens while paused, so there is no next poll to count down to
+    /// — and `0` is the value clients already read that way.
+    #[test]
+    fn a_stale_credential_reports_no_next_poll() {
+        let mut g = Gate::default();
+        g.record(&unusable_credential());
+        let step = g.next_step(enabled(180), false);
+        assert_eq!(reported_interval(step), Some(Duration::ZERO));
+    }
+
+    /// The half that already worked, kept working: a countdown that reflects
+    /// the backoff rather than hitting zero and sitting there.
+    #[test]
+    fn a_throttled_account_still_reports_its_backed_off_cadence() {
+        let mut g = Gate::default();
+        g.record(&limited(None));
+        g.record(&limited(None));
+        let step = g.next_step(enabled(180), false);
+        assert_eq!(step, Step::Wait { after: BASE * 2 });
+        assert_eq!(reported_interval(step), Some(BASE * 2));
+    }
+
+    /// One line in, one line out — however long the stall lasts between them.
+    #[test]
+    fn a_pause_is_reported_once_in_and_once_out() {
+        let mut g = Gate::default();
+        assert_eq!(g.record(&unusable_credential()), Some(Transition::Paused));
+        for _ in 0..64 {
+            assert_eq!(g.record(&unusable_credential()), None, "repeated pause");
+        }
+        assert_eq!(
+            g.record(&reached(PollOutcome::Success { windows: vec![] })),
+            Some(Transition::Resumed)
+        );
+        assert_eq!(
+            g.record(&reached(PollOutcome::Success { windows: vec![] })),
+            None,
+            "repeated recovery"
+        );
+    }
+
+    /// Likewise for the rate limit, which used to warn on every cycle.
+    #[test]
+    fn a_rate_limit_is_reported_once_however_long_it_lasts() {
+        let mut g = Gate::default();
+        assert_eq!(g.record(&limited(None)), Some(Transition::Throttled));
+        for _ in 0..64 {
+            assert_eq!(g.record(&limited(None)), None, "repeated throttle");
+        }
     }
 
     #[test]
