@@ -951,3 +951,163 @@ fn an_early_rollover_reaches_the_client_with_its_history() {
         std::fs::remove_dir_all(config.parent().unwrap()).ok();
     });
 }
+
+/// An adapter whose local credential cannot be resolved — the shape of a
+/// Claude Code access token that expired while nobody was using it. The probe
+/// counts its calls so the test can assert it was never reached.
+struct StaleCredentialAdapter {
+    probes: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait]
+impl Authenticator for StaleCredentialAdapter {
+    async fn discover_accounts(&self) -> Result<Vec<Account>, AuthError> {
+        Ok(vec![stub_account()])
+    }
+    async fn credential_for(&self, _account: &Account) -> Result<Credential, AuthError> {
+        Err(AuthError::Expired("token is past its expiry".into()))
+    }
+}
+
+#[async_trait]
+impl Prober for StaleCredentialAdapter {
+    async fn probe(
+        &self,
+        _account: &Account,
+        _cred: &Credential,
+    ) -> Result<RawResponse, ProbeError> {
+        self.probes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(RawResponse {
+            status: 200,
+            headers: vec![],
+            body: b"{}".to_vec(),
+            fetched_at: chrono::Utc::now(),
+        })
+    }
+}
+
+impl QuotaParser for StaleCredentialAdapter {
+    fn parse(&self, _raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
+        Ok(vec![stub_window()])
+    }
+}
+
+impl WindowPresenter for StaleCredentialAdapter {
+    fn render_hint(&self, _window: &QuotaWindow) -> RenderHint {
+        RenderHint {
+            style: BarStyle::Percent,
+            warn_threshold: 0.8,
+            critical_threshold: 0.95,
+            note: None,
+        }
+    }
+}
+
+impl ProviderAdapter for StaleCredentialAdapter {
+    fn id(&self) -> String {
+        "stub".into()
+    }
+}
+
+/// A credential that cannot resolve pauses the account instead of polling it.
+///
+/// The whole daemon path rather than the scheduler's arithmetic alone: the
+/// failure reaches the client as an `AuthError` still carrying the adapter's
+/// own remedy, and the cadence published beside it is `0`. That `0` is what
+/// this pins — the account previously advertised a live cadence and kept
+/// polling on it for as long as the token stayed expired, so a client counted
+/// down to polls that could not succeed.
+///
+/// The probe counter is a standing guard, not a regression test: resolving the
+/// credential has always gated the probe, and no rearrangement of this path may
+/// quietly put a request on the wire ahead of it.
+#[test]
+fn an_unusable_credential_is_reported_without_ever_probing() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let socket = test_socket_path();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let adapter = Rc::new(StaleCredentialAdapter {
+            probes: std::sync::atomic::AtomicU32::new(0),
+        });
+        let adapters: Vec<Rc<dyn ProviderAdapter>> = vec![adapter.clone()];
+        // Short enough that a scheduler which kept probing would have done so
+        // several times over by the end of this test.
+        let config = test_config("poll_interval_secs = 10\n");
+        let server =
+            tokio::task::spawn_local(teiryod::run(listener, storage, adapters, config.clone()));
+
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        client_handshake(&mut stream).await.expect("handshake");
+        let (mut sink, mut source) = framed(stream).split();
+
+        send_request(
+            &mut sink,
+            &Request::AwaitUpdate {
+                since: PollId::zero(),
+                config_gen: u64::MAX,
+                timeout_ms: 5_000,
+            },
+        )
+        .await;
+        match recv_response(&mut source).await {
+            Response::Update(event) => match event.outcome {
+                PollOutcome::AuthError(msg) => assert!(
+                    msg.contains("past its expiry"),
+                    "the adapter's own remedy was lost: {msg}"
+                ),
+                other => panic!("expected AuthError, got {other:?}"),
+            },
+            other => panic!("expected startup Update, got {other:?}"),
+        }
+
+        // Long enough for several polls at the configured cadence, if the
+        // paused account were still polling.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        send_request(
+            &mut sink,
+            &Request::Status {
+                provider: None,
+                account: None,
+            },
+        )
+        .await;
+        match recv_response(&mut source).await {
+            Response::Status(statuses) => {
+                let status = &statuses[0];
+                assert_eq!(
+                    status.poll_interval_secs, 0,
+                    "a paused account promised a countdown it cannot keep"
+                );
+                assert!(
+                    matches!(
+                        status.last_poll.as_ref().map(|e| &e.outcome),
+                        Some(PollOutcome::AuthError(_))
+                    ),
+                    "the failure did not reach the client"
+                );
+                assert!(status.last_success.is_none(), "nothing ever succeeded here");
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+
+        assert_eq!(
+            adapter.probes.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "an unusable credential still cost the provider a request"
+        );
+
+        send_request(&mut sink, &Request::Shutdown).await;
+        let _ = recv_response(&mut source).await;
+        let _ = server.await;
+        std::fs::remove_file(&socket).ok();
+        std::fs::remove_dir_all(config.parent().unwrap()).ok();
+    });
+}
