@@ -185,21 +185,29 @@ enum Transition {
 }
 
 impl Gate {
-    /// Fold in the poll that just finished, reporting the edge it crossed.
-    fn record(&mut self, polled: &Polled) -> Option<Transition> {
+    /// Fold in the poll that just finished, reporting the edges it crossed.
+    ///
+    /// Two, because one poll can cross both: the poll that ends a pause is
+    /// often the very one the provider then rate limits — a re-check resumes
+    /// as soon as the credential resolves, without waiting out a backoff the
+    /// pause did not clear. Reporting only the resumption would leave the long
+    /// wait that follows it unexplained.
+    fn record(&mut self, polled: &Polled) -> [Option<Transition>; 2] {
         let was_stale = self.credential_stale;
         let was_throttled = self.throttle.is_throttled();
         self.throttle.record(polled);
         self.credential_stale = polled.stage == Stage::Credential;
 
-        match (was_stale, self.credential_stale) {
+        let credential = match (was_stale, self.credential_stale) {
             (false, true) => Some(Transition::Paused),
             (true, false) => Some(Transition::Resumed),
-            // Only reachable when the credential is fine, since a poll that
-            // stopped at the credential never touches the throttle.
-            _ if self.throttle.is_throttled() && !was_throttled => Some(Transition::Throttled),
             _ => None,
-        }
+        };
+        // A poll that stopped at the credential cannot reach this: it leaves
+        // the throttle untouched, so the edge cannot be crossed.
+        let throttled =
+            (self.throttle.is_throttled() && !was_throttled).then_some(Transition::Throttled);
+        [credential, throttled]
     }
 
     /// A re-check resolved the credential, sending nothing.
@@ -342,7 +350,7 @@ pub fn spawn_poller(
                     poll_immediately = false;
                     let polled =
                         poll_once(&daemon, adapter.as_ref(), &account, PollTrigger::Startup).await;
-                    if let Some(t) = gate.record(&polled) {
+                    for t in gate.record(&polled).into_iter().flatten() {
                         log_transition(&account, t, schedule, gate, &mut paused_since);
                     }
                 }
@@ -369,7 +377,7 @@ pub fn spawn_poller(
                         // pause through the same path a scheduled poll uses.
                         Some(trigger) = rx.recv() => {
                             let polled = poll_once(&daemon, adapter.as_ref(), &account, trigger).await;
-                            if let Some(t) = gate.record(&polled) {
+                            for t in gate.record(&polled).into_iter().flatten() {
                                 log_transition(&account, t, schedule, gate, &mut paused_since);
                             }
                         }
@@ -382,7 +390,7 @@ pub fn spawn_poller(
                         _ = tokio::time::sleep(jittered(after)) => {
                             let polled =
                                 poll_once(&daemon, adapter.as_ref(), &account, PollTrigger::Scheduled).await;
-                            if let Some(t) = gate.record(&polled) {
+                            for t in gate.record(&polled).into_iter().flatten() {
                                 log_transition(&account, t, schedule, gate, &mut paused_since);
                             }
                         }
@@ -391,7 +399,7 @@ pub fn spawn_poller(
                         // backoff was stale and clears.
                         Some(trigger) = rx.recv() => {
                             let polled = poll_once(&daemon, adapter.as_ref(), &account, trigger).await;
-                            if let Some(t) = gate.record(&polled) {
+                            for t in gate.record(&polled).into_iter().flatten() {
                                 log_transition(&account, t, schedule, gate, &mut paused_since);
                             }
                         }
@@ -612,6 +620,11 @@ mod tests {
         assert_eq!(t.delay(BASE), BASE);
     }
 
+    /// The edges one poll crossed, in the order they are logged.
+    fn edges(crossed: [Option<Transition>; 2]) -> Vec<Transition> {
+        crossed.into_iter().flatten().collect()
+    }
+
     fn enabled(interval_secs: u64) -> Schedule {
         Schedule {
             enabled: true,
@@ -625,7 +638,10 @@ mod tests {
     #[test]
     fn an_unusable_credential_rechecks_locally_instead_of_probing() {
         let mut g = Gate::default();
-        assert_eq!(g.record(&unusable_credential()), Some(Transition::Paused));
+        assert_eq!(
+            edges(g.record(&unusable_credential())),
+            [Transition::Paused]
+        );
         assert_eq!(
             g.next_step(enabled(180), false),
             Step::Recheck {
@@ -686,8 +702,8 @@ mod tests {
     fn a_credential_that_never_failed_locally_does_not_trigger_recovery() {
         let mut g = Gate::default();
         assert_eq!(
-            g.record(&reached(PollOutcome::AuthError("401".into()))),
-            None,
+            edges(g.record(&reached(PollOutcome::AuthError("401".into())))),
+            [],
             "a provider rejection was mistaken for a local credential failure"
         );
         assert!(!g.credential_stale);
@@ -729,18 +745,41 @@ mod tests {
     #[test]
     fn a_pause_is_reported_once_in_and_once_out() {
         let mut g = Gate::default();
-        assert_eq!(g.record(&unusable_credential()), Some(Transition::Paused));
+        assert_eq!(
+            edges(g.record(&unusable_credential())),
+            [Transition::Paused]
+        );
         for _ in 0..64 {
-            assert_eq!(g.record(&unusable_credential()), None, "repeated pause");
+            assert_eq!(
+                edges(g.record(&unusable_credential())),
+                [],
+                "repeated pause"
+            );
         }
         assert_eq!(
-            g.record(&reached(PollOutcome::Success { windows: vec![] })),
-            Some(Transition::Resumed)
+            edges(g.record(&reached(PollOutcome::Success { windows: vec![] }))),
+            [Transition::Resumed]
         );
         assert_eq!(
-            g.record(&reached(PollOutcome::Success { windows: vec![] })),
-            None,
+            edges(g.record(&reached(PollOutcome::Success { windows: vec![] }))),
+            [],
             "repeated recovery"
+        );
+    }
+
+    /// The poll that ends a pause is a likely candidate to be rate limited: a
+    /// re-check resumes the moment the credential resolves, without waiting out
+    /// a backoff the pause deliberately did not clear. Both edges are crossed
+    /// at once, and reporting only the resumption would leave the long wait
+    /// that immediately follows it unexplained.
+    #[test]
+    fn a_resumption_the_provider_then_limits_reports_both() {
+        let mut g = Gate::default();
+        g.record(&unusable_credential());
+        assert_eq!(
+            edges(g.record(&limited(None))),
+            [Transition::Resumed, Transition::Throttled],
+            "one of the two edges was swallowed"
         );
     }
 
@@ -748,9 +787,9 @@ mod tests {
     #[test]
     fn a_rate_limit_is_reported_once_however_long_it_lasts() {
         let mut g = Gate::default();
-        assert_eq!(g.record(&limited(None)), Some(Transition::Throttled));
+        assert_eq!(edges(g.record(&limited(None))), [Transition::Throttled]);
         for _ in 0..64 {
-            assert_eq!(g.record(&limited(None)), None, "repeated throttle");
+            assert_eq!(edges(g.record(&limited(None))), [], "repeated throttle");
         }
     }
 
