@@ -70,28 +70,14 @@ pub fn render(
         frame.render_widget(placeholder(text, block), area);
         return;
     };
-    let title = readout(app, now).unwrap_or_else(|| {
-        app.charted_trend()
-            .map(|t| t.title.clone())
-            .unwrap_or_else(|| format!("{} — {}", status.account.label, view.window.label))
-    });
-    let inspecting = app.inspect.is_some();
-    let block = block.title_top(
-        Line::from(Span::styled(
-            format!(" {} ", truncate(&title, 72)),
-            if inspecting {
-                Style::default()
-                    .fg(theme::CURSOR)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                theme::heading()
-            },
-        ))
-        .alignment(Alignment::Right),
-    );
+    let fallback = app
+        .charted_trend()
+        .map(|t| t.title.clone())
+        .unwrap_or_else(|| format!("{} — {}", status.account.label, view.window.label));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height < 2 || inner.width < 8 {
+        app.chart_hits.clear();
         return;
     }
     let [strip, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
@@ -104,6 +90,30 @@ pub fn render(
         }
         TrendView::AllWindows => render_all_windows(frame, body, app, now, &mut hits),
         TrendView::History => render_history(frame, body, app, now, &mut hits),
+    }
+
+    // The title last, because a bar's readout is whatever that bar shows on
+    // *this* frame: a rollover landing, or a resize changing how many bars
+    // fit, moves the bars under a cursor that is kept by position.
+    let readout = readout(app, &hits, now);
+    let title = Line::from(Span::styled(
+        format!(
+            " {} ",
+            truncate(readout.as_deref().unwrap_or(&fallback), 72)
+        ),
+        if readout.is_some() {
+            Style::default()
+                .fg(theme::CURSOR)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            theme::heading()
+        },
+    ));
+    if area.width > 2 {
+        frame.render_widget(
+            Paragraph::new(title).alignment(Alignment::Right),
+            Rect::new(area.x + 1, area.y, area.width - 2, 1),
+        );
     }
     app.chart_hits = hits;
 }
@@ -1113,9 +1123,9 @@ fn captioned(frame: &mut Frame<'_>, area: Rect, caption: String) -> Rect {
 /// Highlight for the bar under the cursor.
 fn bar_style(app: &App, plot: Rect, index: usize, color: Color) -> Style {
     match &app.inspect {
-        Some(Inspect::Bar {
-            plot: p, index: i, ..
-        }) if *p == plot && *i == index => Style::default().fg(theme::CURSOR),
+        Some(Inspect::Bar { plot: p, index: i }) if *p == plot && *i == index => Style::default()
+            .fg(theme::CURSOR)
+            .add_modifier(Modifier::REVERSED),
         _ => Style::default().fg(color),
     }
 }
@@ -1314,12 +1324,23 @@ fn burn_bars(
 /// usage, the recent rate with its interval, the average, the projection
 /// and the pace it could afford — so a point on any chart can be read off
 /// against all the others.
-pub fn readout(app: &App, now: DateTime<Utc>) -> Option<String> {
+pub fn readout(app: &App, hits: &[ChartHit], now: DateTime<Utc>) -> Option<String> {
     match app.inspect.as_ref()? {
-        Inspect::Bar { readout, .. } => Some(readout.clone()),
+        Inspect::Bar { plot, index } => {
+            hits.iter()
+                .find(|h| h.plot == *plot)
+                .and_then(|h| match &h.axis {
+                    HitAxis::Bars { readouts, .. } => readouts.get(*index).cloned(),
+                    HitAxis::Time { .. } => None,
+                })
+        }
         Inspect::Reading { window, ts } => {
             let (status, view, snapshots) = series_of(app, window)?;
-            let reading = snapshots.iter().find(|s| s.ts == *ts)?;
+            // By window too: the all-windows page reads every window in one
+            // poll, so a timestamp alone names several readings.
+            let reading = snapshots
+                .iter()
+                .find(|s| s.ts == *ts && &s.window == window)?;
             let mut parts = vec![
                 ts.with_timezone(&Local).format("%a %H:%M").to_string(),
                 usage_text(&teiryo_core::domain::QuotaWindow {

@@ -430,12 +430,22 @@ fn derived_line(
 
     match projection {
         Some(projection) => {
+            let color = if projection.binding(window, now) {
+                theme::WARN
+            } else {
+                theme::DIM
+            };
+            if let (None, Some(fastest)) = (projection.runway.mid, projection.runway.low) {
+                // Flat lately, which is when this is most read: no cap at the
+                // centre, but the fast end of the interval still has one.
+                let value = "cap in ∞".to_owned();
+                fields.push((
+                    format!("{value} ({}–∞)", format_span(fastest)),
+                    Some(value),
+                    Style::default().fg(color),
+                ));
+            }
             if let Some(runway) = projection.runway.mid {
-                let color = if projection.binding(window, now) {
-                    theme::WARN
-                } else {
-                    theme::DIM
-                };
                 if runway <= chrono::Duration::zero() {
                     fields.push(("at cap".to_owned(), None, Style::default().fg(color)));
                 } else {

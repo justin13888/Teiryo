@@ -323,8 +323,12 @@ impl RateEstimate {
 
     /// Whether the interval is narrow enough that widening the lookback would
     /// trade recency for nothing a reader could see.
+    ///
+    /// Never with two readings: their interval is the rounding bound alone,
+    /// with no step scatter to say how bursty the use was, so it can look
+    /// narrow while knowing nothing about the next hour.
     fn is_precise(&self) -> bool {
-        self.width() <= PRECISION_ABS.max(PRECISION_REL * self.pace)
+        self.readings > 2 && self.width() <= PRECISION_ABS.max(PRECISION_REL * self.pace)
     }
 }
 
@@ -550,11 +554,14 @@ pub struct Projection {
 }
 
 impl Projection {
-    /// Whether the cap arrives before the reset at the central rate: the test
-    /// for whether the runway is the binding limit.
+    /// Whether the cap may arrive before the reset: at the *fast* end of the
+    /// rate, not the central one. The test for whether the runway is worth a
+    /// warning — a cap the interval says is plausible before the rollover is
+    /// one to hear about, and waiting for the central estimate to cross
+    /// would warn only once it was as likely as not.
     pub fn binding(&self, window: &EffectiveWindow, now: DateTime<Utc>) -> bool {
         self.runway
-            .mid
+            .low
             .is_some_and(|runway| now + runway < window.reset_at)
     }
 }
@@ -611,8 +618,17 @@ pub struct RatePoint {
 /// A past reading belongs to a window instance the daemon published nothing
 /// about any more, so its start is its own `reset_at` less the nominal
 /// `span`. The one exception is `current`, the live window: a reading that
-/// carries its `reset_at` is measured against it, observed start and all, so
-/// the newest point of the chart agrees with the row beside it.
+/// carries its `reset_at` is measured against it, observed start and all.
+///
+/// The newest point agrees with the row beside it only as far as their
+/// inputs do: the row reads two undownsampled days at the account's own gap
+/// tolerance, a chart reads its range downsampled, at a tolerance widened to
+/// the bucket. Over a long range the chart's rate is the coarser of the two.
+///
+/// The series is filtered and sorted once, and each reading is handed only
+/// the readings of its own instance up to it — the estimator reads nothing
+/// else, and re-filtering the whole series at every reading made this
+/// quadratic in the series rather than in one instance.
 pub fn rate_series(
     window: &WindowId,
     span: Duration,
@@ -620,12 +636,17 @@ pub fn rate_series(
     points: &[QuotaSnapshot],
     max_gap: Duration,
 ) -> Vec<RatePoint> {
-    let mut readings: Vec<&QuotaSnapshot> = points.iter().filter(|p| &p.window == window).collect();
+    let mut readings: Vec<QuotaSnapshot> = points
+        .iter()
+        .filter(|p| &p.window == window)
+        .cloned()
+        .collect();
     readings.sort_by_key(|p| p.ts);
     readings.dedup_by_key(|p| p.ts);
     readings
-        .into_iter()
-        .filter_map(|p| {
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
             let reset_at = p.reset_at?;
             let used = p.utilization();
             let instance = match current {
@@ -640,7 +661,8 @@ pub fn rate_series(
                     used,
                 },
             };
-            let rate = estimate_rate(&instance, points, max_gap, p.ts);
+            let from = readings[..=i].partition_point(|r| r.ts < instance.start);
+            let rate = estimate_rate(&instance, &readings[from..=i], max_gap, p.ts);
             Some(RatePoint {
                 ts: p.ts,
                 window: instance,

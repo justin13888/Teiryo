@@ -189,6 +189,10 @@ pub const OUTCOMES_SPAN_DAYS: i64 = 30;
 /// seven times over, so one unusual day does not make the shape.
 pub const BURN_SPAN_DAYS: i64 = 7;
 
+/// How long the History view's month and week of series are reused before
+/// they are fetched again.
+const SLOW_EXTRA_TTL: Duration = Duration::minutes(10);
+
 /// Points for the burn-by-hour series: ten-minute buckets over the week,
 /// fine enough that no hour's burn is folded into its neighbour's.
 const BURN_MAX_POINTS: u32 = 1008;
@@ -285,10 +289,10 @@ pub enum Inspect {
     Bar {
         /// The plot's position, which tells the bar charts apart.
         plot: Rect,
-        /// Which bar.
+        /// Which bar. What it says is read off the bar chart as drawn, not
+        /// captured at the click: the bars move under a cursor kept by
+        /// position whenever a rollover lands or the pane is resized.
         index: usize,
-        /// What it says, captured when it was clicked.
-        readout: String,
     },
 }
 
@@ -809,6 +813,31 @@ impl App {
     /// Install an auxiliary series.
     pub fn set_extra(&mut self, purpose: Purpose, trend: Trend) {
         self.extras.insert(purpose, trend);
+        self.resnap_inspect();
+    }
+
+    /// Keep the chart cursor on a reading the charts still draw.
+    ///
+    /// A refetch is not the same series again: the daemon keeps the highest
+    /// reading of each bucket, and on a live chart the buckets are anchored
+    /// to an edge that moves with every update, so the reading the cursor was
+    /// on can simply be gone from the next page. Left alone the cursor would
+    /// sit on nothing — no readout, and `,`/`.` with no position to step
+    /// from. It moves to the nearest reading instead, and is put away once
+    /// its instant has scrolled off the series altogether.
+    fn resnap_inspect(&mut self) {
+        let Some(Inspect::Reading { window, ts }) = self.inspect.clone() else {
+            return;
+        };
+        let times = self.reading_times(&window);
+        let first = times.first().copied();
+        self.inspect = match (first, self.nearest_reading(&window, ts)) {
+            (Some(first), Some(nearest)) if ts >= first => Some(Inspect::Reading {
+                window,
+                ts: nearest,
+            }),
+            _ => None,
+        };
     }
 
     /// The auxiliary series the current view needs, as queries.
@@ -821,6 +850,15 @@ impl App {
         };
         wanted
             .iter()
+            // A month of rollovers and a week of readings barely move
+            // between polls; refetching them on every update would make the
+            // History view the most expensive thing the TUI asks for.
+            .filter(|&&purpose| {
+                !matches!(purpose, Purpose::Outcomes | Purpose::Burn)
+                    || self
+                        .extra(purpose)
+                        .is_none_or(|t| now - t.fetched_at >= SLOW_EXTRA_TTL)
+            })
             .filter_map(|&purpose| {
                 let (status, view) = self.extra_target(purpose)?;
                 let account = status.account.id.clone();
@@ -911,6 +949,7 @@ impl App {
         } else {
             self.trend_pan_secs.clamp(0, max)
         };
+        self.resnap_inspect();
     }
 
     /// Install one account's recent history, bucketed per window.
@@ -1005,6 +1044,10 @@ impl App {
     /// of a row, the present moment on the chart.
     fn reset_detail_scroll(&mut self) -> Action {
         let panned = self.trend_pan_secs > 0;
+        if panned {
+            // Back to the present is a pan, and a pan puts the cursor away.
+            self.inspect = None;
+        }
         self.trend_pan_secs = 0;
         self.detail_hscroll = 0;
         if panned {
@@ -1102,10 +1145,9 @@ impl App {
                             ts,
                         })
                     }),
-                    HitAxis::Bars { readouts, .. } => hit.bar_at(at.x).map(|index| Inspect::Bar {
+                    HitAxis::Bars { .. } => hit.bar_at(at.x).map(|index| Inspect::Bar {
                         plot: hit.plot,
                         index,
-                        readout: readouts[index].clone(),
                     }),
                 };
                 // The same point again puts the cursor away.
@@ -1547,7 +1589,8 @@ impl App {
                 // Put the chart cursor away first, then step back out of the
                 // detail pane; only once the cursor is already in the list
                 // does Esc mean "get out of the way".
-                if self.inspect.is_some() {
+                if self.inspect.is_some() && self.detail == DetailTab::Trend && self.detail_visible
+                {
                     self.inspect = None;
                 } else if self.activity_details && self.detail == DetailTab::Activity {
                     self.activity_details = false;
@@ -1647,6 +1690,8 @@ impl App {
             KeyCode::Char('V') => self.set_trend_view(self.trend_view.shift(-1)),
             KeyCode::Char('f') => {
                 self.family_split = !self.family_split;
+                // The cursor may be on the column the split just removed.
+                self.inspect = None;
                 self.set_tab(DetailTab::Trend)
             }
             KeyCode::Char('d') => {
@@ -1673,8 +1718,12 @@ impl App {
                 self.scroll_detail_columns(DETAIL_HSCROLL_STEP);
                 Action::None
             }
-            KeyCode::Char(',') if self.detail == DetailTab::Trend => self.step_inspect(-1),
-            KeyCode::Char('.') if self.detail == DetailTab::Trend => self.step_inspect(1),
+            KeyCode::Char(',') if self.detail_visible && self.detail == DetailTab::Trend => {
+                self.step_inspect(-1)
+            }
+            KeyCode::Char('.') if self.detail_visible && self.detail == DetailTab::Trend => {
+                self.step_inspect(1)
+            }
             KeyCode::Char('r') | KeyCode::Enter => match self.selected_row() {
                 Some(row) => {
                     let account = self.statuses[row.account].account.clone();

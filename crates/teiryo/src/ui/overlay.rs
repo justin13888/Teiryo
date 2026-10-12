@@ -57,6 +57,7 @@ const KEYS: &[(&str, &str)] = &[
     ("", "at the present and at the oldest point)"),
     ("d", "show or hide the detail pane"),
     ("r · Enter", "poll the selected account now"),
+    ("", "(Enter: from the list; in a pane it opens)"),
     ("R", "poll every account now"),
     ("s", "daemon settings (poll intervals, providers)"),
     ("?", "this help"),

@@ -21,8 +21,8 @@ use crate::metrics::{Boundary, BoundaryKind};
 use crate::ui::charts;
 use crate::ui::dashboard::rate_interval;
 use crate::ui::format::{
-    format_countdown, format_elapsed, format_span, outcome_text, pad_to_cells, trigger_glyph,
-    truncate, usage_text,
+    cells, format_countdown, format_elapsed, format_span, outcome_text, pad_to_cells,
+    trigger_glyph, truncate, usage_text,
 };
 use crate::ui::theme;
 
@@ -338,7 +338,11 @@ pub(super) fn x_labels(left: DateTime<Utc>, total: f64, now: DateTime<Utc>) -> V
         let ts = left + chrono::Duration::seconds((total * fraction) as i64);
         let delta = (ts - now).num_seconds();
         let text = match delta {
-            0 => "now".to_owned(),
+            // A live chart's right edge is the instant its series was
+            // fetched, which the frame drawing it trails by up to a refresh.
+            // That is the present to anyone reading the axis; `-1s` is not
+            // a distinction it can make.
+            d if d.abs() < 60 => "now".to_owned(),
             d if d < 0 => format!(
                 "-{}",
                 format_countdown(now - chrono::Duration::seconds(d), now)
@@ -433,7 +437,10 @@ fn render_activity(
         // Wrapped, so a row is as many as its width needs; the error text is
         // the line most likely to run long.
         let width = usize::from(inner.width.max(1));
-        let rows: usize = lines.iter().map(|l| l.width().max(1).div_ceil(width)).sum();
+        let rows: usize = lines
+            .iter()
+            .map(|l| wrapped_rows(&l.to_string(), width))
+            .sum();
         app.set_details_bounds(rows.saturating_sub(usize::from(inner.height)));
         frame.render_widget(
             Paragraph::new(lines)
@@ -444,6 +451,41 @@ fn render_activity(
         );
         app.activity_details_area = area;
     }
+}
+
+/// Rows `text` takes wrapped at `width` the way the Details pane wraps it: by
+/// word, breaking only a word too long for a row on its own.
+///
+/// Counting cells over the width instead undercounts — a word-wrapped row
+/// ends short wherever the next word would not fit — and the scroll bound
+/// built on it left the tail of a long error out of reach.
+fn wrapped_rows(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 1;
+    let mut used = 0;
+    for word in text.split(' ') {
+        let word_width = cells(word);
+        let needed = if used == 0 {
+            word_width
+        } else {
+            used + 1 + word_width
+        };
+        if needed <= width {
+            used = needed;
+        } else if word_width <= width {
+            rows += 1;
+            used = word_width;
+        } else {
+            // A word longer than a row: whatever is on this row stays, and
+            // the word fills rows of its own.
+            if used > 0 {
+                rows += 1;
+            }
+            rows += (word_width - 1) / width;
+            used = word_width - (word_width - 1) / width * width;
+        }
+    }
+    rows
 }
 
 /// Narrowest pane that sets Details beside the log rather than over it.
@@ -554,7 +596,7 @@ pub(super) fn details_lines(event: &PollEvent, now: DateTime<Utc>) -> Vec<Line<'
                     |at| {
                         format!(
                             "{} local · {}",
-                            at.with_timezone(&chrono::Local).format("%a %H:%M"),
+                            at.with_timezone(&chrono::Local).format("%a %m-%d %H:%M"),
                             if at > now {
                                 format!("in {}", format_countdown(at, now))
                             } else {
@@ -775,6 +817,22 @@ mod tests {
     }
 
     #[test]
+    fn details_rows_are_counted_by_word_as_they_wrap() {
+        assert_eq!(wrapped_rows("", 10), 1);
+        assert_eq!(wrapped_rows("abc def", 10), 1);
+        // Fits a row exactly, then one word over.
+        assert_eq!(wrapped_rows("aaaa bbbb cccc", 9), 2);
+        assert_eq!(
+            wrapped_rows("aaaaaa bbbbbb cccccc", 10),
+            3,
+            "20 cells, 3 rows"
+        );
+        // A word longer than the width breaks across rows.
+        assert_eq!(wrapped_rows("aaaaaaaaaaaaaaaaaaaaaaaaa", 10), 3);
+        assert_eq!(wrapped_rows("x aaaaaaaaaaaaaaaaaaaa", 10), 3);
+    }
+
+    #[test]
     fn a_panned_chart_rules_off_the_window_that_is_actually_running() {
         // Panned back an hour on a six-hour range, so the drawn interval ends
         // before the restart the daemon observed.
@@ -885,6 +943,9 @@ mod tests {
         // Unextended, the right edge is the present itself.
         let plain = x_labels(left, DAY, now());
         assert_eq!(plain[2].to_string(), "now");
+        // Including when the frame is drawn a moment after the fetch.
+        let late = x_labels(left, DAY, now() + chrono::Duration::seconds(2));
+        assert_eq!(late[2].to_string(), "now");
     }
 
     /// The activity account column is exactly its budget whatever the account
