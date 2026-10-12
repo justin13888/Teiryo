@@ -105,10 +105,13 @@ The five derived fields, and why each is not the others:
   exists. See below for what it is measured over and how sure it is.
 - **`cap in`** — `project(…).runway`, how long the remaining headroom lasts at
   the recent rate, with the runway at each end of its interval:
-  `cap in 48m (37m–1h05m)`, `∞` where the slow end is zero. Reported whether
-  or not the window resets first: a runway past the reset is a real answer to
-  "how long could I keep this up", and it is drawn dim instead of warn,
-  because the rollover, not the cap, is what arrives. It used to project from
+  `cap in 48m (37m–1h05m)`, `∞` where the slow end is zero — and
+  `cap in ∞ (6h–∞)` when the recent stretch was flat, because the fast end of
+  the interval still has a cap. Reported whether or not the window resets
+  first: a runway past the reset is a real answer to "how long could I keep
+  this up". It is drawn in warn when the runway at the *fast* end of the
+  interval lands before the reset — a cap the interval calls plausible — and
+  dim otherwise, because then the rollover, not the cap, is what arrives. It used to project from
   `pace`, the average since the window opened, which let an idle morning hide
   a hot afternoon; with no recent rate it still does, and says `avg cap in`.
 - **`afford`** — `affordable_pace`, what is left over the time left. The
@@ -173,7 +176,9 @@ stretch, so one rounding step landing mid-stretch threw a slow weekly burn to
   share their rounding error, so no regression can claim better. `q` is
   inferred from the readings themselves — whole numbers, halves or tenths.
 
-The lower end never goes below zero.
+The lower end never goes below zero. An estimate from two readings is never
+called precise, however narrow: its interval is the rounding bound alone, with
+no scatter to say how bursty the use was.
 
 **How far back.** Recency argues for a short stretch and precision for a long
 one, and which wins depends on the series: a 5-hour window in whole percent
@@ -193,6 +198,13 @@ seconds gets a rate averaged over an outage.
 The field is **dropped entirely** when the newest reading is itself older than
 `max_gap`. A series that stopped has no current rate, and printing the last one
 it had under a `now` label is worse than printing nothing.
+
+The rows read **48 hours** of history per account: two doublings past the
+12-hour lookback a weekly window starts from. Twelve alone left a weekly
+window nothing to widen into — one rounding step over twelve hours of a week is
+already wider than the precision target. The charts slide the same estimator
+over their own range, downsampled, at a gap tolerance widened to the bucket, so
+over a long range the chart's rate is the coarser of the two.
 
 The recorded rollover list is deliberately not what guards any of this:
 `boundaries` filters unannounced rollovers out, and an unannounced rollover is
@@ -245,7 +257,8 @@ can stack in it.
 of the two is selected.
 
 Every series is an ordinary `History` request; the extra ones are made only
-for the view that draws them. A week drawn in 480 points has a reading every
+for the view that draws them, and History's month of rollovers and week of
+readings are reused for ten minutes rather than refetched on every poll. A week drawn in 480 points has a reading every
 21 minutes, so the charts measure rates with a gap tolerance widened to twice
 the downsampling bucket — otherwise every step of a long range reads as an
 outage.
@@ -258,7 +271,13 @@ usage, `now` with its interval, the average, the projection and `afford`, as
 they stood then. The cursor runs through every time chart on screen, since they
 share an axis. With the pane focused, Enter puts it on the newest reading and
 `,`/`.` step it a reading at a time. The same point again, a right click or Esc
-puts it away; so does panning or changing the range.
+puts it away; so does panning, `g`, changing the range, or toggling the split.
+A live refetch can drop the very reading the cursor was on — the daemon keeps
+the highest reading of each bucket, and the buckets move with the chart's
+edge — so the cursor moves to the nearest reading that came back, and goes
+away once its instant has scrolled off the series. Enter means this only in a
+focused Trend pane, and opens Details in Activity; from the list it still
+polls, as `r` does everywhere.
 
 Plots are laid out by hand rather than by ratatui's axes, so the rect recorded
 for hit-testing is exactly the rect the data occupies and a column maps back to
@@ -266,10 +285,11 @@ an instant without guessing at label widths.
 
 Three rules from the original single chart still hold on Usage:
 
-- **Rollover-split.** A reset ends the current segment and starts a new one at
-  the new window's start. No diagonal drop. Detected from `reset_at` moving
-  forward, not from `used` decreasing — a provider correction that lowers
-  `used` mid-window is not a rollover and must not break the line.
+- **Rollover-split.** Intended: a reset ends the current segment and starts a
+  new one at the new window's start, detected from `reset_at` moving forward,
+  not from `used` decreasing. The All windows chart and the Pace and Forecast
+  lines break this way; the Usage line itself is still drawn unbroken, as it
+  was before this change, with the boundary rules marking each reset.
 - **Ideal-pace guide.** The gap between the series and the linear burn from the
   window's start to its `reset_at` *is* `metrics::pace`; the Pace chart below
   now draws it directly.
