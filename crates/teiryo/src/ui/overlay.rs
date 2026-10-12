@@ -37,6 +37,8 @@ const KEYS: &[(&str, &str)] = &[
     ),
     ("j / k · ↓ / ↑", "in the list: move selection"),
     ("", "in the detail pane: scroll it sideways"),
+    ("", "(Activity: select a poll; Enter shows Details)"),
+    ("< / >", "scroll Activity sideways"),
     ("", "(Trend pans through time, g returns to now)"),
     (
         "g / G · Home / End",

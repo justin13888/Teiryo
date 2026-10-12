@@ -16,8 +16,8 @@ use ratatui::widgets::ListState;
 
 use teiryo_core::domain::{AccountId, WindowId};
 use teiryo_core::{
-    AccountStatus, ConfigEdit, ConfigState, PollEvent, ProviderHealth, ProviderId, QuotaSnapshot,
-    Request, WindowRollover, WindowView,
+    AccountStatus, ConfigEdit, ConfigState, PollEvent, PollId, ProviderHealth, ProviderId,
+    QuotaSnapshot, Request, WindowRollover, WindowView,
 };
 
 /// Which detail-pane tab is showing.
@@ -529,6 +529,28 @@ pub struct App {
     recent: HashMap<(AccountId, WindowId), Vec<QuotaSnapshot>>,
     /// Loaded poll log.
     pub activity: Vec<PollEvent>,
+    /// The poll the Activity cursor is on, by id: the log is refetched on
+    /// every update and new polls arrive at the top, so an index would slide
+    /// onto a different poll each time one landed.
+    activity_cursor: Option<PollId>,
+    /// Where the cursor last resolved, for when its poll falls off the end of
+    /// the fetched log: the cursor stays at that position rather than
+    /// vanishing.
+    activity_cursor_index: usize,
+    /// Whether the cursor moved since the last frame, so the renderer should
+    /// scroll it into view. Only then: the wheel browses the log without
+    /// moving the cursor, and following it on every frame would undo that.
+    pub activity_follow: bool,
+    /// Whether the Details pane is open beside the log.
+    pub activity_details: bool,
+    /// Where the log's rows were drawn on the last frame.
+    pub activity_list_area: Rect,
+    /// Where the Details pane was drawn on the last frame; empty when shut.
+    pub activity_details_area: Rect,
+    /// Rows the Details pane is scrolled down by.
+    pub details_scroll: usize,
+    /// Largest useful [`App::details_scroll`], as last measured.
+    pub details_scroll_max: usize,
     /// Loaded provider health.
     pub health: Vec<ProviderHealth>,
     /// Modal drawn over the dashboard, if any.
@@ -578,6 +600,14 @@ impl App {
             inspect: None,
             recent: HashMap::new(),
             activity: Vec::new(),
+            activity_cursor: None,
+            activity_cursor_index: 0,
+            activity_follow: false,
+            activity_details: false,
+            activity_list_area: Rect::ZERO,
+            activity_details_area: Rect::ZERO,
+            details_scroll: 0,
+            details_scroll_max: 0,
             health: Vec::new(),
             overlay: None,
             config: None,
@@ -945,7 +975,12 @@ impl App {
     fn scroll_detail(&mut self, delta: isize) -> Action {
         match self.detail {
             DetailTab::Trend => self.pan_trend(delta as i64 * self.trend_key_step_secs()),
-            DetailTab::Activity | DetailTab::Health => {
+            // The log has a row cursor; sideways is `<`/`>` and the wheel.
+            DetailTab::Activity => {
+                self.move_activity_cursor(delta);
+                Action::None
+            }
+            DetailTab::Health => {
                 self.scroll_detail_columns(delta * DETAIL_HSCROLL_STEP);
                 Action::None
             }
@@ -1021,7 +1056,7 @@ impl App {
         };
         if self.detail_area.contains(at) {
             self.focus = Pane::Detail;
-            self.wheel_detail(rows, columns)
+            self.wheel_detail(at, rows, columns)
         } else if self.quotas_area.contains(at) {
             self.focus = Pane::List;
             // The list is one column of rows; a sideways gesture has nowhere
@@ -1077,7 +1112,8 @@ impl App {
                 self.inspect = if target == self.inspect { None } else { target };
                 Action::None
             }
-            DetailTab::Activity | DetailTab::Health => Action::None,
+            DetailTab::Activity => self.click_activity(at),
+            DetailTab::Health => Action::None,
         }
     }
 
@@ -1159,7 +1195,7 @@ impl App {
     /// the chart has only time, the text tabs have rows down and columns
     /// across. Unlike `j`/`k`, which must pick one axis per pane, the wheel
     /// reports which one the user asked for.
-    fn wheel_detail(&mut self, rows: isize, columns: isize) -> Action {
+    fn wheel_detail(&mut self, at: Position, rows: isize, columns: isize) -> Action {
         match self.detail {
             DetailTab::Trend => {
                 // Time is the chart's only axis, so both gestures travel along
@@ -1167,12 +1203,98 @@ impl App {
                 let delta = if columns != 0 { columns } else { rows };
                 self.pan_trend(delta as i64 * self.trend_wheel_step_secs())
             }
+            DetailTab::Activity if self.activity_details_area.contains(at) => {
+                let max = self.details_scroll_max as isize;
+                self.details_scroll = (self.details_scroll as isize + rows).clamp(0, max) as usize;
+                Action::None
+            }
             DetailTab::Activity | DetailTab::Health => {
                 self.scroll_detail_rows(rows);
                 self.scroll_detail_columns(columns);
                 Action::None
             }
         }
+    }
+
+    /// The Activity row the cursor is on, if it has been put on one.
+    pub fn activity_index(&self) -> Option<usize> {
+        let id = self.activity_cursor?;
+        if self.activity.is_empty() {
+            return None;
+        }
+        Some(
+            self.activity
+                .iter()
+                .position(|e| e.id == id)
+                .unwrap_or(self.activity_cursor_index.min(self.activity.len() - 1)),
+        )
+    }
+
+    /// The poll the Activity cursor is on.
+    pub fn activity_selected(&self) -> Option<&PollEvent> {
+        self.activity.get(self.activity_index()?)
+    }
+
+    /// Put the Activity cursor on row `index`, clamped to the log.
+    fn select_activity(&mut self, index: usize) {
+        if self.activity.is_empty() {
+            return;
+        }
+        let index = index.min(self.activity.len() - 1);
+        if Some(index) != self.activity_index() {
+            self.details_scroll = 0;
+        }
+        self.activity_cursor = Some(self.activity[index].id);
+        self.activity_cursor_index = index;
+        self.activity_follow = true;
+    }
+
+    /// Move the Activity cursor `delta` rows; the first press puts it on the
+    /// newest poll.
+    fn move_activity_cursor(&mut self, delta: isize) {
+        let next = match self.activity_index() {
+            Some(i) => (i as isize + delta).max(0) as usize,
+            None => 0,
+        };
+        self.select_activity(next);
+    }
+
+    /// Open or shut the Details pane, putting the cursor on the newest poll
+    /// if it is not on one yet.
+    fn toggle_details(&mut self) -> Action {
+        if self.activity_index().is_none() {
+            self.select_activity(0);
+        }
+        self.activity_details = !self.activity_details && self.activity_index().is_some();
+        self.details_scroll = 0;
+        Action::None
+    }
+
+    /// Record how far the Details pane overruns its viewport.
+    pub fn set_details_bounds(&mut self, rows: usize) {
+        self.details_scroll_max = rows;
+        self.details_scroll = self.details_scroll.min(rows);
+    }
+
+    /// A click on the Activity tab: a row selects it, and the selected row
+    /// again opens or shuts its details.
+    fn click_activity(&mut self, at: Position) -> Action {
+        let list = self.activity_list_area;
+        if !list.contains(at) {
+            return Action::None;
+        }
+        let index = self.detail_scroll + usize::from(at.y - list.y);
+        if index >= self.activity.len() {
+            return Action::None;
+        }
+        if Some(index) == self.activity_index() {
+            return self.toggle_details();
+        }
+        self.select_activity(index);
+        // Following would scroll a row the user just clicked, which is on
+        // screen by definition.
+        self.activity_follow = false;
+        Action::None
     }
 
     /// Distinct providers currently displayed.
@@ -1427,6 +1549,8 @@ impl App {
                 // does Esc mean "get out of the way".
                 if self.inspect.is_some() {
                     self.inspect = None;
+                } else if self.activity_details && self.detail == DetailTab::Activity {
+                    self.activity_details = false;
                 } else if self.focus == Pane::Detail {
                     self.focus = Pane::List;
                 } else {
@@ -1454,6 +1578,9 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => self.focus_pane(Pane::Detail),
             KeyCode::Char('g') | KeyCode::Home => {
                 if self.detail_focused() {
+                    if self.detail == DetailTab::Activity {
+                        self.select_activity(0);
+                    }
                     return self.reset_detail_scroll();
                 }
                 self.select(0);
@@ -1467,6 +1594,10 @@ impl App {
                     if self.detail == DetailTab::Trend {
                         return self.reset_detail_scroll();
                     }
+                    if self.detail == DetailTab::Activity {
+                        self.select_activity(usize::MAX);
+                        return Action::None;
+                    }
                     self.detail_hscroll = self.detail_hscroll_max;
                     return Action::None;
                 }
@@ -1475,6 +1606,14 @@ impl App {
                     self.select(len - 1);
                 }
                 Action::ReloadDetail
+            }
+            KeyCode::PageDown if self.detail == DetailTab::Activity => {
+                self.move_activity_cursor(DETAIL_PAGE);
+                Action::None
+            }
+            KeyCode::PageUp if self.detail == DetailTab::Activity => {
+                self.move_activity_cursor(-DETAIL_PAGE);
+                Action::None
             }
             KeyCode::PageDown => {
                 self.scroll_detail_rows(DETAIL_PAGE);
@@ -1522,6 +1661,17 @@ impl App {
             }
             KeyCode::Enter if self.detail_focused() && self.detail == DetailTab::Trend => {
                 self.toggle_inspect()
+            }
+            KeyCode::Enter if self.detail_focused() && self.detail == DetailTab::Activity => {
+                self.toggle_details()
+            }
+            KeyCode::Char('<') if self.detail_focused() => {
+                self.scroll_detail_columns(-DETAIL_HSCROLL_STEP);
+                Action::None
+            }
+            KeyCode::Char('>') if self.detail_focused() => {
+                self.scroll_detail_columns(DETAIL_HSCROLL_STEP);
+                Action::None
             }
             KeyCode::Char(',') if self.detail == DetailTab::Trend => self.step_inspect(-1),
             KeyCode::Char('.') if self.detail == DetailTab::Trend => self.step_inspect(1),
@@ -2009,12 +2159,14 @@ mod tests {
 
         app.handle_key(key('l'));
         assert_eq!(app.focus, Pane::Detail);
-        app.handle_key(key('j'));
-        app.handle_key(key('j'));
+        // In the log `j`/`k` move its row cursor, so sideways is `<`/`>`.
+        app.handle_key(key('>'));
+        app.handle_key(key('>'));
         assert_eq!(app.detail_hscroll, 2 * DETAIL_HSCROLL_STEP as usize);
+        app.handle_key(key('j'));
         assert_eq!(app.selected_index(), Some(2), "the selection was dragged");
 
-        app.handle_key(key('k'));
+        app.handle_key(key('<'));
         assert_eq!(app.detail_hscroll, DETAIL_HSCROLL_STEP as usize);
         // Esc steps back out of the pane before it collapses it.
         app.handle_key(code(KeyCode::Esc));

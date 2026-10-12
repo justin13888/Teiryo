@@ -93,7 +93,10 @@ fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
         (None, true, Pane::Detail, DetailTab::Trend) => {
             "j/k pan  v view  f split  click/Enter inspect  , . step  g now  h list  [ ] range  ? help"
         }
-        (None, true, Pane::Detail, DetailTab::Activity | DetailTab::Health) => {
+        (None, true, Pane::Detail, DetailTab::Activity) => {
+            "j/k select  Enter/click details  < > across  g/G ends  PgUp/PgDn page  h list  ? help"
+        }
+        (None, true, Pane::Detail, DetailTab::Health) => {
             "j/k scroll across  g/G ends  PgUp/PgDn · wheel rows  h list  Tab tab  ? help  q quit"
         }
     };
@@ -1114,5 +1117,119 @@ mod tests {
         // Session on the left.
         assert!(app.chart_hits[0].plot.x < app.chart_hits[2].plot.x);
         assert!(out.contains("Window weekly with"), "{out}");
+    }
+
+    fn on_activity() -> App {
+        let mut app = populated();
+        app.detail = DetailTab::Activity;
+        app.focus = Pane::Detail;
+        app
+    }
+
+    #[test]
+    fn the_keyboard_selects_a_poll_and_enter_toggles_its_details() {
+        let mut app = on_activity();
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.activity_index(),
+            Some(0),
+            "the first press lands on the newest"
+        );
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.activity_index(), Some(1));
+
+        app.handle_key(key(KeyCode::Enter));
+        let out = rendered(&mut app, 120, 50);
+        assert!(app.activity_details_area.width > 0, "{out}");
+        for field in [
+            "Details",
+            "latency",
+            "341 ms",
+            "manual, from the TUI",
+            "auth error",
+        ] {
+            assert!(out.contains(field), "expected {field:?}:\n{out}");
+        }
+        // The full error, not the column-truncated one.
+        assert!(
+            out.contains("token expired — run `claude` to refresh"),
+            "{out}"
+        );
+        // Wide enough to sit beside the log, which stays readable.
+        assert!(app.activity_list_area.width > 0);
+
+        app.handle_key(key(KeyCode::Enter));
+        rendered(&mut app, 120, 50);
+        assert_eq!(
+            app.activity_details_area,
+            Rect::ZERO,
+            "Enter again shuts it"
+        );
+    }
+
+    #[test]
+    fn clicking_a_poll_selects_it_and_clicking_it_again_toggles_its_details() {
+        let mut app = on_activity();
+        rendered(&mut app, 120, 50);
+        let list = app.activity_list_area;
+        click(&mut app, list.x + 3, list.y + 1);
+        assert_eq!(app.activity_index(), Some(1));
+        assert!(!app.activity_details, "a first click only selects");
+
+        click(&mut app, list.x + 3, list.y + 1);
+        assert!(app.activity_details, "the same row again opens it");
+        rendered(&mut app, 120, 50);
+        let list = app.activity_list_area;
+        click(&mut app, list.x + 3, list.y + 1);
+        assert!(!app.activity_details, "and again shuts it");
+
+        // A click past the last row selects nothing.
+        rendered(&mut app, 120, 50);
+        click(&mut app, list.x + 3, list.y + 10);
+        assert_eq!(app.activity_index(), Some(1));
+    }
+
+    #[test]
+    fn the_cursor_stays_on_its_poll_when_newer_ones_arrive() {
+        let mut app = on_activity();
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        let chosen = app.activity_selected().unwrap().id;
+        // A refresh: a new poll at the top, the old ones shifted down.
+        let mut log = vec![event(false)];
+        log.extend(app.activity.clone());
+        app.activity = log;
+        assert_eq!(app.activity_index(), Some(1));
+        assert_eq!(app.activity_selected().unwrap().id, chosen);
+    }
+
+    #[test]
+    fn a_narrow_pane_shows_details_in_place_of_the_log() {
+        let mut app = on_activity();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let out = rendered(&mut app, 80, 50);
+        assert_eq!(app.activity_list_area, Rect::ZERO, "{out}");
+        assert!(out.contains("Details"), "{out}");
+        // Esc shuts it before it steps out of the pane.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.activity_details);
+        assert_eq!(app.focus, Pane::Detail);
+    }
+
+    #[test]
+    fn a_successful_poll_lists_every_window_it_returned() {
+        let mut app = on_activity();
+        app.activity[0].outcome = PollOutcome::Success {
+            windows: app.statuses[0]
+                .windows
+                .iter()
+                .map(|w| w.window.clone())
+                .collect(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let out = rendered(&mut app, 160, 60);
+        assert!(out.contains("ok · 3 windows"), "{out}");
+        assert!(out.contains("session_5h"), "{out}");
+        assert!(out.contains("model opus · rolling 5h"), "{out}");
     }
 }

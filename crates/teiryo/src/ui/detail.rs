@@ -6,13 +6,13 @@
 //! moment it was opened.
 
 use chrono::{DateTime, Utc};
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use teiryo_core::domain::QuotaUnit;
+use teiryo_core::domain::{ClientKind, PollOutcome, PollTrigger, QuotaUnit, WindowScope};
 use teiryo_core::{PollEvent, ProviderHealth, WindowRollover, WindowView};
 
 use crate::app::{App, DetailTab, Pane, TimeRange, Trend};
@@ -21,8 +21,8 @@ use crate::metrics::{Boundary, BoundaryKind};
 use crate::ui::charts;
 use crate::ui::dashboard::rate_interval;
 use crate::ui::format::{
-    format_countdown, format_elapsed, outcome_text, pad_to_cells, trigger_glyph, truncate,
-    usage_text,
+    format_countdown, format_elapsed, format_span, outcome_text, pad_to_cells, trigger_glyph,
+    truncate, usage_text,
 };
 use crate::ui::theme;
 
@@ -84,7 +84,7 @@ fn footer(app: &App, now: DateTime<Utc>) -> Line<'static> {
         DetailTab::Trend => trend_footer(app, now),
         DetailTab::Activity => Line::from(Span::styled(
             format!(
-                " {} polls · PgUp/PgDn rows · j/k across ",
+                " {} polls · j/k select · Enter or click details · < > across ",
                 app.activity.len()
             ),
             theme::dim(),
@@ -368,21 +368,206 @@ fn render_activity(
     viewport: Rect,
     now: DateTime<Utc>,
 ) {
+    app.activity_list_area = Rect::ZERO;
+    app.activity_details_area = Rect::ZERO;
     if app.activity.is_empty() {
         app.set_detail_bounds(0, 0);
         frame.render_widget(placeholder("no polls recorded yet", block), area);
         return;
     }
-    // A Paragraph rather than a List: the rows are wider than most terminals,
-    // and only a Paragraph can be scrolled sideways to reach the rest of them.
-    // Nothing is lost — the log has no selection to highlight.
-    let lines: Vec<Line<'static>> = app
-        .activity
-        .iter()
-        .map(|event| activity_line(event, now))
-        .collect();
-    let scroll = fit_scroll(app, &lines, viewport);
-    frame.render_widget(Paragraph::new(lines).block(block).scroll(scroll), area);
+    frame.render_widget(block, area);
+    let selected = app.activity_index();
+    // Beside the log where there is room for both to be read; in its place
+    // where there is not, until it is shut again.
+    let (list, details) = match selected.filter(|_| app.activity_details) {
+        Some(_) if viewport.width >= DETAILS_BESIDE_MIN_WIDTH => {
+            let [list, details] =
+                Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                    .areas(viewport);
+            (list, Some(details))
+        }
+        Some(_) => (Rect::ZERO, Some(viewport)),
+        None => (viewport, None),
+    };
+
+    if list.height > 0 {
+        // Bring a cursor that moved back into view: just inside whichever
+        // edge it left by.
+        if let Some(index) = selected.filter(|_| app.activity_follow) {
+            let rows = usize::from(list.height);
+            if index < app.detail_scroll {
+                app.detail_scroll = index;
+            } else if index >= app.detail_scroll + rows {
+                app.detail_scroll = index + 1 - rows;
+            }
+        }
+        // A Paragraph rather than a List: the rows are wider than most
+        // terminals, and only a Paragraph can be scrolled sideways to reach
+        // the rest of them.
+        let lines: Vec<Line<'static>> = app
+            .activity
+            .iter()
+            .enumerate()
+            .map(|(i, event)| {
+                let line = activity_line(event, now);
+                if Some(i) == selected {
+                    line.patch_style(theme::selected())
+                } else {
+                    line
+                }
+            })
+            .collect();
+        let scroll = fit_scroll(app, &lines, list);
+        frame.render_widget(Paragraph::new(lines).scroll(scroll), list);
+        app.activity_list_area = list;
+    }
+    app.activity_follow = false;
+
+    if let (Some(area), Some(event)) = (details, app.activity_selected()) {
+        let block = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(theme::border(app.focus == Pane::Detail))
+            .title(Span::styled(" Details ", theme::heading()));
+        let inner = block.inner(area);
+        let lines = details_lines(event, now);
+        // Wrapped, so a row is as many as its width needs; the error text is
+        // the line most likely to run long.
+        let width = usize::from(inner.width.max(1));
+        let rows: usize = lines.iter().map(|l| l.width().max(1).div_ceil(width)).sum();
+        app.set_details_bounds(rows.saturating_sub(usize::from(inner.height)));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false })
+                .scroll((app.details_scroll.min(u16::MAX as usize) as u16, 0)),
+            area,
+        );
+        app.activity_details_area = area;
+    }
+}
+
+/// Narrowest pane that sets Details beside the log rather than over it.
+const DETAILS_BESIDE_MIN_WIDTH: u16 = 90;
+
+/// Everything a poll event carries, one field to a line.
+pub(super) fn details_lines(event: &PollEvent, now: DateTime<Utc>) -> Vec<Line<'static>> {
+    let field = |name: &str, value: String, style: Style| {
+        Line::from(vec![
+            Span::styled(format!(" {name:<9}"), theme::dim()),
+            Span::styled(value, style),
+        ])
+    };
+    let plain = Style::default();
+    let local = event.ts.with_timezone(&chrono::Local);
+    let (outcome, failed) = match &event.outcome {
+        PollOutcome::Success { windows } => (
+            format!(
+                "ok · {} window{}",
+                windows.len(),
+                if windows.len() == 1 { "" } else { "s" }
+            ),
+            false,
+        ),
+        PollOutcome::AuthError(_) => ("auth error".to_owned(), true),
+        PollOutcome::NetworkError(_) => ("network error".to_owned(), true),
+        PollOutcome::SchemaDrift(_) => ("schema drift".to_owned(), true),
+        PollOutcome::RateLimited { .. } => ("rate limited".to_owned(), true),
+    };
+    let mut lines = vec![
+        field("poll", event.id.to_string(), plain),
+        field(
+            "time",
+            format!(
+                "{} local · {} UTC · {}",
+                local.format("%Y-%m-%d %H:%M:%S"),
+                event.ts.format("%H:%M:%S"),
+                format_elapsed(event.ts, now)
+            ),
+            plain,
+        ),
+        field("provider", event.provider.clone(), plain),
+        field("account", event.account.to_string(), plain),
+        field(
+            "trigger",
+            match &event.trigger {
+                PollTrigger::Scheduled => "scheduled".to_owned(),
+                PollTrigger::Startup => "daemon startup".to_owned(),
+                PollTrigger::Manual {
+                    client: ClientKind::Tui,
+                } => "manual, from the TUI".to_owned(),
+                PollTrigger::Manual {
+                    client: ClientKind::Other(name),
+                } => format!("manual, from {name}"),
+            },
+            plain,
+        ),
+        field(
+            "outcome",
+            outcome,
+            Style::default().fg(if failed { theme::CRIT } else { theme::OK }),
+        ),
+    ];
+    if let Some(message) = event.outcome.error_message() {
+        lines.push(field(
+            "error",
+            message.to_owned(),
+            Style::default().fg(theme::CRIT),
+        ));
+    }
+    if let PollOutcome::RateLimited { retry_after } = &event.outcome {
+        lines.push(field(
+            "retry",
+            retry_after.map_or_else(
+                || "no delay suggested".to_owned(),
+                |d| {
+                    format!(
+                        "after {}",
+                        format_span(chrono::Duration::from_std(d).unwrap_or_default())
+                    )
+                },
+            ),
+            plain,
+        ));
+    }
+    lines.push(field("latency", format!("{} ms", event.latency_ms), plain));
+    if let PollOutcome::Success { windows } = &event.outcome {
+        for window in windows {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {}", window.label), theme::heading()),
+                Span::styled(format!("  {}", window.id), theme::dim()),
+            ]));
+            let scope = match &window.scope {
+                WindowScope::AccountWide => "account-wide".to_owned(),
+                WindowScope::Model(model) => format!("model {model}"),
+            };
+            let span = window.span().map_or_else(
+                || "rolling".to_owned(),
+                |s| format!("rolling {}", format_span(s)),
+            );
+            lines.push(field("scope", format!("{scope} · {span}"), plain));
+            lines.push(field("used", usage_text(window), plain));
+            lines.push(field(
+                "resets",
+                window.reset_at.map_or_else(
+                    || "not published".to_owned(),
+                    |at| {
+                        format!(
+                            "{} local · {}",
+                            at.with_timezone(&chrono::Local).format("%a %H:%M"),
+                            if at > now {
+                                format!("in {}", format_countdown(at, now))
+                            } else {
+                                format!("{} ago", format_countdown(now + (now - at), now))
+                            }
+                        )
+                    },
+                ),
+                plain,
+            ));
+        }
+    }
+    lines
 }
 
 fn activity_line(event: &PollEvent, now: DateTime<Utc>) -> Line<'static> {
