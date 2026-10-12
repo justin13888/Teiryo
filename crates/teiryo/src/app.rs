@@ -8,7 +8,9 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
 
@@ -115,6 +117,179 @@ impl TimeRange {
         let last = Self::ALL.len() as isize - 1;
         Self::ALL[(i + delta).clamp(0, last) as usize]
     }
+}
+
+/// Which set of charts the Trend tab is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrendView {
+    /// Usage over the burn rate, on one time axis, with the data coverage
+    /// beneath them.
+    UsagePace,
+    /// Where the window was projected to land, and the pace it could afford
+    /// against the pace it ran at — both as they stood at every reading.
+    Forecast,
+    /// Every window of the account on one axis.
+    AllWindows,
+    /// What became of past window instances, and when in the day quota goes.
+    History,
+}
+
+impl TrendView {
+    /// Views in display order.
+    pub const ALL: [TrendView; 4] = [
+        TrendView::UsagePace,
+        TrendView::Forecast,
+        TrendView::AllWindows,
+        TrendView::History,
+    ];
+
+    /// Label for the view strip.
+    pub fn label(self) -> &'static str {
+        match self {
+            TrendView::UsagePace => "Usage·Pace",
+            TrendView::Forecast => "Forecast",
+            TrendView::AllWindows => "All windows",
+            TrendView::History => "History",
+        }
+    }
+
+    fn shift(self, delta: isize) -> Self {
+        let i = Self::ALL.iter().position(|v| *v == self).unwrap_or(0) as isize;
+        let len = Self::ALL.len() as isize;
+        Self::ALL[(i + delta).rem_euclid(len) as usize]
+    }
+
+    /// Whether the view draws the selected window's own series and so can be
+    /// split into a session and a weekly column.
+    pub fn splits(self) -> bool {
+        matches!(self, TrendView::UsagePace | TrendView::Forecast)
+    }
+}
+
+/// What a series beyond the selected window's own is fetched for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Purpose {
+    /// The other family's window, for the split columns: the weekly window
+    /// beside a session one, or the reverse.
+    Sibling,
+    /// Every window of the selected account over the charted range.
+    AllWindows,
+    /// A month of the selected window's rollovers, whose last readings are
+    /// the peaks past instances reached.
+    Outcomes,
+    /// A week of the selected window's readings, for burn by hour of day.
+    Burn,
+}
+
+/// A month: how far back the past-window outcomes reach. Rollovers are never
+/// downsampled, so the reach costs only their count.
+pub const OUTCOMES_SPAN_DAYS: i64 = 30;
+
+/// A week: how far back burn by hour of day reaches — every hour of the day
+/// seven times over, so one unusual day does not make the shape.
+pub const BURN_SPAN_DAYS: i64 = 7;
+
+/// Points for the burn-by-hour series: ten-minute buckets over the week,
+/// fine enough that no hour's burn is folded into its neighbour's.
+const BURN_MAX_POINTS: u32 = 1008;
+
+/// Whether a window is a session-length one rather than a weekly one — the
+/// two families the split view sets side by side.
+pub fn is_session(view: &WindowView) -> bool {
+    view.window
+        .span()
+        .is_some_and(|span| span <= Duration::days(1))
+}
+
+/// Where a chart was drawn and what its columns mean.
+///
+/// Recorded by the renderer, the only place that knows both, so a click can
+/// be turned back into the instant or the bar under it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChartHit {
+    /// The plot's cells, axes and labels excluded.
+    pub plot: Rect,
+    /// What a column of the plot is.
+    pub axis: HitAxis,
+}
+
+/// The x axis of a recorded chart.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HitAxis {
+    /// Time, `secs` of it from `left` across the plot's width, charting the
+    /// readings of `window`.
+    Time {
+        /// Instant at the plot's left edge.
+        left: DateTime<Utc>,
+        /// Seconds spanned by the plot's full width.
+        secs: f64,
+        /// Whose readings a click snaps to.
+        window: WindowId,
+    },
+    /// Bars of `width` cells separated by `gap`, each with what it shows.
+    Bars {
+        /// Cells per bar.
+        width: u16,
+        /// Cells between bars.
+        gap: u16,
+        /// One readout per bar, left to right.
+        readouts: Vec<String>,
+    },
+}
+
+impl ChartHit {
+    /// The instant under `column`, for a time axis. The middle of the cell,
+    /// since a cell covers a stretch of time rather than an instant.
+    pub fn instant_at(&self, column: u16) -> Option<DateTime<Utc>> {
+        let HitAxis::Time { left, secs, .. } = &self.axis else {
+            return None;
+        };
+        if self.plot.width == 0 || column < self.plot.x || column >= self.plot.right() {
+            return None;
+        }
+        let fraction = (f64::from(column - self.plot.x) + 0.5) / f64::from(self.plot.width);
+        Some(*left + Duration::milliseconds((fraction * secs * 1000.0) as i64))
+    }
+
+    /// The bar under `column`, for a bar chart.
+    pub fn bar_at(&self, column: u16) -> Option<usize> {
+        let HitAxis::Bars {
+            width,
+            gap,
+            readouts,
+        } = &self.axis
+        else {
+            return None;
+        };
+        let offset = column.checked_sub(self.plot.x)?;
+        let stride = width + gap;
+        if stride == 0 || offset % stride >= *width {
+            return None;
+        }
+        let index = usize::from(offset / stride);
+        (index < readouts.len()).then_some(index)
+    }
+}
+
+/// What the chart cursor is on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Inspect {
+    /// A reading of `window`, taken at `ts`.
+    Reading {
+        /// Whose reading.
+        window: WindowId,
+        /// When it was taken.
+        ts: DateTime<Utc>,
+    },
+    /// The `index`th bar of the bar chart whose plot starts at `plot`.
+    Bar {
+        /// The plot's position, which tells the bar charts apart.
+        plot: Rect,
+        /// Which bar.
+        index: usize,
+        /// What it says, captured when it was clicked.
+        readout: String,
+    },
 }
 
 /// A modal drawn over the dashboard.
@@ -240,11 +415,31 @@ pub enum DetailQuery {
         until: DateTime<Utc>,
         /// The request to send.
         request: Request,
+        /// What else the current view charts, each fetched alongside.
+        extras: Vec<ExtraQuery>,
     },
     /// Recent poll log.
     Activity(Request),
     /// Provider health.
     Health(Request),
+}
+
+/// One auxiliary series the Trend tab needs fetched.
+pub struct ExtraQuery {
+    /// What it is for.
+    pub purpose: Purpose,
+    /// Account to query.
+    pub account: AccountId,
+    /// The window it describes, which is what the reply is checked against.
+    pub window: WindowId,
+    /// Display title.
+    pub title: String,
+    /// Range it is charted over.
+    pub range: TimeRange,
+    /// Right edge of the interval.
+    pub until: DateTime<Utc>,
+    /// The request to send.
+    pub request: Request,
 }
 
 /// What the event loop should do after a key press.
@@ -314,6 +509,20 @@ pub struct App {
     pub detail_area: Rect,
     /// Loaded trend series, if any.
     pub trend: Option<Trend>,
+    /// Which charts the Trend tab is showing.
+    pub trend_view: TrendView,
+    /// Whether the splittable views set the session and weekly windows side
+    /// by side.
+    pub family_split: bool,
+    /// Series beyond the selected window's own, by what they were fetched
+    /// for.
+    extras: HashMap<Purpose, Trend>,
+    /// Every chart drawn on the last frame, for hit-testing the pointer.
+    pub chart_hits: Vec<ChartHit>,
+    /// The view strip's entries as drawn on the last frame.
+    pub view_tabs: Vec<(Rect, TrendView)>,
+    /// What the chart cursor is on, if it is out.
+    pub inspect: Option<Inspect>,
     /// Recent history per window, for the burn rates the rows draw. Keyed by
     /// window rather than held on [`Trend`] because every row needs its own,
     /// not just the selected one.
@@ -361,6 +570,12 @@ impl App {
             quotas_area: Rect::ZERO,
             detail_area: Rect::ZERO,
             trend: None,
+            trend_view: TrendView::UsagePace,
+            family_split: false,
+            extras: HashMap::new(),
+            chart_hits: Vec::new(),
+            view_tabs: Vec::new(),
+            inspect: None,
             recent: HashMap::new(),
             activity: Vec::new(),
             health: Vec::new(),
@@ -471,6 +686,7 @@ impl App {
             // carrying the offset across would open the new chart on empty
             // time rather than on its data.
             self.trend_pan_secs = 0;
+            self.inspect = None;
         }
         self.selection = target;
         self.user_moved = true;
@@ -529,6 +745,104 @@ impl App {
         self.trend
             .as_ref()
             .filter(|t| t.account == status.account.id && t.window == view.window.id)
+    }
+
+    /// The window the split view sets beside the selected one: the first of
+    /// the other family on the same account.
+    pub fn sibling_window(&self) -> Option<(&AccountStatus, &WindowView)> {
+        let (status, view) = self.selected_window()?;
+        let session = is_session(view);
+        status
+            .windows
+            .iter()
+            .find(|w| w.window.reset_at.is_some() && is_session(w) != session)
+            .map(|w| (status, w))
+    }
+
+    /// The window an auxiliary series must describe to be charted now.
+    fn extra_target(&self, purpose: Purpose) -> Option<(&AccountStatus, &WindowView)> {
+        match purpose {
+            Purpose::Sibling => self.sibling_window(),
+            _ => self.selected_window(),
+        }
+    }
+
+    /// An auxiliary series, only while it still describes what the view is
+    /// about — the same guard [`App::charted_trend`] applies to the main one.
+    pub fn extra(&self, purpose: Purpose) -> Option<&Trend> {
+        let (status, view) = self.extra_target(purpose)?;
+        self.extras
+            .get(&purpose)
+            .filter(|t| t.account == status.account.id && t.window == view.window.id)
+    }
+
+    /// Install an auxiliary series.
+    pub fn set_extra(&mut self, purpose: Purpose, trend: Trend) {
+        self.extras.insert(purpose, trend);
+    }
+
+    /// The auxiliary series the current view needs, as queries.
+    fn extra_queries(&self, until: DateTime<Utc>, now: DateTime<Utc>) -> Vec<ExtraQuery> {
+        let wanted: &[Purpose] = match self.trend_view {
+            TrendView::UsagePace | TrendView::Forecast if self.family_split => &[Purpose::Sibling],
+            TrendView::UsagePace | TrendView::Forecast => &[],
+            TrendView::AllWindows => &[Purpose::AllWindows],
+            TrendView::History => &[Purpose::Outcomes, Purpose::Burn],
+        };
+        wanted
+            .iter()
+            .filter_map(|&purpose| {
+                let (status, view) = self.extra_target(purpose)?;
+                let account = status.account.id.clone();
+                let window = view.window.id.clone();
+                let (since, until, window_filter, max_points) = match purpose {
+                    Purpose::Sibling => (
+                        until - self.range.duration(),
+                        until,
+                        Some(window.clone()),
+                        self.range.max_points(),
+                    ),
+                    Purpose::AllWindows => (
+                        until - self.range.duration(),
+                        until,
+                        None,
+                        self.range.max_points(),
+                    ),
+                    // Only the rollovers are wanted, which come undownsampled
+                    // whatever the budget; one point keeps the reply small.
+                    Purpose::Outcomes => (
+                        now - Duration::days(OUTCOMES_SPAN_DAYS),
+                        now,
+                        Some(window.clone()),
+                        1,
+                    ),
+                    Purpose::Burn => (
+                        now - Duration::days(BURN_SPAN_DAYS),
+                        now,
+                        Some(window.clone()),
+                        BURN_MAX_POINTS,
+                    ),
+                };
+                // Panned or not only matters to the range-shaped series.
+                let pinned = matches!(purpose, Purpose::Sibling | Purpose::AllWindows)
+                    && self.trend_pan_secs > 0;
+                Some(ExtraQuery {
+                    purpose,
+                    account: account.clone(),
+                    window,
+                    title: format!("{} — {}", status.account.label, view.window.label),
+                    range: self.range,
+                    until,
+                    request: Request::History {
+                        account,
+                        window: window_filter,
+                        since,
+                        until: pinned.then_some(until),
+                        max_points: Some(max_points),
+                    },
+                })
+            })
+            .collect()
     }
 
     /// Furthest the chart may pan back, in seconds: far enough to bring the
@@ -600,6 +914,7 @@ impl App {
             return Action::None;
         }
         self.trend_pan_secs = panned;
+        self.inspect = None;
         // The visible interval moved, so the series must be refetched.
         Action::ReloadDetail
     }
@@ -686,6 +1001,17 @@ impl App {
         // One notch, one line. A wheel gesture arrives as a stream of these
         // events, so anything coarser turns a flick of the finger into a jump
         // across the whole pane.
+        let at = Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => return self.click(at),
+            MouseEventKind::Down(MouseButton::Right) => {
+                if self.detail_area.contains(at) {
+                    self.inspect = None;
+                }
+                return Action::None;
+            }
+            _ => {}
+        }
         let (rows, columns) = match mouse.kind {
             MouseEventKind::ScrollDown => (1, 0),
             MouseEventKind::ScrollUp => (-1, 0),
@@ -693,7 +1019,6 @@ impl App {
             MouseEventKind::ScrollLeft => (0, -1),
             _ => return Action::None,
         };
-        let at = Position::new(mouse.column, mouse.row);
         if self.detail_area.contains(at) {
             self.focus = Pane::Detail;
             self.wheel_detail(rows, columns)
@@ -709,6 +1034,125 @@ impl App {
         } else {
             Action::None
         }
+    }
+
+    /// A left click: on the detail pane it picks a view, or reads the chart
+    /// under the pointer; anywhere it moves the cursor to the pane clicked.
+    fn click(&mut self, at: Position) -> Action {
+        if self.quotas_area.contains(at) {
+            self.focus = Pane::List;
+            return Action::None;
+        }
+        if !self.detail_area.contains(at) {
+            return Action::None;
+        }
+        self.focus = Pane::Detail;
+        match self.detail {
+            DetailTab::Trend => {
+                if let Some(&(_, view)) = self.view_tabs.iter().find(|(r, _)| r.contains(at)) {
+                    return self.set_trend_view(view);
+                }
+                let Some(hit) = self
+                    .chart_hits
+                    .iter()
+                    .find(|h| h.plot.contains(at))
+                    .cloned()
+                else {
+                    return Action::None;
+                };
+                let target = match &hit.axis {
+                    HitAxis::Time { window, .. } => hit.instant_at(at.x).and_then(|ts| {
+                        self.nearest_reading(window, ts).map(|ts| Inspect::Reading {
+                            window: window.clone(),
+                            ts,
+                        })
+                    }),
+                    HitAxis::Bars { readouts, .. } => hit.bar_at(at.x).map(|index| Inspect::Bar {
+                        plot: hit.plot,
+                        index,
+                        readout: readouts[index].clone(),
+                    }),
+                };
+                // The same point again puts the cursor away.
+                self.inspect = if target == self.inspect { None } else { target };
+                Action::None
+            }
+            DetailTab::Activity | DetailTab::Health => Action::None,
+        }
+    }
+
+    /// The series the current view draws `window`'s readings from.
+    ///
+    /// One series, never a merge: the same window can be loaded twice —
+    /// as the selection's own trend and inside the all-windows page — each
+    /// downsampled on its own, and a cursor stepping through the union would
+    /// land on readings the chart under it never drew.
+    pub fn charted_series(&self, window: &WindowId) -> Option<&Trend> {
+        match self.trend_view {
+            TrendView::AllWindows => self.extra(Purpose::AllWindows),
+            TrendView::UsagePace | TrendView::Forecast => {
+                [self.charted_trend(), self.extra(Purpose::Sibling)]
+                    .into_iter()
+                    .flatten()
+                    .find(|t| &t.window == window)
+            }
+            TrendView::History => None,
+        }
+    }
+
+    /// When `window` was read, oldest first, in the series the current view
+    /// draws it from.
+    fn reading_times(&self, window: &WindowId) -> Vec<DateTime<Utc>> {
+        let mut times: Vec<DateTime<Utc>> = self
+            .charted_series(window)
+            .into_iter()
+            .flat_map(|t| t.snapshots.iter())
+            .filter(|s| &s.window == window)
+            .map(|s| s.ts)
+            .collect();
+        times.sort();
+        times.dedup();
+        times
+    }
+
+    /// The reading of `window` nearest `ts`: a click lands between readings
+    /// far more often than on one, and only a reading has numbers to show.
+    fn nearest_reading(&self, window: &WindowId, ts: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.reading_times(window)
+            .into_iter()
+            .min_by_key(|t| (*t - ts).num_milliseconds().abs())
+    }
+
+    /// Put the chart cursor out on the newest reading, or away.
+    fn toggle_inspect(&mut self) -> Action {
+        if self.inspect.is_some() {
+            self.inspect = None;
+            return Action::None;
+        }
+        if let Some((_, view)) = self.selected_window() {
+            let window = view.window.id.clone();
+            self.inspect = self
+                .reading_times(&window)
+                .last()
+                .map(|&ts| Inspect::Reading { window, ts });
+        }
+        Action::None
+    }
+
+    /// Step the chart cursor `delta` readings along its series.
+    fn step_inspect(&mut self, delta: isize) -> Action {
+        let Some(Inspect::Reading { window, ts }) = self.inspect.clone() else {
+            return self.toggle_inspect();
+        };
+        let times = self.reading_times(&window);
+        if let Some(i) = times.iter().position(|t| *t == ts) {
+            let next = (i as isize + delta).clamp(0, times.len() as isize - 1) as usize;
+            self.inspect = Some(Inspect::Reading {
+                window,
+                ts: times[next],
+            });
+        }
+        Action::None
     }
 
     /// Wheel handling for the detail pane, where each tab has its own axes:
@@ -768,6 +1212,7 @@ impl App {
                         until: (self.trend_pan_secs > 0).then_some(until),
                         max_points: Some(self.range.max_points()),
                     },
+                    extras: self.extra_queries(until, now),
                 })
             }
             DetailTab::Activity => Some(DetailQuery::Activity(Request::RecentPolls {
@@ -977,9 +1422,12 @@ impl App {
                 Action::LoadConfig
             }
             KeyCode::Esc => {
-                // Step back out of the detail pane first; only once the cursor
-                // is already in the list does Esc mean "get out of the way".
-                if self.focus == Pane::Detail {
+                // Put the chart cursor away first, then step back out of the
+                // detail pane; only once the cursor is already in the list
+                // does Esc mean "get out of the way".
+                if self.inspect.is_some() {
+                    self.inspect = None;
+                } else if self.focus == Pane::Detail {
                     self.focus = Pane::List;
                 } else {
                     self.detail_visible = false;
@@ -1045,14 +1493,22 @@ impl App {
             // something different either side of a zoom; start from the
             // present rather than from a distance that no longer applies.
             KeyCode::Char('[') => {
+                self.inspect = None;
                 self.range = self.range.shift(-1);
                 self.trend_pan_secs = 0;
                 Action::ReloadDetail
             }
             KeyCode::Char(']') => {
+                self.inspect = None;
                 self.range = self.range.shift(1);
                 self.trend_pan_secs = 0;
                 Action::ReloadDetail
+            }
+            KeyCode::Char('v') => self.set_trend_view(self.trend_view.shift(1)),
+            KeyCode::Char('V') => self.set_trend_view(self.trend_view.shift(-1)),
+            KeyCode::Char('f') => {
+                self.family_split = !self.family_split;
+                self.set_tab(DetailTab::Trend)
             }
             KeyCode::Char('d') => {
                 self.detail_visible = !self.detail_visible;
@@ -1064,6 +1520,11 @@ impl App {
                     Action::None
                 }
             }
+            KeyCode::Enter if self.detail_focused() && self.detail == DetailTab::Trend => {
+                self.toggle_inspect()
+            }
+            KeyCode::Char(',') if self.detail == DetailTab::Trend => self.step_inspect(-1),
+            KeyCode::Char('.') if self.detail == DetailTab::Trend => self.step_inspect(1),
             KeyCode::Char('r') | KeyCode::Enter => match self.selected_row() {
                 Some(row) => {
                     let account = self.statuses[row.account].account.clone();
@@ -1091,6 +1552,15 @@ impl App {
             }
             _ => Action::None,
         }
+    }
+
+    /// Show `view` on the Trend tab, switching to the tab if need be.
+    fn set_trend_view(&mut self, view: TrendView) -> Action {
+        if view != self.trend_view {
+            self.inspect = None;
+        }
+        self.trend_view = view;
+        self.set_tab(DetailTab::Trend)
     }
 
     fn set_tab(&mut self, tab: DetailTab) -> Action {

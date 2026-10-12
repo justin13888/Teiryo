@@ -592,6 +592,64 @@ pub fn project(
     })
 }
 
+/// One reading of a charted series with everything derived at its instant:
+/// the window instance it belonged to, and the rate the series up to it
+/// supported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RatePoint {
+    /// When the reading was taken.
+    pub ts: DateTime<Utc>,
+    /// The window instance the reading belonged to, with `used` at it.
+    pub window: EffectiveWindow,
+    /// The rate as it would have been estimated at `ts`.
+    pub rate: Option<RateEstimate>,
+}
+
+/// Slide [`estimate_rate`] along a series, as the row would have computed it
+/// at each reading — the history behind the pace, forecast and afford charts.
+///
+/// A past reading belongs to a window instance the daemon published nothing
+/// about any more, so its start is its own `reset_at` less the nominal
+/// `span`. The one exception is `current`, the live window: a reading that
+/// carries its `reset_at` is measured against it, observed start and all, so
+/// the newest point of the chart agrees with the row beside it.
+pub fn rate_series(
+    window: &WindowId,
+    span: Duration,
+    current: Option<&EffectiveWindow>,
+    points: &[QuotaSnapshot],
+    max_gap: Duration,
+) -> Vec<RatePoint> {
+    let mut readings: Vec<&QuotaSnapshot> = points.iter().filter(|p| &p.window == window).collect();
+    readings.sort_by_key(|p| p.ts);
+    readings.dedup_by_key(|p| p.ts);
+    readings
+        .into_iter()
+        .filter_map(|p| {
+            let reset_at = p.reset_at?;
+            let used = p.utilization();
+            let instance = match current {
+                Some(c) if (c.reset_at - reset_at).abs() <= RESET_TOLERANCE && p.ts >= c.start => {
+                    EffectiveWindow { used, ..c.clone() }
+                }
+                _ => EffectiveWindow {
+                    window: window.clone(),
+                    start: reset_at - span,
+                    reset_at,
+                    start_uncertainty: Duration::zero(),
+                    used,
+                },
+            };
+            let rate = estimate_rate(&instance, points, max_gap, p.ts);
+            Some(RatePoint {
+                ts: p.ts,
+                window: instance,
+                rate,
+            })
+        })
+        .collect()
+}
+
 /// Whether a reading was taken inside the window as it stands now, judged by
 /// the reset instant it carried — the only signal a lone snapshot has.
 ///
@@ -1317,6 +1375,31 @@ mod tests {
         };
         let q = project(&bracketed, &shifted, now()).expect("a projection");
         assert!((q.at_reset.mid - p.at_reset.mid).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_rate_series_measures_each_reading_against_its_own_window() {
+        let window = effective(60.0, 4);
+        let mut previous = point(45, 90.0);
+        previous.reset_at = Some(now() - Duration::hours(1));
+        let series = [previous, point(30, 50.0), point(15, 55.0), point(0, 60.0)];
+        let got = rate_series(
+            &WindowId::from("w"),
+            Duration::hours(10),
+            Some(&window),
+            &series,
+            max_gap(),
+        );
+        assert_eq!(got.len(), 4);
+        // The older instance ended an hour ago; the reading belongs to it.
+        assert_eq!(got[0].window.reset_at, now() - Duration::hours(1));
+        // The newest point agrees with what the row computes right now.
+        assert_eq!(
+            got[3].rate,
+            estimate_rate(&window, &series, max_gap(), now())
+        );
+        // And nothing measured before the first reading of an instance.
+        assert_eq!(got[1].rate, None);
     }
 
     #[test]

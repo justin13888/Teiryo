@@ -286,22 +286,47 @@ async fn reload_detail(command: &mut Client, app: &mut App) {
             range,
             until,
             request,
-        } => match command.request(&request).await {
-            Ok(Response::History(page)) => {
-                app.set_trend(Trend {
-                    account,
-                    window,
-                    title,
-                    snapshots: page.snapshots,
-                    rollovers: page.rollovers,
-                    range,
-                    until,
-                    earliest: page.earliest,
-                    fetched_at: now,
-                });
+            extras,
+        } => {
+            match command.request(&request).await {
+                Ok(Response::History(page)) => {
+                    app.set_trend(Trend {
+                        account,
+                        window,
+                        title,
+                        snapshots: page.snapshots,
+                        rollovers: page.rollovers,
+                        range,
+                        until,
+                        earliest: page.earliest,
+                        fetched_at: now,
+                    });
+                }
+                other => return note_unexpected(app, other),
             }
-            other => note_unexpected(app, other),
-        },
+            // Whatever else the view charts. Each reply is checked against
+            // the selection when it is drawn, not here, so one landing after
+            // the cursor moved is simply never shown.
+            for extra in extras {
+                match command.request(&extra.request).await {
+                    Ok(Response::History(page)) => app.set_extra(
+                        extra.purpose,
+                        Trend {
+                            account: extra.account,
+                            window: extra.window,
+                            title: extra.title,
+                            snapshots: page.snapshots,
+                            rollovers: page.rollovers,
+                            range: extra.range,
+                            until: extra.until,
+                            earliest: page.earliest,
+                            fetched_at: now,
+                        },
+                    ),
+                    other => return note_unexpected(app, other),
+                }
+            }
+        }
         DetailQuery::Activity(request) => match command.request(&request).await {
             Ok(Response::RecentPolls(events)) => app.activity = events,
             other => note_unexpected(app, other),
