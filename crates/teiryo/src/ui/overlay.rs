@@ -68,13 +68,17 @@ const KEYS: &[(&str, &str)] = &[
 const NUMBERS: &[(&str, &str)] = &[
     ("⟳ 1h 59m", "when the window rolls over"),
     ("1.03× pace", "burn rate since the window opened"),
-    ("3.00× now", "the same rate over the recent stretch"),
-    ("cap in 1h 50m", "how long the headroom lasts at that pace"),
+    ("3.00× now (2.6–3.4)", "recent rate, with its 80% interval"),
+    ("cap in 1h 50m (…)", "headroom left at the recent rate"),
     (
         "afford 0.95×",
         "the pace that spends the rest exactly by then",
     ),
-    ("→103% at reset", "where the current pace lands"),
+    ("→103% (…) at reset", "where the recent rate lands"),
+    (
+        "avg cap in · avg →",
+        "no recent rate: projected from the average",
+    ),
     ("▲ ▼ =", "above, below, or level with what it affords"),
     ("~", "measured from a start we could only bracket"),
 ];

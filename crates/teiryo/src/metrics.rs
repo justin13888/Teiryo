@@ -167,7 +167,7 @@ pub fn pace(window: &EffectiveWindow, now: DateTime<Utc>) -> Option<f64> {
 /// At a twentieth of the window this bounds pace at `20×`, and costs the
 /// field for the first 15 minutes of a 5-hour window or the first 8 hours of a
 /// weekly one. That is the stretch where the average says least and
-/// [`recent_pace`] says most, and the two are separate fields, so the row
+/// [`estimate_rate`] says most, and the two are separate fields, so the row
 /// still reports a burst that starts right after a reset.
 const MIN_ELAPSED_FRACTION: f64 = 0.05;
 
@@ -250,27 +250,202 @@ pub fn gap_tolerance(poll_interval_secs: u32) -> Duration {
     (Duration::seconds(i64::from(poll_interval_secs)) * 4).max(Duration::minutes(10))
 }
 
-/// How far back a "recent" rate looks: a tenth of the window, but never so
-/// short that two polls dominate it, nor so long that recent stops meaning
-/// anything. A 5-hour window looks back 30 minutes, a weekly one 12 hours.
+/// How far back a "recent" rate looks before it has to widen: a tenth of the
+/// window, but never so short that two polls dominate it, nor so long that
+/// recent stops meaning anything. A 5-hour window looks back 30 minutes, a
+/// weekly one 12 hours.
 fn recent_lookback(span: Duration) -> Duration {
     Duration::seconds((span.num_seconds() / 10).clamp(15 * 60, 12 * 3600))
 }
 
-/// Burn rate over the newest unbroken stretch of the series, on the same scale
-/// as [`pace`]: `1.0` is the rate the window can afford, `2.0` is twice that.
+/// Student-t quantiles at 0.90, for 1 to 30 degrees of freedom — the ends of
+/// the two-sided 80% interval every [`RateEstimate`] carries. A rate fitted
+/// to a handful of readings has a handful of degrees of freedom, and the
+/// normal quantile would understate how little that says.
+const T_QUANTILE: [f64; 30] = [
+    3.078, 1.886, 1.638, 1.533, 1.476, 1.440, 1.415, 1.397, 1.383, 1.372, 1.363, 1.356, 1.350,
+    1.345, 1.341, 1.337, 1.333, 1.330, 1.328, 1.325, 1.323, 1.321, 1.319, 1.318, 1.316, 1.315,
+    1.314, 1.313, 1.311, 1.310,
+];
+
+/// The normal quantile the table converges on past its last row.
+const Z_QUANTILE: f64 = 1.2816;
+
+fn t_quantile(dof: usize) -> f64 {
+    dof.checked_sub(1)
+        .and_then(|i| T_QUANTILE.get(i).copied())
+        .unwrap_or(Z_QUANTILE)
+}
+
+/// How wide an interval may be, on the pace scale, before the lookback widens
+/// to narrow it: an absolute floor, so a near-idle window is not chased back
+/// across the whole stretch for a precision nobody can read...
+const PRECISION_ABS: f64 = 0.25;
+
+/// ...and a share of the rate itself, so a fast burn is not held to a
+/// precision only a slow one needs.
+const PRECISION_REL: f64 = 0.25;
+
+/// A burn rate and how sure of it the series allows us to be, on the scale of
+/// [`pace`]: `1.0` is the rate the window can afford.
+///
+/// The interval is the point. A rate is the slope of a series that the
+/// provider rounds — Claude reports whole percent — and one rounding step
+/// over half an hour of a 5-hour window is a tenth of the whole scale. A
+/// number printed without its interval reads as a measurement whatever it was
+/// derived from, so every consumer that projects from this carries the
+/// interval through.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RateEstimate {
+    /// Central estimate: the burn over the readings used, divided by the
+    /// time between the first and the last.
+    pub pace: f64,
+    /// Lower end of the 80% interval, never below zero — usage
+    /// inside one window instance only climbs.
+    pub low: f64,
+    /// Upper end of the interval.
+    pub high: f64,
+    /// Oldest reading the estimate rests on.
+    pub from: DateTime<Utc>,
+    /// Newest reading the estimate rests on.
+    pub to: DateTime<Utc>,
+    /// How many readings it rests on.
+    pub readings: usize,
+    /// The resolution the readings were reported at, as a utilization ratio.
+    pub quantum: f64,
+}
+
+impl RateEstimate {
+    /// Width of the interval, on the pace scale.
+    pub fn width(&self) -> f64 {
+        self.high - self.low
+    }
+
+    /// Whether the interval is narrow enough that widening the lookback would
+    /// trade recency for nothing a reader could see.
+    fn is_precise(&self) -> bool {
+        self.width() <= PRECISION_ABS.max(PRECISION_REL * self.pace)
+    }
+}
+
+/// The resolution a series is reported at, inferred from its readings and
+/// expressed as a utilization ratio.
+///
+/// Providers round, and how far they round bounds how finely a slope can be
+/// resolved: no fit over a stretch of length `T` can tell rates closer than
+/// one step over `T` apart. Inferred rather than configured because it is a
+/// property of the provider's wire format, which the TUI does not know.
+fn reading_quantum(points: &[&QuotaSnapshot]) -> f64 {
+    let fits = |step: f64| {
+        points
+            .iter()
+            .all(|p| ((p.used / step).round() * step - p.used).abs() < 1e-6)
+    };
+    let raw = if fits(1.0) {
+        1.0
+    } else if fits(0.5) {
+        0.5
+    } else {
+        0.1
+    };
+    // `utilization` is `used` over a scale the unit decides; one raw step is
+    // that scale's share of the bar.
+    let scale = points
+        .last()
+        .and_then(|p| match p.unit {
+            teiryo_core::domain::QuotaUnit::Percent => Some(100.0),
+            _ => p.limit.filter(|l| *l > 0.0),
+        })
+        .unwrap_or(100.0);
+    raw / scale
+}
+
+/// Fit a rate to `run`, which is sorted, deduplicated, and one unbroken
+/// stretch. `None` below two readings or [`MIN_SAMPLE_SECS`].
+///
+/// The centre is the burn over the stretch divided by its length — the
+/// ratio estimator, `Σd / Στ` over the steps between readings. Usage is a
+/// cumulative counter, so that *is* the average rate over the stretch, exact
+/// up to rounding at its two ends. A least-squares slope is not: it weights
+/// the middle of the stretch, so a single rounding step landing mid-stretch
+/// throws it well past the true rate, on exactly the slow, coarse series this
+/// exists for.
+///
+/// The interval's half-width is the larger of two things, because they
+/// describe different ignorance:
+///
+/// - the spread of the steps around that rate — `Σ(d − r·τ)²`, scaled to the
+///   rate's standard error and widened by Student's t for how few steps there
+///   are. This is what bursty use leaves undecided about the rate *going
+///   forward*;
+/// - one rounding step over the whole stretch, `q / T`. The true burn between
+///   two readings rounded to `q` lies within `q` of the reported one, whatever
+///   the convention, so this end of the interval is exact: a steady rate is
+///   always inside it, however few readings there are.
+fn fit(run: &[(DateTime<Utc>, f64)], quantum: f64, span_secs: f64) -> Option<RateEstimate> {
+    let (first_ts, first_used) = *run.first()?;
+    let (last_ts, last_used) = *run.last()?;
+    let elapsed = (last_ts - first_ts).num_seconds() as f64;
+    if run.len() < 2 || elapsed < MIN_SAMPLE_SECS as f64 {
+        return None;
+    }
+    let rate = (last_used - first_used) / elapsed;
+    let steps = run.len() - 1;
+    let statistical = if steps > 1 {
+        let scatter: f64 = run
+            .windows(2)
+            .map(|pair| {
+                let (ts, used) = pair[1];
+                let (prev_ts, prev_used) = pair[0];
+                let tau = (ts - prev_ts).num_seconds() as f64;
+                (used - prev_used - rate * tau).powi(2)
+            })
+            .sum();
+        let dof = steps - 1;
+        let variance = scatter * steps as f64 / dof as f64 / (elapsed * elapsed);
+        t_quantile(dof) * variance.sqrt()
+    } else {
+        0.0
+    };
+    let rounding = quantum / elapsed;
+    let half = statistical.max(rounding);
+    Some(RateEstimate {
+        // A stretch ending inside `FALL_EPSILON` below where it began is one
+        // that was flat, which `0.00×` is the honest reading of.
+        pace: rate.max(0.0) * span_secs,
+        low: (rate - half).max(0.0) * span_secs,
+        high: (rate + half).max(0.0) * span_secs,
+        from: first_ts,
+        to: last_ts,
+        readings: run.len(),
+        quantum,
+    })
+}
+
+/// Burn rate over the newest unbroken stretch of the series, with its
+/// 80% interval, on the same scale as [`pace`].
 ///
 /// [`pace`] averages everything since the window opened, so a sprint after an
 /// idle stretch barely moves it. This measures only the recent end of the
-/// series, which is what says whether the sprint is happening now.
+/// series, which is what says whether the sprint is happening now — and it is
+/// what the cap and the at-reset projection are extrapolated from.
 ///
-/// What counts as "the recent end" is the question the whole function is
-/// about, because a series is not a continuous record. The daemon stops, and
-/// resumes hours later; the provider restarts the window without saying so, or
-/// revises a reading downwards. None of those is a measurement, and averaging
-/// across one invents a rate that was never burnt — so the stretch is walked
-/// backwards from the newest reading and cut at the first step that crosses
-/// one.
+/// What counts as "the recent end" is two questions. The first is where the
+/// series stops being one measurement, because a series is not a continuous
+/// record. The daemon stops, and resumes hours later; the provider restarts
+/// the window without saying so, or revises a reading downwards. None of those
+/// is a measurement, and averaging across one invents a rate that was never
+/// burnt — so the stretch is walked backwards from the newest reading and cut
+/// at the first step that crosses one.
+///
+/// The second is how much of that stretch to use. Recency argues for little
+/// and precision for a lot, and which matters more depends on the readings: a
+/// 5-hour window reported in whole percent resolves a half-hour slope to a
+/// tenth of the scale, a weekly window over the same half hour to nearly
+/// three. So the lookback starts at a tenth of the window and doubles while
+/// the interval is wider than [`PRECISION_ABS`] or [`PRECISION_REL`] of the
+/// rate, until it is narrow enough or the stretch runs out. `from` says where
+/// it ended up, so a caller can say how recent "now" really is.
 ///
 /// The cut on a fall in `used` is deliberately almost *any* fall rather than
 /// one large enough to be a reset. Inside a single window instance usage only
@@ -286,31 +461,34 @@ fn recent_lookback(span: Duration) -> Duration {
 /// `None` when the newest reading is itself older than `max_gap`: a series
 /// that stopped has no current rate, and printing the last one it had under a
 /// `now` label is worse than printing nothing.
-pub fn recent_pace(
+pub fn estimate_rate(
     window: &EffectiveWindow,
     points: &[QuotaSnapshot],
     max_gap: Duration,
     now: DateTime<Utc>,
-) -> Option<f64> {
+) -> Option<RateEstimate> {
     let span = window.span();
     if span.num_seconds() <= 0 {
         return None;
     }
-    let floor = (now - recent_lookback(span)).max(window.start);
 
     // Sorted and deduplicated, because nothing in the protocol promises an
     // ordering and a repeated poll is not a second measurement.
-    let mut run: Vec<(DateTime<Utc>, f64)> = points
+    let mut matching: Vec<&QuotaSnapshot> = points
         .iter()
         .filter(|p| p.window == window.window)
-        .filter(|p| p.ts >= floor && p.ts <= now)
+        .filter(|p| p.ts >= window.start && p.ts <= now)
         .filter(|p| in_same_window(p, window))
+        .filter(|p| p.utilization().is_some())
+        .collect();
+    matching.sort_by_key(|p| p.ts);
+    matching.dedup_by_key(|p| p.ts);
+    let run: Vec<(DateTime<Utc>, f64)> = matching
+        .iter()
         .filter_map(|p| Some((p.ts, p.utilization()?)))
         .collect();
-    run.sort_by_key(|(ts, _)| *ts);
-    run.dedup_by_key(|(ts, _)| *ts);
 
-    let (newest_ts, newest_used) = *run.last()?;
+    let (newest_ts, _) = *run.last()?;
     if now - newest_ts > max_gap {
         return None;
     }
@@ -325,17 +503,93 @@ pub fn recent_pace(
         }
         first -= 1;
     }
+    let stretch = &run[first..];
+    let quantum = reading_quantum(&matching[first..]);
+    let span_secs = span.num_seconds() as f64;
 
-    let (first_ts, first_used) = run[first];
-    let elapsed = (newest_ts - first_ts).num_seconds();
-    if elapsed < MIN_SAMPLE_SECS {
+    // Widen from a tenth of the window until the interval is readable or the
+    // stretch is exhausted. Each pass is a suffix of the stretch, so the
+    // newest reading always anchors it.
+    let mut lookback = recent_lookback(span);
+    loop {
+        let floor = newest_ts - lookback;
+        let start = stretch.partition_point(|(ts, _)| *ts < floor);
+        let exhausted = start == 0;
+        match fit(&stretch[start..], quantum, span_secs) {
+            Some(estimate) if exhausted || estimate.is_precise() => return Some(estimate),
+            None if exhausted => return None,
+            _ => lookback = lookback * 2,
+        }
+    }
+}
+
+/// A range on whatever scale its caller names: a low end, a central value,
+/// and a high end.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Band<T> {
+    /// What the low end of the rate implies.
+    pub low: T,
+    /// What the central rate implies.
+    pub mid: T,
+    /// What the high end of the rate implies.
+    pub high: T,
+}
+
+/// What a rate implies about the rest of the window, carried at both ends of
+/// its interval.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Projection {
+    /// Utilization at `reset_at` if the rate holds, as a ratio that may run
+    /// past `1.0` — `1.4` is "would have wanted 140%".
+    pub at_reset: Band<f64>,
+    /// How long the remaining headroom lasts, at each end of the rate. `high`
+    /// is the *latest* — the slow end of the rate — so the band reads in the
+    /// same order as time. `None` where that end of the rate is zero and the
+    /// cap never arrives.
+    pub runway: Band<Option<Duration>>,
+}
+
+impl Projection {
+    /// Whether the cap arrives before the reset at the central rate: the test
+    /// for whether the runway is the binding limit.
+    pub fn binding(&self, window: &EffectiveWindow, now: DateTime<Utc>) -> bool {
+        self.runway
+            .mid
+            .is_some_and(|runway| now + runway < window.reset_at)
+    }
+}
+
+/// Extrapolate a rate to the reset and to the cap.
+///
+/// Rests on the rate and on `reset_at` only. The window's start enters
+/// through the pace scale and cancels — a pace is a slope times the span, and
+/// projecting divides the span back out — so a projection from a recent rate
+/// carries none of the uncertainty of a bracketed start, unlike one from
+/// [`pace`].
+pub fn project(
+    window: &EffectiveWindow,
+    rate: &RateEstimate,
+    now: DateTime<Utc>,
+) -> Option<Projection> {
+    let used = window.used?;
+    let span = window.span().num_seconds() as f64;
+    if span <= 0.0 {
         return None;
     }
-    // The walk stopped at the last real fall, so the only way the stretch ends
-    // below where it started is a slip inside the epsilon — a stretch that was
-    // flat, which `0.00×` is the honest reading of.
-    let burnt = (newest_used - first_used).max(0.0);
-    Some(burnt / elapsed as f64 * span.num_seconds() as f64)
+    let left = (window.reset_at - now).num_seconds().max(0) as f64 / span;
+    let at = |pace: f64| used + pace * left;
+    Some(Projection {
+        at_reset: Band {
+            low: at(rate.low),
+            mid: at(rate.pace),
+            high: at(rate.high),
+        },
+        runway: Band {
+            low: runway_at(window, rate.high),
+            mid: runway_at(window, rate.pace),
+            high: runway_at(window, rate.low),
+        },
+    })
 }
 
 /// Whether a reading was taken inside the window as it stands now, judged by
@@ -343,7 +597,7 @@ pub fn recent_pace(
 ///
 /// Note what this cannot see: an unannounced restart leaves `reset_at` exactly
 /// where it was, so both sides of one pass this test. Catching those is what
-/// [`recent_pace`]'s cut on a falling reading is for; the two are
+/// [`estimate_rate`]'s cut on a falling reading is for; the two are
 /// complementary, not redundant.
 fn in_same_window(point: &QuotaSnapshot, window: &EffectiveWindow) -> bool {
     point
@@ -451,6 +705,17 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap()
+    }
+
+    /// The central rate alone, which is what every one of these cases was
+    /// written against; the interval has its own tests.
+    fn recent_pace(
+        window: &EffectiveWindow,
+        points: &[QuotaSnapshot],
+        max_gap: Duration,
+        now: DateTime<Utc>,
+    ) -> Option<f64> {
+        estimate_rate(window, points, max_gap, now).map(|e| e.pace)
     }
 
     /// The 10-hour test window as it reaches the TUI, with whatever the daemon
@@ -911,6 +1176,150 @@ mod tests {
     }
 
     #[test]
+    fn two_readings_are_bounded_by_one_rounding_step() {
+        // 10 whole points in 30 minutes of a 10-hour window: 2.0× at the
+        // centre, and the true burn lies within one point of the reported
+        // one, so 9 to 11 points — 1.8× to 2.2×.
+        let window = effective(60.0, 4);
+        let got = estimate_rate(
+            &window,
+            &[point(30, 50.0), point(0, 60.0)],
+            max_gap(),
+            now(),
+        )
+        .expect("a rate");
+        assert_eq!(got.readings, 2);
+        assert_eq!(got.quantum, 0.01);
+        assert_eq!(as_shown(Some(got.low)), Some(1.8));
+        assert_eq!(as_shown(Some(got.pace)), Some(2.0));
+        assert_eq!(as_shown(Some(got.high)), Some(2.2));
+    }
+
+    #[test]
+    fn a_coarse_short_stretch_widens_its_lookback_until_it_reads() {
+        // A weekly window reported in whole percent, read every ten minutes
+        // for 12 hours, burning a point every two hours. Over the 12-hour
+        // lookback one rounding step is 1.4× of a 168-hour window, so the
+        // interval cannot be narrow — and it must say so rather than print
+        // a two-decimal figure as if it were measured.
+        let mut weekly = effective(10.0, 4);
+        weekly.reset_at = now() + Duration::days(3);
+        weekly.start = weekly.reset_at - Duration::days(7);
+        let series: Vec<QuotaSnapshot> = (0..=72)
+            .map(|k| {
+                let minutes = 720 - k * 10;
+                let mut p = point(minutes, 4.0 + (k / 12) as f64);
+                p.reset_at = Some(weekly.reset_at);
+                p
+            })
+            .collect();
+        let got = estimate_rate(&weekly, &series, max_gap(), now()).expect("a rate");
+        // It reached back past its starting 12 hours to the whole stretch.
+        assert_eq!(got.from, now() - Duration::hours(12));
+        assert!(got.low <= got.pace && got.pace <= got.high);
+        // The true rate, 0.5 points an hour, is 0.84×.
+        assert!(got.low <= 0.84 && 0.84 <= got.high, "{got:?}");
+        // One step over 12 hours of a week is 0.14× each side, at least.
+        assert!(got.width() >= 0.28 - 1e-9, "{got:?}");
+    }
+
+    /// The shrunk case that retired the least-squares fit: a slow weekly
+    /// burn read every two minutes for 14 minutes, whole percent, with the
+    /// one rounding step landing mid-stretch. A slope fitted through the step
+    /// read 9.6× (2.4–16.8) against a true 0.71×; the burn over the stretch,
+    /// one point in 14 minutes with one point of rounding either side, holds it.
+    #[test]
+    fn a_rounding_step_mid_stretch_does_not_throw_the_rate() {
+        let mut weekly = effective(10.0, 4);
+        weekly.reset_at = now() + Duration::days(3);
+        weekly.start = weekly.reset_at - Duration::days(7);
+        let series: Vec<QuotaSnapshot> = [10.0, 10.0, 10.0, 10.0, 11.0, 11.0, 11.0, 11.0]
+            .iter()
+            .enumerate()
+            .map(|(k, used)| {
+                let mut p = point(14 - 2 * k as i64, *used);
+                p.reset_at = Some(weekly.reset_at);
+                p
+            })
+            .collect();
+        let got = estimate_rate(&weekly, &series, max_gap(), now()).expect("a rate");
+        assert!(got.low <= 0.71 && 0.71 <= got.high, "{got:?}");
+        assert!(got.pace < 9.0, "{got:?}");
+    }
+
+    #[test]
+    fn the_interval_narrows_as_the_stretch_grows() {
+        // The same steady 10 points an hour, rounded to whole percent, read
+        // every ten minutes over 20 and then over 50 minutes: the rounding
+        // step is spread over more time, so the interval must shrink.
+        let window = effective(60.0, 4);
+        let read = |minutes: i64| -> Vec<QuotaSnapshot> {
+            (0..=minutes / 10)
+                .map(|k| point(minutes - k * 10, (50.0 + k as f64 * 10.0 / 6.0).floor()))
+                .collect()
+        };
+        let short = estimate_rate(&window, &read(20), max_gap(), now()).expect("a rate");
+        let long = estimate_rate(&window, &read(50), max_gap(), now()).expect("a rate");
+        assert!(long.width() < short.width(), "{short:?} vs {long:?}");
+    }
+
+    #[test]
+    fn a_precise_recent_stretch_does_not_reach_back_further() {
+        // A 10-hour window: the lookback starts at an hour, and an hour of
+        // readings every ten minutes at a steady 1 point each resolves the
+        // rate well inside the precision target, so older readings — at a
+        // very different rate — must not leak in.
+        let window = effective(60.0, 4);
+        let mut series: Vec<QuotaSnapshot> = (7..=12)
+            .map(|k| point(k * 10, 30.0 + (12 - k) as f64 * 0.2))
+            .collect();
+        series.extend((0..=6).map(|k| point(60 - k * 10, 54.0 + k as f64)));
+        let got = estimate_rate(&window, &series, max_gap(), now()).expect("a rate");
+        assert_eq!(got.from, now() - Duration::hours(1));
+        // 6 points an hour of a 10-hour window.
+        assert_eq!(as_shown(Some(got.pace)), Some(0.6));
+        assert!(got.width() <= PRECISION_ABS, "{got:?}");
+    }
+
+    #[test]
+    fn a_projection_rests_on_the_rate_and_the_reset_alone() {
+        // 60% used, 4 of 10 hours left, burning at 2.0× (1.8–2.2): another
+        // 80% (72–88%) by the reset, and the 40% left lasts two hours at the
+        // central rate, an hour 49 at the fast end and 2h13 at the slow one.
+        let window = effective(60.0, 4);
+        let rate = estimate_rate(
+            &window,
+            &[point(30, 50.0), point(0, 60.0)],
+            max_gap(),
+            now(),
+        )
+        .expect("a rate");
+        let p = project(&window, &rate, now()).expect("a projection");
+        assert_eq!(as_shown(Some(p.at_reset.mid)), Some(1.4));
+        assert_eq!(as_shown(Some(p.at_reset.low)), Some(1.32));
+        assert_eq!(as_shown(Some(p.at_reset.high)), Some(1.48));
+        assert_eq!(p.runway.mid, Some(Duration::hours(2)));
+        assert!(p.runway.low < p.runway.mid && p.runway.mid < p.runway.high);
+        assert!(
+            p.binding(&window, now()),
+            "the cap lands two hours before the reset"
+        );
+
+        // The same rate against a window whose start is only bracketed
+        // projects exactly the same: the start cancels out.
+        let mut bracketed = window.clone();
+        bracketed.start += Duration::hours(1);
+        let shifted = RateEstimate {
+            pace: rate.pace * 9.0 / 10.0,
+            low: rate.low * 9.0 / 10.0,
+            high: rate.high * 9.0 / 10.0,
+            ..rate
+        };
+        let q = project(&bracketed, &shifted, now()).expect("a projection");
+        assert!((q.at_reset.mid - p.at_reset.mid).abs() < 1e-9);
+    }
+
+    #[test]
     fn a_window_that_just_opened_has_no_recent_stretch_to_measure() {
         // Nothing before the window's own start counts, and it started now.
         let window = effective(0.0, 10);
@@ -1101,6 +1510,17 @@ mod properties {
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap()
+    }
+
+    /// The central rate alone, which is what every one of these cases was
+    /// written against; the interval has its own tests.
+    fn recent_pace(
+        window: &EffectiveWindow,
+        points: &[QuotaSnapshot],
+        max_gap: Duration,
+        now: DateTime<Utc>,
+    ) -> Option<f64> {
+        estimate_rate(window, points, max_gap, now).map(|e| e.pace)
     }
 
     fn hint() -> RenderHint {
@@ -1885,6 +2305,52 @@ mod properties {
                 "read {got:.4} across the reset; the stretch since it burnt at {:.4}",
                 s.newer_pace(),
             );
+        }
+
+        /// **P12 — the interval holds the true rate.** A steady burn
+        /// reported in whole percent, read at an ordinary cadence: whatever
+        /// the rounding did to the readings, the true rate lies inside the
+        /// interval, and the central estimate inside both its ends.
+        #[test]
+        fn the_interval_contains_a_steady_rate_through_rounding(
+            cadence in 120i64..900,
+            readings in 3usize..120,
+            per_hour in 0.0f64..8.0,
+            base_share in 0.0f64..1.0,
+        ) {
+            // Kept under the cap: a reading past 100% clamps, and a clamped
+            // series is flat whatever was burnt.
+            let base = base_share * (99.0 - per_hour * 12.0);
+            let window = series_window((base + per_hour * 12.0).min(100.0) / 100.0);
+            let gap = gap_tolerance(cadence as u32);
+            let points: Vec<QuotaSnapshot> = (0..readings)
+                .filter_map(|k| {
+                    let ago = Duration::seconds(cadence * (readings - 1 - k) as i64);
+                    // Inside the 12-hour fetch every caller has.
+                    (ago <= Duration::hours(12)).then(|| {
+                        let hours = (Duration::hours(12) - ago).num_seconds() as f64 / 3600.0;
+                        QuotaSnapshot {
+                            poll_id: PollId::generate(),
+                            ts: now() - ago,
+                            window: WindowId::from("w"),
+                            label: "w".to_owned(),
+                            unit: QuotaUnit::Percent,
+                            used: (base + per_hour * hours).floor(),
+                            limit: Some(100.0),
+                            reset_at: Some(now() + Duration::days(3)),
+                        }
+                    })
+                })
+                .collect();
+            if let Some(got) = estimate_rate(&window, &points, gap, now()) {
+                let truth = per_hour / 100.0 / 3600.0 * SERIES_SPAN.num_seconds() as f64;
+                prop_assert!(got.low >= 0.0, "{got:?}");
+                prop_assert!(got.low <= got.pace && got.pace <= got.high, "{got:?}");
+                prop_assert!(
+                    got.low - 1e-9 <= truth && truth <= got.high + 1e-9,
+                    "true {truth:.4} outside {got:?}",
+                );
+            }
         }
 
         /// **P9 — the answer does not depend on the order it arrives in.**

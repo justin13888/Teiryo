@@ -621,9 +621,17 @@ mod tests {
 
         assert!(out.contains("1.03× pace"), "expected the average:\n{out}");
         assert!(
-            out.contains("3.00× now"),
-            "expected the recent rate:\n{out}"
+            out.contains("3.00× now ("),
+            "expected the recent rate with its interval:\n{out}"
         );
+        // The runway is the recent rate's, not the average's: the 38% left
+        // at a point a minute lasts 38 minutes, where 1.03× would give hours.
+        assert!(
+            out.contains("cap in 38m 00s ("),
+            "expected a runway at the recent rate:\n{out}"
+        );
+        // And so is the projection, which no longer just restates the pace.
+        assert!(!out.contains("→103%"), "{out}");
         // Windows with no history behind them simply omit the field.
         assert_eq!(out.matches("× now").count(), 1, "only one series:\n{out}");
     }

@@ -233,7 +233,7 @@ async fn refresh_status(command: &mut Client, app: &mut App) {
 }
 
 /// How far back the rows' burn rates may look. Twelve hours covers the longest
-/// lookback `metrics::recent_pace` uses, and at the default cadence it is a few
+/// lookback `metrics::estimate_rate` starts from, and at the default cadence it is a few
 /// hundred readings per window — inside `RECENT_MAX_POINTS`, so the daemon
 /// returns them undownsampled and a rate is measured from real endpoints.
 const RECENT_SPAN_HOURS: i64 = 12;

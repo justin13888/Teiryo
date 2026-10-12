@@ -19,6 +19,7 @@ use teiryo_core::{PollEvent, ProviderHealth, WindowRollover, WindowView};
 use crate::app::{App, DetailTab, Pane, TimeRange, Trend};
 use crate::metrics;
 use crate::metrics::{Boundary, BoundaryKind};
+use crate::ui::dashboard::rate_interval;
 use crate::ui::format::{
     format_countdown, format_elapsed, outcome_text, pad_to_cells, trigger_glyph, truncate,
     usage_text,
@@ -175,14 +176,26 @@ fn trend_footer(app: &App, now: DateTime<Utc>) -> Line<'static> {
         // average since the window opened, this one only the recent end of it.
         let points = app.recent_points(&status.account.id, &view.window.id);
         let max_gap = metrics::gap_tolerance(status.poll_interval_secs);
-        if let Some(recent) = effective
+        if let Some((window, recent)) = effective
             .as_ref()
-            .and_then(|w| metrics::recent_pace(w, points, max_gap, now))
+            .and_then(|w| metrics::estimate_rate(w, points, max_gap, now).map(|rate| (w, rate)))
         {
             spans.push(Span::styled(
-                format!(" · lately {recent:.2}×"),
+                format!(" · lately {:.2}× {}", recent.pace, rate_interval(&recent)),
                 theme::dim(),
             ));
+            if let Some(projection) = metrics::project(window, &recent, now) {
+                let at = projection.at_reset;
+                spans.push(Span::styled(
+                    format!(
+                        " · →{:.0}% ({:.0}–{:.0}%)",
+                        at.mid * 100.0,
+                        at.low * 100.0,
+                        at.high * 100.0
+                    ),
+                    theme::dim(),
+                ));
+            }
         }
         if let Some(note) = &view.hint.note {
             spans.push(Span::styled(
