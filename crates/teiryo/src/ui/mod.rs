@@ -1,6 +1,7 @@
 //! Rendering. One view — header, quota gauges, tabbed detail pane, key bar —
 //! with overlays drawn on top of it.
 
+pub mod charts;
 pub mod dashboard;
 pub mod detail;
 pub mod format;
@@ -21,7 +22,7 @@ const MIN_DETAIL_HEIGHT: u16 = 13;
 
 /// Tallest the detail pane grows to; beyond this the quota list benefits more
 /// from the rows than the chart does.
-const MAX_DETAIL_HEIGHT: u16 = 22;
+const MAX_DETAIL_HEIGHT: u16 = 32;
 
 /// Terminal height below which the detail pane is suppressed, so the quota
 /// list itself does not get squeezed to nothing.
@@ -31,8 +32,12 @@ const MIN_HEIGHT_FOR_DETAIL: u16 = 26;
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let now = Utc::now();
     let area = frame.area();
+    // Whatever was clickable last frame is gone unless this one draws it
+    // again; a hidden pane must not answer clicks on where it used to be.
+    app.chart_hits.clear();
+    app.view_tabs.clear();
     let detail_height = if app.detail_visible && area.height >= MIN_HEIGHT_FOR_DETAIL {
-        (area.height / 3).clamp(MIN_DETAIL_HEIGHT, MAX_DETAIL_HEIGHT)
+        (area.height / 2).clamp(MIN_DETAIL_HEIGHT, MAX_DETAIL_HEIGHT)
     } else {
         0
     };
@@ -86,9 +91,12 @@ fn render_key_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "j/k move  l detail  r poll  R all  Tab tab  [ ] range  d hide  s settings  ? help  q quit"
         }
         (None, true, Pane::Detail, DetailTab::Trend) => {
-            "j/k pan time  wheel nudges  g now  h list  Tab tab  [ ] range  d hide  ? help  q quit"
+            "j/k pan  v view  f split  click/Enter inspect  , . step  g now  h list  [ ] range  ? help"
         }
-        (None, true, Pane::Detail, DetailTab::Activity | DetailTab::Health) => {
+        (None, true, Pane::Detail, DetailTab::Activity) => {
+            "j/k select  Enter/click details  < > across  g/G ends  PgUp/PgDn page  h list  ? help"
+        }
+        (None, true, Pane::Detail, DetailTab::Health) => {
             "j/k scroll across  g/G ends  PgUp/PgDn · wheel rows  h list  Tab tab  ? help  q quit"
         }
     };
@@ -117,7 +125,8 @@ mod tests {
         RolloverKind, WindowRollover, WindowView,
     };
 
-    use crate::app::{DetailTab, Overlay, Trend};
+    use crate::app::{DetailTab, HitAxis, Inspect, Overlay, Purpose, Trend, TrendView};
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
     fn view(id: &str, used: f64, note: Option<&str>) -> WindowView {
         WindowView {
@@ -621,9 +630,17 @@ mod tests {
 
         assert!(out.contains("1.03× pace"), "expected the average:\n{out}");
         assert!(
-            out.contains("3.00× now"),
-            "expected the recent rate:\n{out}"
+            out.contains("3.00× now ("),
+            "expected the recent rate with its interval:\n{out}"
         );
+        // The runway is the recent rate's, not the average's: the 38% left
+        // at a point a minute lasts 38 minutes, where 1.03× would give hours.
+        assert!(
+            out.contains("cap in 38m 00s ("),
+            "expected a runway at the recent rate:\n{out}"
+        );
+        // And so is the projection, which no longer just restates the pace.
+        assert!(!out.contains("→103%"), "{out}");
         // Windows with no history behind them simply omit the field.
         assert_eq!(out.matches("× now").count(), 1, "only one series:\n{out}");
     }
@@ -874,5 +891,610 @@ mod tests {
             }
         }
         draw(&mut app, 100, 40);
+    }
+
+    /// A frame of the Trend tab with every auxiliary series loaded, so each
+    /// view has what it draws.
+    fn charted() -> App {
+        let mut app = populated();
+        app.detail = DetailTab::Trend;
+        let trend = trend_for(&app, 90);
+        // Every window of the account over the same interval, for the
+        // all-windows view: the selected one's readings under each id.
+        let mut all = trend_for(&app, 90);
+        for id in ["weekly", "weekly_opus"] {
+            all.snapshots
+                .extend(trend.snapshots.iter().map(|s| QuotaSnapshot {
+                    window: WindowId::from(id),
+                    used: s.used / 2.0,
+                    ..s.clone()
+                }));
+        }
+        app.set_extra(Purpose::AllWindows, all);
+        app.set_extra(Purpose::Outcomes, trend_for(&app, 2));
+        app.set_extra(Purpose::Burn, trend_for(&app, 90));
+        app.set_recent(
+            &AccountId::from("claude:default"),
+            recent_ramp("session_5h", 20, 42.0, 62.0),
+        );
+        app.trend = Some(trend);
+        app
+    }
+
+    fn click(app: &mut App, column: u16, row: u16) -> crate::app::Action {
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// The plot column a reading at `ts` lands in, by the geometry recorded
+    /// for the chart.
+    fn column_of(app: &App, chart: usize, ts: chrono::DateTime<Utc>) -> u16 {
+        let hit = &app.chart_hits[chart];
+        let HitAxis::Time { left, secs, .. } = &hit.axis else {
+            panic!("not a time chart");
+        };
+        let fraction = (ts - *left).num_milliseconds() as f64 / 1000.0 / secs;
+        hit.plot.x + (fraction * f64::from(hit.plot.width)) as u16
+    }
+
+    #[test]
+    fn the_usage_view_stacks_a_rate_chart_and_the_coverage_under_usage() {
+        let mut app = charted();
+        let out = rendered(&mut app, 120, 60);
+        assert_eq!(app.chart_hits.len(), 2, "usage and pace:\n{out}");
+        let (usage, pace) = (&app.chart_hits[0].plot, &app.chart_hits[1].plot);
+        assert!(usage.y < pace.y, "usage above pace");
+        // One label column for both, so their time axes line up.
+        assert_eq!((usage.x, usage.width), (pace.x, pace.width));
+        for legend in ["now", "80%", "avg", "data", "Usage·Pace", "Forecast"] {
+            assert!(out.contains(legend), "expected {legend:?}:\n{out}");
+        }
+        // The coverage strip marks readings.
+        assert!(out.contains("•"), "{out}");
+    }
+
+    #[test]
+    fn every_view_renders_with_its_data_and_records_what_it_drew() {
+        for (view, hits, expect) in [
+            (TrendView::Forecast, 2, "afford"),
+            (TrendView::AllWindows, 1, "Window weekly_opus"),
+            (TrendView::History, 2, "burn by hour of day"),
+        ] {
+            let mut app = charted();
+            app.trend_view = view;
+            let out = rendered(&mut app, 120, 60);
+            assert_eq!(app.chart_hits.len(), hits, "{view:?}:\n{out}");
+            assert!(out.contains(expect), "{view:?} lacks {expect:?}:\n{out}");
+            // And at every size, without panicking.
+            for (w, h) in [(20, 5), (60, 30), (80, 40), (240, 80)] {
+                draw(&mut app, w, h);
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_pane_keeps_the_usage_chart_and_drops_the_rate_chart() {
+        let mut app = charted();
+        // 26 rows is the smallest terminal that shows the pane at all.
+        draw(&mut app, 120, 26);
+        assert_eq!(app.chart_hits.len(), 1, "usage alone");
+    }
+
+    #[test]
+    fn a_click_on_a_chart_reads_out_the_reading_under_it_and_again_puts_it_away() {
+        let mut app = charted();
+        rendered(&mut app, 120, 60);
+        let target = app.trend.as_ref().unwrap().snapshots[60].clone();
+        let column = column_of(&app, 1, target.ts);
+        let row = app.chart_hits[1].plot.y + 1;
+
+        click(&mut app, column, row);
+        assert_eq!(app.focus, Pane::Detail, "a click moves the cursor there");
+        let Some(Inspect::Reading { ts, .. }) = app.inspect.clone() else {
+            panic!("expected a reading, got {:?}", app.inspect);
+        };
+        // Snapped to a reading within a column's width of the one aimed at:
+        // a column of a 24-hour chart is a quarter of an hour wide.
+        let HitAxis::Time { secs, .. } = &app.chart_hits[1].axis else {
+            panic!("a time chart");
+        };
+        let cell = secs / f64::from(app.chart_hits[1].plot.width);
+        assert!(
+            ((ts - target.ts).num_seconds().abs() as f64) <= cell,
+            "{ts} vs {}",
+            target.ts
+        );
+        let snapped = app
+            .trend
+            .as_ref()
+            .unwrap()
+            .snapshots
+            .iter()
+            .find(|s| s.ts == ts)
+            .unwrap()
+            .used;
+        let out = rendered(&mut app, 120, 60);
+        assert!(
+            out.contains(&format!("{snapped:.0}% used")),
+            "readout:\n{out}"
+        );
+
+        // The same point again.
+        rendered(&mut app, 120, 60);
+        let again = column_of(&app, 1, ts);
+        click(&mut app, again, row);
+        assert_eq!(app.inspect, None);
+    }
+
+    #[test]
+    fn the_keyboard_walks_the_chart_cursor_reading_by_reading() {
+        let mut app = charted();
+        app.focus = Pane::Detail;
+        rendered(&mut app, 120, 60);
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        app.handle_key(key(KeyCode::Enter));
+        let times: Vec<_> = app
+            .trend
+            .as_ref()
+            .unwrap()
+            .snapshots
+            .iter()
+            .map(|s| s.ts)
+            .collect();
+        let at = |app: &App| match &app.inspect {
+            Some(Inspect::Reading { ts, .. }) => Some(*ts),
+            _ => None,
+        };
+        assert_eq!(
+            at(&app),
+            times.last().copied(),
+            "Enter starts at the newest"
+        );
+        app.handle_key(key(KeyCode::Char('.')));
+        assert_eq!(at(&app), times.last().copied(), "and stops there");
+        app.handle_key(key(KeyCode::Char(',')));
+        assert_eq!(at(&app), Some(times[times.len() - 2]));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.inspect, None, "Esc puts it away");
+        assert_eq!(app.focus, Pane::Detail, "before leaving the pane");
+    }
+
+    #[test]
+    fn a_click_on_a_bar_reads_out_what_it_stands_for() {
+        let mut app = charted();
+        app.trend_view = TrendView::History;
+        rendered(&mut app, 120, 60);
+        let burn = app.chart_hits[1].clone();
+        let HitAxis::Bars { width, gap, .. } = burn.axis else {
+            panic!("bars");
+        };
+        // The fourth bar: hour 03.
+        click(
+            &mut app,
+            burn.plot.x + 3 * (width + gap),
+            burn.plot.bottom() - 2,
+        );
+        let out = rendered(&mut app, 120, 60);
+        assert!(out.contains("03:00–04:00"), "{out}");
+    }
+
+    #[test]
+    fn clicking_a_view_name_switches_to_it() {
+        let mut app = charted();
+        rendered(&mut app, 120, 60);
+        let (rect, view) = app.view_tabs[2];
+        assert_eq!(view, TrendView::AllWindows);
+        assert!(matches!(
+            click(&mut app, rect.x, rect.y),
+            crate::app::Action::ReloadDetail
+        ));
+        assert_eq!(app.trend_view, TrendView::AllWindows);
+    }
+
+    #[test]
+    fn the_split_sets_the_session_window_beside_the_weekly_one() {
+        let mut app = charted();
+        // Make the selected window's neighbour a weekly one.
+        for status in &mut app.statuses {
+            status.windows[1].window.reset_kind =
+                ResetKind::Rolling(std::time::Duration::from_secs(7 * 24 * 3600));
+        }
+        app.family_split = true;
+        let (_, sibling) = app.sibling_window().expect("a weekly sibling");
+        assert_eq!(sibling.window.id, WindowId::from("weekly"));
+        let mut weekly = trend_for(&app, 90);
+        weekly.window = WindowId::from("weekly");
+        for s in &mut weekly.snapshots {
+            s.window = WindowId::from("weekly");
+        }
+        app.set_extra(Purpose::Sibling, weekly);
+        let out = rendered(&mut app, 160, 60);
+        assert_eq!(app.chart_hits.len(), 4, "two stacks:\n{out}");
+        // Session on the left.
+        assert!(app.chart_hits[0].plot.x < app.chart_hits[2].plot.x);
+        assert!(out.contains("Window weekly with"), "{out}");
+    }
+
+    fn on_activity() -> App {
+        let mut app = populated();
+        app.detail = DetailTab::Activity;
+        app.focus = Pane::Detail;
+        app
+    }
+
+    #[test]
+    fn the_keyboard_selects_a_poll_and_enter_toggles_its_details() {
+        let mut app = on_activity();
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.activity_index(),
+            Some(0),
+            "the first press lands on the newest"
+        );
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.activity_index(), Some(1));
+
+        app.handle_key(key(KeyCode::Enter));
+        let out = rendered(&mut app, 120, 50);
+        assert!(app.activity_details_area.width > 0, "{out}");
+        for field in [
+            "Details",
+            "latency",
+            "341 ms",
+            "manual, from the TUI",
+            "auth error",
+        ] {
+            assert!(out.contains(field), "expected {field:?}:\n{out}");
+        }
+        // The full error, not the column-truncated one.
+        assert!(
+            out.contains("token expired — run `claude` to refresh"),
+            "{out}"
+        );
+        // Wide enough to sit beside the log, which stays readable.
+        assert!(app.activity_list_area.width > 0);
+
+        app.handle_key(key(KeyCode::Enter));
+        rendered(&mut app, 120, 50);
+        assert_eq!(
+            app.activity_details_area,
+            Rect::ZERO,
+            "Enter again shuts it"
+        );
+    }
+
+    #[test]
+    fn clicking_a_poll_selects_it_and_clicking_it_again_toggles_its_details() {
+        let mut app = on_activity();
+        rendered(&mut app, 120, 50);
+        let list = app.activity_list_area;
+        click(&mut app, list.x + 3, list.y + 1);
+        assert_eq!(app.activity_index(), Some(1));
+        assert!(!app.activity_details, "a first click only selects");
+
+        click(&mut app, list.x + 3, list.y + 1);
+        assert!(app.activity_details, "the same row again opens it");
+        rendered(&mut app, 120, 50);
+        let list = app.activity_list_area;
+        click(&mut app, list.x + 3, list.y + 1);
+        assert!(!app.activity_details, "and again shuts it");
+
+        // A click past the last row selects nothing.
+        rendered(&mut app, 120, 50);
+        click(&mut app, list.x + 3, list.y + 10);
+        assert_eq!(app.activity_index(), Some(1));
+    }
+
+    /// The wheel over the Details pane scrolls the details, not the log, one
+    /// line a notch, and stops where the content ends.
+    #[test]
+    fn the_wheel_scrolls_the_details_pane_and_stops_at_its_end() {
+        let mut app = on_activity();
+        // An error long enough to wrap past the bottom of the pane.
+        app.activity[1].outcome =
+            PollOutcome::AuthError("token expired — run `claude` to refresh. ".repeat(8));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let out = rendered(&mut app, 100, 26);
+        let max = app.details_scroll_max;
+        assert!(max > 0, "the details overrun a short pane:\n{out}");
+        let area = app.activity_details_area;
+        let (column, row) = (area.x + 2, area.y + 2);
+        let notch = |app: &mut App, kind| {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        notch(&mut app, MouseEventKind::ScrollDown);
+        assert_eq!(app.details_scroll, 1);
+        for _ in 0..max + 5 {
+            notch(&mut app, MouseEventKind::ScrollDown);
+        }
+        assert_eq!(app.details_scroll, max, "no further than the content");
+        assert_eq!(app.detail_scroll, 0, "the log stays put");
+        let out = rendered(&mut app, 100, 26);
+        assert_eq!(app.details_scroll, max, "and the next frame agrees:\n{out}");
+        for _ in 0..max + 5 {
+            notch(&mut app, MouseEventKind::ScrollUp);
+        }
+        assert_eq!(app.details_scroll, 0);
+    }
+
+    /// A right click on the pane puts the chart cursor away; one elsewhere
+    /// leaves it.
+    #[test]
+    fn a_right_click_on_the_pane_puts_the_chart_cursor_away() {
+        let mut app = charted();
+        app.focus = Pane::Detail;
+        rendered(&mut app, 120, 60);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.inspect.is_some());
+        let right = |app: &mut App, at: Rect| {
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: at.x + 1,
+                row: at.y + 1,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let quotas = app.quotas_area;
+        right(&mut app, quotas);
+        assert!(app.inspect.is_some(), "outside the pane it stays");
+        let plot = app.chart_hits[0].plot;
+        right(&mut app, plot);
+        assert_eq!(app.inspect, None);
+    }
+
+    #[test]
+    fn the_cursor_stays_on_its_poll_when_newer_ones_arrive() {
+        let mut app = on_activity();
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        let chosen = app.activity_selected().unwrap().id;
+        // A refresh: a new poll at the top, the old ones shifted down.
+        let mut log = vec![event(false)];
+        log.extend(app.activity.clone());
+        app.activity = log;
+        assert_eq!(app.activity_index(), Some(1));
+        assert_eq!(app.activity_selected().unwrap().id, chosen);
+    }
+
+    #[test]
+    fn a_narrow_pane_shows_details_in_place_of_the_log() {
+        let mut app = on_activity();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let out = rendered(&mut app, 80, 50);
+        assert_eq!(app.activity_list_area, Rect::ZERO, "{out}");
+        assert!(out.contains("Details"), "{out}");
+        // Esc shuts it before it steps out of the pane.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.activity_details);
+        assert_eq!(app.focus, Pane::Detail);
+    }
+
+    #[test]
+    fn a_successful_poll_lists_every_window_it_returned() {
+        let mut app = on_activity();
+        app.activity[0].outcome = PollOutcome::Success {
+            windows: app.statuses[0]
+                .windows
+                .iter()
+                .map(|w| w.window.clone())
+                .collect(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let out = rendered(&mut app, 160, 60);
+        assert!(out.contains("ok · 3 windows"), "{out}");
+        assert!(out.contains("session_5h"), "{out}");
+        assert!(out.contains("model opus · rolling 5h"), "{out}");
+    }
+
+    /// The all-windows page reads every window in one poll, so a timestamp
+    /// alone names several readings; the readout must be the selected one's.
+    #[test]
+    fn the_all_windows_readout_is_the_selected_windows_own_reading() {
+        let mut app = charted();
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            app.selected_window().unwrap().1.window.id,
+            WindowId::from("weekly")
+        );
+        // Session readings first in the page, weekly ones at half of them,
+        // taken by the same polls.
+        let mut all = trend_for(&app, 90);
+        all.window = WindowId::from("weekly");
+        for s in &mut all.snapshots {
+            s.window = WindowId::from("session_5h");
+        }
+        let session = all.snapshots.clone();
+        all.snapshots.extend(session.iter().map(|s| QuotaSnapshot {
+            window: WindowId::from("weekly"),
+            used: s.used / 2.0,
+            ..s.clone()
+        }));
+        let snapshots = all.snapshots.clone();
+        app.set_extra(Purpose::AllWindows, all);
+        app.trend_view = TrendView::AllWindows;
+        rendered(&mut app, 120, 60);
+        let target = &snapshots[90 + 80];
+        let column = column_of(&app, 0, target.ts);
+        let row = app.chart_hits[0].plot.y + 1;
+        click(&mut app, column, row);
+        let Some(Inspect::Reading { ts, .. }) = app.inspect.clone() else {
+            panic!("a reading");
+        };
+        let weekly = snapshots
+            .iter()
+            .find(|s| s.ts == ts && s.window == WindowId::from("weekly"))
+            .unwrap();
+        let session = snapshots
+            .iter()
+            .find(|s| s.ts == ts && s.window == WindowId::from("session_5h"))
+            .unwrap();
+        assert_ne!(
+            format!("{:.0}", weekly.used),
+            format!("{:.0}", session.used)
+        );
+        let out = rendered(&mut app, 120, 60);
+        assert!(
+            out.contains(&format!(" · {:.0}% used", weekly.used)),
+            "expected weekly's {:.0}%, not session's {:.0}%:\n{out}",
+            weekly.used,
+            session.used
+        );
+    }
+
+    /// The daemon's buckets move with every live refetch, so the reading the
+    /// cursor was on may not come back; it moves to the nearest that does.
+    #[test]
+    fn the_chart_cursor_follows_a_refetch_and_leaves_with_its_reading() {
+        let mut app = charted();
+        app.focus = Pane::Detail;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Some(Inspect::Reading { ts, .. }) = app.inspect.clone() else {
+            panic!("a reading");
+        };
+        // The same series, every reading 20 seconds later.
+        let mut moved = trend_for(&app, 90);
+        for s in &mut moved.snapshots {
+            s.ts += Duration::seconds(20);
+        }
+        let expected = moved
+            .snapshots
+            .iter()
+            .map(|s| s.ts)
+            .min_by_key(|t| (*t - ts).num_milliseconds().abs())
+            .unwrap();
+        app.set_trend(moved);
+        assert_eq!(
+            app.inspect,
+            Some(Inspect::Reading {
+                window: WindowId::from("session_5h"),
+                ts: expected
+            })
+        );
+        let out = rendered(&mut app, 120, 60);
+        assert!(out.contains("% used ·"), "the readout survives:\n{out}");
+        app.handle_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE));
+        assert_ne!(
+            app.inspect,
+            Some(Inspect::Reading {
+                window: WindowId::from("session_5h"),
+                ts: expected
+            }),
+            "and it still steps"
+        );
+
+        // A series that now begins after the cursor's instant: it scrolled
+        // off the left edge, and the cursor goes with it.
+        for _ in 0..60 {
+            app.handle_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE));
+        }
+        let mut later = trend_for(&app, 90);
+        later
+            .snapshots
+            .retain(|s| s.ts > Utc::now() - Duration::minutes(10));
+        app.set_trend(later);
+        assert_eq!(app.inspect, None);
+    }
+
+    /// A reading published without a reset has no rate behind it, but its
+    /// time and usage are still worth reading out.
+    #[test]
+    fn a_reading_without_a_reset_still_reads_out_its_time_and_usage() {
+        let mut app = charted();
+        app.focus = Pane::Detail;
+        let trend = app.trend.as_mut().unwrap();
+        let last = trend.snapshots.last_mut().unwrap();
+        last.reset_at = None;
+        let (ts, used) = (last.ts, last.used);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.inspect,
+            Some(Inspect::Reading {
+                window: WindowId::from("session_5h"),
+                ts
+            })
+        );
+        let out = rendered(&mut app, 120, 60);
+        let time = ts
+            .with_timezone(&chrono::Local)
+            .format("%a %H:%M")
+            .to_string();
+        assert!(
+            out.contains(&format!("{time} · {used:.0}% used")),
+            "readout:\n{out}"
+        );
+    }
+
+    #[test]
+    fn returning_to_the_present_puts_the_chart_cursor_away() {
+        let mut app = charted();
+        app.focus = Pane::Detail;
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert!(!app.trend_is_live());
+        app.trend = Some(trend_for(&app, 90));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.inspect.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(app.inspect, None);
+    }
+
+    #[test]
+    fn esc_on_another_tab_does_not_spend_itself_on_an_unseen_chart_cursor() {
+        let mut app = charted();
+        app.focus = Pane::Detail;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.inspect.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.activity_details);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            !app.activity_details,
+            "the first Esc shuts what is on screen"
+        );
+    }
+
+    #[test]
+    fn a_flat_recent_stretch_still_says_how_soon_the_cap_could_come() {
+        let mut app = populated();
+        app.set_recent(
+            &AccountId::from("claude:default"),
+            recent_ramp("session_5h", 20, 62.0, 62.0),
+        );
+        let out = rendered(&mut app, 140, 40);
+        assert!(out.contains("0.00× now ("), "{out}");
+        assert!(out.contains("cap in ∞ ("), "{out}");
+    }
+
+    #[test]
+    fn a_narrow_row_drops_an_interval_before_the_value_it_belongs_to() {
+        let mut app = populated();
+        app.set_recent(
+            &AccountId::from("claude:default"),
+            recent_ramp("session_5h", 20, 42.0, 62.0),
+        );
+        let out = rendered(&mut app, 36, 40);
+        assert!(out.contains("3.00× now"), "{out}");
+        assert!(!out.contains("3.00× now ("), "{out}");
+    }
+
+    #[test]
+    fn without_a_recent_rate_the_projections_say_they_are_the_averages() {
+        let mut app = populated();
+        let out = rendered(&mut app, 140, 40);
+        assert!(out.contains("avg cap in"), "{out}");
+        assert!(out.contains("avg →"), "{out}");
+        assert!(!out.contains("× now"), "{out}");
     }
 }

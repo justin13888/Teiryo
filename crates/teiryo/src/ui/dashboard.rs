@@ -362,15 +362,24 @@ const MIN_BAR: usize = 8;
 /// going, how long that lasts, and how fast it could afford to go.
 ///
 /// Fields are appended left to right only while they fit, so a narrow terminal
-/// sheds them from the right. The order is by how much each one adds: the two
-/// burn rates first and together, since the whole point of the recent one is
-/// being read against the average; then the runway that says what the pace
-/// costs; then the pace still affordable; and last the projection — which is
-/// *numerically identical* to pace (projected use at reset is
-/// `u + (u/E)(1-E) = u/E`) and so is the field worth losing first.
+/// sheds them from the right; a field carrying an interval first drops the
+/// interval and keeps its value. The order is by how much each one adds: the
+/// two burn rates first and together, since the whole point of the recent one
+/// is being read against the average; then the runway that says what the
+/// current rate costs; then the pace still affordable; and last the
+/// projection to the reset.
+///
+/// The runway and the projection are extrapolated from the *recent* rate,
+/// with the ends of its interval — what the user is doing now is what
+/// decides when the cap arrives, and an average since the window opened would
+/// let an idle morning hide a hot afternoon. Only where there is no recent
+/// rate do they fall back to the average, and then they say `avg` so the two
+/// are never confused. Projected from the average, the at-reset figure is
+/// numerically the pace itself (`u + (u/E)(1-E) = u/E`); projected from the
+/// recent rate it is not, which is why it now earns its place.
 ///
 /// `None` when the window publishes no `reset_at`: every one of these is
-/// derived from the window's own start, so there is nothing to say.
+/// derived from the window's own start or end, so there is nothing to say.
 fn derived_line(
     view: &WindowView,
     points: &[QuotaSnapshot],
@@ -382,81 +391,155 @@ fn derived_line(
     const SEPARATOR: &str = " · ";
 
     let window = &metrics::effective_window(view, now)?;
-    let mut fields: Vec<(String, Style)> = Vec::new();
+    // Each field in full, then without its interval, then its style.
+    let mut fields: Vec<(String, Option<String>, Style)> = Vec::new();
 
     // Marks the fields measured from the window's start when that start is
     // itself only bracketed — a restart seen across an outage can be days
     // wide. Marked rather than withheld: the figure is still the best there
     // is, and hiding it would lose the signal a wide bracket is usually
-    // reporting. `afford` and `now` carry no mark because neither is measured
-    // from the start.
+    // reporting. `afford` and everything projected from the recent rate carry
+    // no mark, because none of them depends on the start.
     let mark = if metrics::start_is_uncertain(window) {
         "~"
     } else {
         ""
     };
 
-    if let Some(pace) = metrics::pace(window, now) {
+    let average = metrics::pace(window, now);
+    if let Some(pace) = average {
         let (glyph, color) = pace_style(pace);
         fields.push((
             format!("{glyph} {mark}{pace:.2}× pace"),
+            None,
             Style::default().fg(color),
         ));
     }
     let max_gap = metrics::gap_tolerance(poll_interval_secs);
-    if let Some(recent) = metrics::recent_pace(window, points, max_gap, now) {
-        let (glyph, color) = pace_style(recent);
+    let rate = metrics::estimate_rate(window, points, max_gap, now);
+    if let Some(rate) = rate {
+        let (glyph, color) = pace_style(rate.pace);
+        let value = format!("{glyph} {:.2}× now", rate.pace);
         fields.push((
-            format!("{glyph} {recent:.2}× now"),
+            format!("{value} {}", rate_interval(&rate)),
+            Some(value),
             Style::default().fg(color),
         ));
     }
-    if let Some(runway) = metrics::runway(window, now) {
-        // Warn only when the cap is what actually arrives first. A runway
-        // longer than the window has left is information, not an alarm — the
-        // rollover gets there before the cap does.
-        let binding = metrics::eta_to_cap(window, now).is_some();
-        let text = if runway <= chrono::Duration::zero() {
-            "at cap".to_owned()
-        } else {
-            format!("cap in {mark}{}", format_span(runway))
-        };
-        let color = if binding { theme::WARN } else { theme::DIM };
-        fields.push((text, Style::default().fg(color)));
+    let projection = rate.and_then(|rate| metrics::project(window, &rate, now));
+
+    match projection {
+        Some(projection) => {
+            let color = if projection.binding(window, now) {
+                theme::WARN
+            } else {
+                theme::DIM
+            };
+            if let (None, Some(fastest)) = (projection.runway.mid, projection.runway.low) {
+                // Flat lately, which is when this is most read: no cap at the
+                // centre, but the fast end of the interval still has one.
+                let value = "cap in ∞".to_owned();
+                fields.push((
+                    format!("{value} ({}–∞)", format_span(fastest)),
+                    Some(value),
+                    Style::default().fg(color),
+                ));
+            }
+            if let Some(runway) = projection.runway.mid {
+                if runway <= chrono::Duration::zero() {
+                    fields.push(("at cap".to_owned(), None, Style::default().fg(color)));
+                } else {
+                    let value = format!("cap in {}", format_span(runway));
+                    let slowest = projection
+                        .runway
+                        .high
+                        .map_or_else(|| "∞".to_owned(), format_span);
+                    let fastest = projection.runway.low.map_or_else(String::new, format_span);
+                    fields.push((
+                        format!("{value} ({fastest}–{slowest})"),
+                        Some(value),
+                        Style::default().fg(color),
+                    ));
+                }
+            }
+        }
+        None => {
+            if let Some(runway) = metrics::runway(window, now) {
+                // Warn only when the cap is what actually arrives first. A
+                // runway longer than the window has left is information, not
+                // an alarm — the rollover gets there before the cap does.
+                let binding = metrics::eta_to_cap(window, now).is_some();
+                let text = if runway <= chrono::Duration::zero() {
+                    "at cap".to_owned()
+                } else {
+                    format!("avg cap in {mark}{}", format_span(runway))
+                };
+                let color = if binding { theme::WARN } else { theme::DIM };
+                fields.push((text, None, Style::default().fg(color)));
+            }
+        }
     }
     if let Some(afford) = metrics::affordable_pace(window, now) {
-        fields.push((format!("afford {afford:.2}×"), theme::dim()));
+        fields.push((format!("afford {afford:.2}×"), None, theme::dim()));
     }
-    if let Some(pace) = metrics::pace(window, now) {
-        fields.push((
-            format!("→{mark}{:.0}% at reset", pace * 100.0),
-            theme::dim(),
-        ));
+    match projection {
+        Some(projection) => {
+            let at = projection.at_reset;
+            let value = format!("→{:.0}%", at.mid * 100.0);
+            fields.push((
+                format!(
+                    "{value} ({:.0}–{:.0}%) at reset",
+                    at.low * 100.0,
+                    at.high * 100.0
+                ),
+                Some(format!("{value} at reset")),
+                theme::dim(),
+            ));
+        }
+        None => {
+            if let Some(pace) = average {
+                fields.push((
+                    format!("avg →{mark}{:.0}% at reset", pace * 100.0),
+                    None,
+                    theme::dim(),
+                ));
+            }
+        }
     }
 
     let mut spans = vec![Span::raw(" ".repeat(INDENT))];
     let mut used = INDENT;
-    for (text, style) in fields {
+    for (full, short, style) in fields {
         // Counted in cells, for consistency with every other budget here
         // rather than to fix a live defect: every field on this line is
-        // formatted locally from numbers, and `▲ ▼ × → ·` are all one cell, so
-        // today a char count gives the same answer. An earlier pass moved this
-        // off `str::len`, which did overstate the separator by a byte. Chars
-        // are simply the wrong unit for a budget ratatui charges in cells, and
-        // the day a field here carries provider text — the label column
-        // already does — the units have to already agree.
+        // formatted locally from numbers, and `▲ ▼ × → · – ∞` are all one
+        // cell, so today a char count gives the same answer. Chars are simply
+        // the wrong unit for a budget ratatui charges in cells, and the day a
+        // field here carries provider text — the label column already does —
+        // the units have to already agree.
         let separator = if used > INDENT { cells(SEPARATOR) } else { 0 };
-        let cost = cells(&text) + separator;
-        if used + cost > width {
-            break;
-        }
+        let fits = |text: &str| used + cells(text) + separator <= width;
+        let text = if fits(&full) {
+            full
+        } else {
+            match short.filter(|s| fits(s)) {
+                Some(short) => short,
+                None => break,
+            }
+        };
         if used > INDENT {
             spans.push(Span::styled(SEPARATOR, theme::dim()));
         }
-        used += cost;
+        used += cells(&text) + separator;
         spans.push(Span::styled(text, style));
     }
     (spans.len() > 1).then(|| Line::from(spans))
+}
+
+/// A rate's interval as the row prints it: `(1.6–2.6)`, one decimal, because
+/// the ends of an 80% interval are not known to two.
+pub fn rate_interval(rate: &metrics::RateEstimate) -> String {
+    format!("({:.1}–{:.1})", rate.low, rate.high)
 }
 
 /// Glyph and colour for a burn rate, whether it is the average since the

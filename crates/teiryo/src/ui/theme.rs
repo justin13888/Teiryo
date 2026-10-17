@@ -23,6 +23,13 @@ pub const DIM: Color = Color::DarkGray;
 /// Block borders.
 pub const BORDER: Color = Color::DarkGray;
 
+/// A second series beside the accent one — the average beside the recent
+/// rate, the projection beside the readings. Never a severity.
+pub const SECONDARY: Color = Color::Magenta;
+/// The chart cursor: the terminal's own foreground, legible on any theme and
+/// the one colour no series uses.
+pub const CURSOR: Color = Color::Reset;
+
 /// A window that expired on schedule. Several can share a chart, so they read
 /// as a background grid rather than as something to look at.
 pub const BOUNDARY: Color = DIM;

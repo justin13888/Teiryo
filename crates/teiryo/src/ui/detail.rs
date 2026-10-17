@@ -6,22 +6,23 @@
 //! moment it was opened.
 
 use chrono::{DateTime, Utc};
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use teiryo_core::domain::QuotaUnit;
+use teiryo_core::domain::{ClientKind, PollOutcome, PollTrigger, QuotaUnit, WindowScope};
 use teiryo_core::{PollEvent, ProviderHealth, WindowRollover, WindowView};
 
 use crate::app::{App, DetailTab, Pane, TimeRange, Trend};
 use crate::metrics;
 use crate::metrics::{Boundary, BoundaryKind};
+use crate::ui::charts;
+use crate::ui::dashboard::rate_interval;
 use crate::ui::format::{
-    format_countdown, format_elapsed, outcome_text, pad_to_cells, trigger_glyph, truncate,
-    usage_text,
+    cells, format_countdown, format_elapsed, format_span, outcome_text, pad_to_cells,
+    trigger_glyph, truncate, usage_text,
 };
 use crate::ui::theme;
 
@@ -37,7 +38,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: DateTime<Ut
         DetailTab::Trend => {
             // A chart is drawn to fit, on both axes; only text rows overflow.
             app.set_detail_bounds(0, 0);
-            render_trend(frame, area, block, app, now);
+            charts::render(frame, area, block, app, now);
         }
         DetailTab::Activity => render_activity(frame, area, block, app, viewport, now),
         DetailTab::Health => render_health(frame, area, block, app, viewport, now),
@@ -83,7 +84,7 @@ fn footer(app: &App, now: DateTime<Utc>) -> Line<'static> {
         DetailTab::Trend => trend_footer(app, now),
         DetailTab::Activity => Line::from(Span::styled(
             format!(
-                " {} polls · PgUp/PgDn rows · j/k across ",
+                " {} polls · j/k select · Enter or click details · < > across ",
                 app.activity.len()
             ),
             theme::dim(),
@@ -175,14 +176,26 @@ fn trend_footer(app: &App, now: DateTime<Utc>) -> Line<'static> {
         // average since the window opened, this one only the recent end of it.
         let points = app.recent_points(&status.account.id, &view.window.id);
         let max_gap = metrics::gap_tolerance(status.poll_interval_secs);
-        if let Some(recent) = effective
+        if let Some((window, recent)) = effective
             .as_ref()
-            .and_then(|w| metrics::recent_pace(w, points, max_gap, now))
+            .and_then(|w| metrics::estimate_rate(w, points, max_gap, now).map(|rate| (w, rate)))
         {
             spans.push(Span::styled(
-                format!(" · lately {recent:.2}×"),
+                format!(" · lately {:.2}× {}", recent.pace, rate_interval(&recent)),
                 theme::dim(),
             ));
+            if let Some(projection) = metrics::project(window, &recent, now) {
+                let at = projection.at_reset;
+                spans.push(Span::styled(
+                    format!(
+                        " · →{:.0}% ({:.0}–{:.0}%)",
+                        at.mid * 100.0,
+                        at.low * 100.0,
+                        at.high * 100.0
+                    ),
+                    theme::dim(),
+                ));
+            }
         }
         if let Some(note) = &view.hint.note {
             spans.push(Span::styled(
@@ -206,7 +219,7 @@ fn trend_footer(app: &App, now: DateTime<Utc>) -> Line<'static> {
 /// `CurrentStart` rule back to `reset_at - span` — an instant inside the
 /// *previous* window instance, drawn only because the anchor was dropped, and
 /// disagreeing with the footer beside it, which resolves at `now`.
-fn trend_rules(
+pub(super) fn trend_rules(
     view: Option<&WindowView>,
     rollovers: &[WindowRollover],
     from: DateTime<Utc>,
@@ -225,167 +238,9 @@ fn trend_rules(
     .unwrap_or_default()
 }
 
-fn render_trend(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    block: Block<'static>,
-    app: &App,
-    now: DateTime<Utc>,
-) {
-    // Only chart a series that belongs to the current selection: a reload is
-    // in flight while the selection moves, and the previous window's history
-    // under the new window's title would be a lie.
-    let Some(trend) = app.charted_trend() else {
-        // "Select a window" is only actionable advice when there *are*
-        // windows; with none it reads as a broken chart rather than as a
-        // daemon that has not reported a successful poll yet.
-        let text = if app.statuses.iter().all(|s| s.windows.is_empty()) {
-            "no quota data yet — waiting for the first successful poll"
-        } else {
-            "select a window with j/k to chart its history"
-        };
-        frame.render_widget(placeholder(text, block), area);
-        return;
-    };
-    if trend.snapshots.len() < 2 {
-        frame.render_widget(
-            placeholder(
-                &format!(
-                    "not enough history for {} in the last {}",
-                    trend.title,
-                    trend.range.label()
-                ),
-                block,
-            ),
-            area,
-        );
-        return;
-    }
-
-    // X is seconds before the right edge of the charted interval, so the
-    // series always ends there regardless of when the daemon last polled — and
-    // a panned chart stays put instead of sliding right on every tick.
-    let span = trend.range.duration().num_seconds().max(1) as f64;
-    let until = trend.until;
-    let x_of = |ts: DateTime<Utc>| span - (until - ts).num_seconds() as f64;
-    let y_max = y_bound(trend);
-
-    let series: Vec<(f64, f64)> = trend
-        .snapshots
-        .iter()
-        .map(|s| (x_of(s.ts), s.used))
-        .collect();
-    let critical = app
-        .selected_window()
-        .map(|(_, view)| f64::from(view.hint.critical_threshold) * y_max)
-        .unwrap_or(y_max);
-
-    // Where the window began and where it ends. Empty for a provider that
-    // publishes no reset instant and has never been seen to roll over.
-    let rules = trend_rules(
-        app.selected_window().map(|(_, view)| view),
-        &trend.rollovers,
-        until - trend.range.duration(),
-        until,
-        now,
-    );
-    // The upcoming reset is the one boundary that lies to the right of the
-    // series, so the axis has to grow to hold it.
-    let lead = future_lead(&rules, span, x_of, app.trend_is_live());
-    let x_bound = span + lead;
-    let threshold = vec![(0.0, critical), (x_bound, critical)];
-
-    // Owned first, borrowed into datasets after: `Dataset::data` holds a slice.
-    let rule_points: Vec<(BoundaryKind, Vec<(f64, f64)>)> = rules
-        .iter()
-        .filter(|b| b.kind != BoundaryKind::UpcomingReset || lead > 0.0)
-        .map(|b| (b.kind, vrule(x_of(b.at), y_max)))
-        .collect();
-    // An unannounced drop is not a boundary — inferred from `used` alone, it is
-    // not trustworthy enough to draw a rule through the chart — but it is still
-    // worth a mark at the reading that raised it.
-    let drops: Vec<(f64, f64)> = charted_rollovers(trend)
-        .filter(|r| !r.kind.is_boundary())
-        .map(|r| (x_of(r.observed_at), r.new_used))
-        .collect();
-
-    // Rules first: later datasets draw over earlier ones, and the series is
-    // what the pane is for.
-    let mut datasets: Vec<Dataset<'_>> = rule_points
-        .iter()
-        .map(|(kind, points)| {
-            Dataset::default()
-                .marker(Marker::Braille)
-                .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(rule_color(*kind)))
-                .data(points)
-        })
-        .collect();
-    datasets.push(
-        Dataset::default()
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(theme::ACCENT))
-            .data(&series),
-    );
-    // The same points again, as a scatter in a coarser marker. Everything
-    // between two readings is interpolation the daemon never measured, and at
-    // a 3-minute cadence a wide range draws far more interpolated cells than
-    // real ones. Braille for the line and a full-cell dot for the readings
-    // makes the difference visible: the fat dots are what was actually probed.
-    datasets.push(
-        Dataset::default()
-            .marker(Marker::Dot)
-            .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(theme::ACCENT))
-            .data(&series),
-    );
-    datasets.push(
-        Dataset::default()
-            .marker(Marker::Dot)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(theme::CRIT))
-            .data(&threshold),
-    );
-    if !drops.is_empty() {
-        datasets.push(
-            Dataset::default()
-                .marker(Marker::Block)
-                .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(theme::BOUNDARY_SURPRISE))
-                .data(&drops),
-        );
-    }
-
-    let chart = Chart::new(datasets)
-        .block(
-            block.title_top(
-                Line::from(Span::styled(
-                    format!(" {} ", truncate(&trend.title, 40)),
-                    theme::heading(),
-                ))
-                .alignment(Alignment::Right),
-            ),
-        )
-        .x_axis(
-            Axis::default()
-                .style(theme::dim())
-                .bounds([0.0, x_bound])
-                .labels(x_labels(until - trend.range.duration(), x_bound, now)),
-        )
-        .y_axis(
-            Axis::default()
-                .style(theme::dim())
-                .bounds([0.0, y_max])
-                .labels(y_labels(y_max)),
-        )
-        .legend_position(None);
-    frame.render_widget(chart, area);
-}
-
 /// Upper bound of the y axis: the published limit where there is one, else
 /// enough headroom above the peak to keep the line off the top border.
-fn y_bound(trend: &Trend) -> f64 {
+pub(super) fn y_bound(trend: &Trend) -> f64 {
     let peak = trend
         .snapshots
         .iter()
@@ -413,7 +268,7 @@ fn y_bound(trend: &Trend) -> f64 {
 /// for every window on the account. The pane only ever asks about one, but
 /// filtering here keeps the markers and the footer count agreeing with
 /// [`metrics::boundaries`], which does the same.
-fn charted_rollovers(trend: &Trend) -> impl Iterator<Item = &WindowRollover> {
+pub(super) fn charted_rollovers(trend: &Trend) -> impl Iterator<Item = &WindowRollover> {
     trend.rollovers.iter().filter(|r| r.window == trend.window)
 }
 
@@ -433,7 +288,7 @@ const FUTURE_LEAD_MAX: f64 = 0.20;
 /// A panned view is deliberately excluded: it is not showing the present, so
 /// the *current* window's reset is not the boundary next to its right edge, and
 /// drawing it there would place a future instant in the middle of the past.
-fn future_lead(
+pub(super) fn future_lead(
     rules: &[Boundary],
     span: f64,
     x_of: impl Fn(DateTime<Utc>) -> f64,
@@ -455,7 +310,7 @@ fn future_lead(
 /// ratatui has no vline primitive. Braille dots spaced up the y axis read as a
 /// dotted rule, which keeps it distinct from both the solid series and the
 /// dotted horizontal threshold.
-fn vrule(x: f64, y_max: f64) -> Vec<(f64, f64)> {
+pub(super) fn vrule(x: f64, y_max: f64) -> Vec<(f64, f64)> {
     const DOTS: usize = 24;
     (0..=DOTS)
         .map(|i| (x, y_max * i as f64 / DOTS as f64))
@@ -465,7 +320,7 @@ fn vrule(x: f64, y_max: f64) -> Vec<(f64, f64)> {
 /// Color for a boundary rule. Scheduled rollovers recede into the background;
 /// the live window's own edges match its series; anything the provider did not
 /// advertise is flagged.
-fn rule_color(kind: BoundaryKind) -> Color {
+pub(super) fn rule_color(kind: BoundaryKind) -> Color {
     match kind {
         BoundaryKind::Rollover => theme::BOUNDARY,
         BoundaryKind::Surprise => theme::BOUNDARY_SURPRISE,
@@ -478,12 +333,16 @@ fn rule_color(kind: BoundaryKind) -> Color {
 /// differ, and "now" on the right of a view that ends three days ago would be
 /// a lie. When the axis has been extended to reach an upcoming reset the right
 /// label runs forwards instead, as `+1h`.
-fn x_labels(left: DateTime<Utc>, total: f64, now: DateTime<Utc>) -> Vec<Line<'static>> {
+pub(super) fn x_labels(left: DateTime<Utc>, total: f64, now: DateTime<Utc>) -> Vec<Line<'static>> {
     let at = |fraction: f64| {
         let ts = left + chrono::Duration::seconds((total * fraction) as i64);
         let delta = (ts - now).num_seconds();
         let text = match delta {
-            0 => "now".to_owned(),
+            // A live chart's right edge is the instant its series was
+            // fetched, which the frame drawing it trails by up to a refresh.
+            // That is the present to anyone reading the axis; `-1s` is not
+            // a distinction it can make.
+            d if d.abs() < 60 => "now".to_owned(),
             d if d < 0 => format!(
                 "-{}",
                 format_countdown(now - chrono::Duration::seconds(d), now)
@@ -498,7 +357,7 @@ fn x_labels(left: DateTime<Utc>, total: f64, now: DateTime<Utc>) -> Vec<Line<'st
     vec![at(0.0), at(0.5), at(1.0)]
 }
 
-fn y_labels(y_max: f64) -> Vec<Line<'static>> {
+pub(super) fn y_labels(y_max: f64) -> Vec<Line<'static>> {
     [0.0, y_max / 2.0, y_max]
         .into_iter()
         .map(|v| Line::from(Span::styled(format!("{v:.0}"), theme::dim())))
@@ -513,21 +372,244 @@ fn render_activity(
     viewport: Rect,
     now: DateTime<Utc>,
 ) {
+    app.activity_list_area = Rect::ZERO;
+    app.activity_details_area = Rect::ZERO;
     if app.activity.is_empty() {
         app.set_detail_bounds(0, 0);
         frame.render_widget(placeholder("no polls recorded yet", block), area);
         return;
     }
-    // A Paragraph rather than a List: the rows are wider than most terminals,
-    // and only a Paragraph can be scrolled sideways to reach the rest of them.
-    // Nothing is lost — the log has no selection to highlight.
-    let lines: Vec<Line<'static>> = app
-        .activity
-        .iter()
-        .map(|event| activity_line(event, now))
-        .collect();
-    let scroll = fit_scroll(app, &lines, viewport);
-    frame.render_widget(Paragraph::new(lines).block(block).scroll(scroll), area);
+    frame.render_widget(block, area);
+    let selected = app.activity_index();
+    // Beside the log where there is room for both to be read; in its place
+    // where there is not, until it is shut again.
+    let (list, details) = match selected.filter(|_| app.activity_details) {
+        Some(_) if viewport.width >= DETAILS_BESIDE_MIN_WIDTH => {
+            let [list, details] =
+                Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                    .areas(viewport);
+            (list, Some(details))
+        }
+        Some(_) => (Rect::ZERO, Some(viewport)),
+        None => (viewport, None),
+    };
+
+    if list.height > 0 {
+        // Bring a cursor that moved back into view: just inside whichever
+        // edge it left by.
+        if let Some(index) = selected.filter(|_| app.activity_follow) {
+            let rows = usize::from(list.height);
+            if index < app.detail_scroll {
+                app.detail_scroll = index;
+            } else if index >= app.detail_scroll + rows {
+                app.detail_scroll = index + 1 - rows;
+            }
+        }
+        // A Paragraph rather than a List: the rows are wider than most
+        // terminals, and only a Paragraph can be scrolled sideways to reach
+        // the rest of them.
+        let lines: Vec<Line<'static>> = app
+            .activity
+            .iter()
+            .enumerate()
+            .map(|(i, event)| {
+                let line = activity_line(event, now);
+                if Some(i) == selected {
+                    line.patch_style(theme::selected())
+                } else {
+                    line
+                }
+            })
+            .collect();
+        let scroll = fit_scroll(app, &lines, list);
+        frame.render_widget(Paragraph::new(lines).scroll(scroll), list);
+        app.activity_list_area = list;
+    }
+    app.activity_follow = false;
+
+    if let (Some(area), Some(event)) = (details, app.activity_selected()) {
+        let block = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(theme::border(app.focus == Pane::Detail))
+            .title(Span::styled(" Details ", theme::heading()));
+        let inner = block.inner(area);
+        let lines = details_lines(event, now);
+        // Wrapped, so a row is as many as its width needs; the error text is
+        // the line most likely to run long.
+        let width = usize::from(inner.width.max(1));
+        let rows: usize = lines
+            .iter()
+            .map(|l| wrapped_rows(&l.to_string(), width))
+            .sum();
+        app.set_details_bounds(rows.saturating_sub(usize::from(inner.height)));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false })
+                .scroll((app.details_scroll.min(u16::MAX as usize) as u16, 0)),
+            area,
+        );
+        app.activity_details_area = area;
+    }
+}
+
+/// Rows `text` takes wrapped at `width` the way the Details pane wraps it: by
+/// word, breaking only a word too long for a row on its own.
+///
+/// Counting cells over the width instead undercounts — a word-wrapped row
+/// ends short wherever the next word would not fit — and the scroll bound
+/// built on it left the tail of a long error out of reach.
+fn wrapped_rows(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 1;
+    let mut used = 0;
+    for word in text.split(' ') {
+        let word_width = cells(word);
+        let needed = if used == 0 {
+            word_width
+        } else {
+            used + 1 + word_width
+        };
+        if needed <= width {
+            used = needed;
+        } else if word_width <= width {
+            rows += 1;
+            used = word_width;
+        } else {
+            // A word longer than a row: whatever is on this row stays, and
+            // the word fills rows of its own.
+            if used > 0 {
+                rows += 1;
+            }
+            rows += (word_width - 1) / width;
+            used = word_width - (word_width - 1) / width * width;
+        }
+    }
+    rows
+}
+
+/// Narrowest pane that sets Details beside the log rather than over it.
+const DETAILS_BESIDE_MIN_WIDTH: u16 = 90;
+
+/// Everything a poll event carries, one field to a line.
+pub(super) fn details_lines(event: &PollEvent, now: DateTime<Utc>) -> Vec<Line<'static>> {
+    let field = |name: &str, value: String, style: Style| {
+        Line::from(vec![
+            Span::styled(format!(" {name:<9}"), theme::dim()),
+            Span::styled(value, style),
+        ])
+    };
+    let plain = Style::default();
+    let local = event.ts.with_timezone(&chrono::Local);
+    let (outcome, failed) = match &event.outcome {
+        PollOutcome::Success { windows } => (
+            format!(
+                "ok · {} window{}",
+                windows.len(),
+                if windows.len() == 1 { "" } else { "s" }
+            ),
+            false,
+        ),
+        PollOutcome::AuthError(_) => ("auth error".to_owned(), true),
+        PollOutcome::NetworkError(_) => ("network error".to_owned(), true),
+        PollOutcome::SchemaDrift(_) => ("schema drift".to_owned(), true),
+        PollOutcome::RateLimited { .. } => ("rate limited".to_owned(), true),
+    };
+    let mut lines = vec![
+        field("poll", event.id.to_string(), plain),
+        field(
+            "time",
+            format!(
+                "{} local · {} UTC · {}",
+                local.format("%Y-%m-%d %H:%M:%S"),
+                event.ts.format("%H:%M:%S"),
+                format_elapsed(event.ts, now)
+            ),
+            plain,
+        ),
+        field("provider", event.provider.clone(), plain),
+        field("account", event.account.to_string(), plain),
+        field(
+            "trigger",
+            match &event.trigger {
+                PollTrigger::Scheduled => "scheduled".to_owned(),
+                PollTrigger::Startup => "daemon startup".to_owned(),
+                PollTrigger::Manual {
+                    client: ClientKind::Tui,
+                } => "manual, from the TUI".to_owned(),
+                PollTrigger::Manual {
+                    client: ClientKind::Other(name),
+                } => format!("manual, from {name}"),
+            },
+            plain,
+        ),
+        field(
+            "outcome",
+            outcome,
+            Style::default().fg(if failed { theme::CRIT } else { theme::OK }),
+        ),
+    ];
+    if let Some(message) = event.outcome.error_message() {
+        lines.push(field(
+            "error",
+            message.to_owned(),
+            Style::default().fg(theme::CRIT),
+        ));
+    }
+    if let PollOutcome::RateLimited { retry_after } = &event.outcome {
+        lines.push(field(
+            "retry",
+            retry_after.map_or_else(
+                || "no delay suggested".to_owned(),
+                |d| {
+                    format!(
+                        "after {}",
+                        format_span(chrono::Duration::from_std(d).unwrap_or_default())
+                    )
+                },
+            ),
+            plain,
+        ));
+    }
+    lines.push(field("latency", format!("{} ms", event.latency_ms), plain));
+    if let PollOutcome::Success { windows } = &event.outcome {
+        for window in windows {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {}", window.label), theme::heading()),
+                Span::styled(format!("  {}", window.id), theme::dim()),
+            ]));
+            let scope = match &window.scope {
+                WindowScope::AccountWide => "account-wide".to_owned(),
+                WindowScope::Model(model) => format!("model {model}"),
+            };
+            let span = window.span().map_or_else(
+                || "rolling".to_owned(),
+                |s| format!("rolling {}", format_span(s)),
+            );
+            lines.push(field("scope", format!("{scope} · {span}"), plain));
+            lines.push(field("used", usage_text(window), plain));
+            lines.push(field(
+                "resets",
+                window.reset_at.map_or_else(
+                    || "not published".to_owned(),
+                    |at| {
+                        format!(
+                            "{} local · {}",
+                            at.with_timezone(&chrono::Local).format("%a %m-%d %H:%M"),
+                            if at > now {
+                                format!("in {}", format_countdown(at, now))
+                            } else {
+                                format!("{} ago", format_countdown(now + (now - at), now))
+                            }
+                        )
+                    },
+                ),
+                plain,
+            ));
+        }
+    }
+    lines
 }
 
 fn activity_line(event: &PollEvent, now: DateTime<Utc>) -> Line<'static> {
@@ -650,7 +732,7 @@ fn account_lines(provider: &ProviderHealth, now: DateTime<Utc>) -> Vec<Line<'sta
     lines
 }
 
-fn placeholder(text: &str, block: Block<'static>) -> Paragraph<'static> {
+pub(super) fn placeholder(text: &str, block: Block<'static>) -> Paragraph<'static> {
     Paragraph::new(Line::from(Span::styled(format!(" {text}"), theme::dim())))
         .block(block)
         .wrap(Wrap { trim: true })
@@ -732,6 +814,22 @@ mod tests {
                 not_after: now() - chrono::Duration::minutes(25),
             }),
         }
+    }
+
+    #[test]
+    fn details_rows_are_counted_by_word_as_they_wrap() {
+        assert_eq!(wrapped_rows("", 10), 1);
+        assert_eq!(wrapped_rows("abc def", 10), 1);
+        // Fits a row exactly, then one word over.
+        assert_eq!(wrapped_rows("aaaa bbbb cccc", 9), 2);
+        assert_eq!(
+            wrapped_rows("aaaaaa bbbbbb cccccc", 10),
+            3,
+            "20 cells, 3 rows"
+        );
+        // A word longer than the width breaks across rows.
+        assert_eq!(wrapped_rows("aaaaaaaaaaaaaaaaaaaaaaaaa", 10), 3);
+        assert_eq!(wrapped_rows("x aaaaaaaaaaaaaaaaaaaa", 10), 3);
     }
 
     #[test]
@@ -845,6 +943,9 @@ mod tests {
         // Unextended, the right edge is the present itself.
         let plain = x_labels(left, DAY, now());
         assert_eq!(plain[2].to_string(), "now");
+        // Including when the frame is drawn a moment after the fetch.
+        let late = x_labels(left, DAY, now() + chrono::Duration::seconds(2));
+        assert_eq!(late[2].to_string(), "now");
     }
 
     /// The activity account column is exactly its budget whatever the account

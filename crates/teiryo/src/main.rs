@@ -8,7 +8,9 @@ mod spawn;
 mod ui;
 
 use chrono::Utc;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, MouseEventKind,
+};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -142,6 +144,15 @@ async fn drive(
             maybe_event = term_events.next() => {
                 let action = match maybe_event {
                     Some(Ok(Event::Key(key))) => app.handle_key(key),
+                    // With mouse capture on, every movement of the pointer is
+                    // an event, and redrawing the charts for each one is what
+                    // a moving pointer would otherwise cost. Nothing here
+                    // responds to movement, so it is dropped before the draw.
+                    Some(Ok(Event::Mouse(mouse)))
+                        if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) =>
+                    {
+                        continue
+                    }
                     Some(Ok(Event::Mouse(mouse))) => app.handle_mouse(mouse),
                     None => return Ok(()),
                     _ => continue,
@@ -232,14 +243,20 @@ async fn refresh_status(command: &mut Client, app: &mut App) {
     }
 }
 
-/// How far back the rows' burn rates may look. Twelve hours covers the longest
-/// lookback `metrics::recent_pace` uses, and at the default cadence it is a few
-/// hundred readings per window — inside `RECENT_MAX_POINTS`, so the daemon
-/// returns them undownsampled and a rate is measured from real endpoints.
-const RECENT_SPAN_HOURS: i64 = 12;
+/// How far back the rows' burn rates may look: two doublings past the longest
+/// lookback `metrics::estimate_rate` starts from, which is twelve hours.
+///
+/// Twelve alone left a weekly window nothing to widen into. One rounding step
+/// over twelve hours of a week is already wider than the precision target, so
+/// the row stopped at its first pass with the widest interval there is while
+/// the charts, fetching more, widened past it — and the two disagreed. At the
+/// default three-minute cadence two days is 960 readings per window, inside
+/// `RECENT_MAX_POINTS`, so the daemon still returns them undownsampled and the
+/// rate is measured from real endpoints.
+const RECENT_SPAN_HOURS: i64 = 48;
 
 /// Point budget for one window's slice of that history.
-const RECENT_MAX_POINTS: u32 = 512;
+const RECENT_MAX_POINTS: u32 = 1_000;
 
 /// Fetch the recent history the rows measure their burn rates from.
 ///
@@ -286,22 +303,47 @@ async fn reload_detail(command: &mut Client, app: &mut App) {
             range,
             until,
             request,
-        } => match command.request(&request).await {
-            Ok(Response::History(page)) => {
-                app.set_trend(Trend {
-                    account,
-                    window,
-                    title,
-                    snapshots: page.snapshots,
-                    rollovers: page.rollovers,
-                    range,
-                    until,
-                    earliest: page.earliest,
-                    fetched_at: now,
-                });
+            extras,
+        } => {
+            match command.request(&request).await {
+                Ok(Response::History(page)) => {
+                    app.set_trend(Trend {
+                        account,
+                        window,
+                        title,
+                        snapshots: page.snapshots,
+                        rollovers: page.rollovers,
+                        range,
+                        until,
+                        earliest: page.earliest,
+                        fetched_at: now,
+                    });
+                }
+                other => return note_unexpected(app, other),
             }
-            other => note_unexpected(app, other),
-        },
+            // Whatever else the view charts. Each reply is checked against
+            // the selection when it is drawn, not here, so one landing after
+            // the cursor moved is simply never shown.
+            for extra in extras {
+                match command.request(&extra.request).await {
+                    Ok(Response::History(page)) => app.set_extra(
+                        extra.purpose,
+                        Trend {
+                            account: extra.account,
+                            window: extra.window,
+                            title: extra.title,
+                            snapshots: page.snapshots,
+                            rollovers: page.rollovers,
+                            range: extra.range,
+                            until: extra.until,
+                            earliest: page.earliest,
+                            fetched_at: now,
+                        },
+                    ),
+                    other => return note_unexpected(app, other),
+                }
+            }
+        }
         DetailQuery::Activity(request) => match command.request(&request).await {
             Ok(Response::RecentPolls(events)) => app.activity = events,
             other => note_unexpected(app, other),

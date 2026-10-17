@@ -8,14 +8,16 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
 
 use teiryo_core::domain::{AccountId, WindowId};
 use teiryo_core::{
-    AccountStatus, ConfigEdit, ConfigState, PollEvent, ProviderHealth, ProviderId, QuotaSnapshot,
-    Request, WindowRollover, WindowView,
+    AccountStatus, ConfigEdit, ConfigState, PollEvent, PollId, ProviderHealth, ProviderId,
+    QuotaSnapshot, Request, WindowRollover, WindowView,
 };
 
 /// Which detail-pane tab is showing.
@@ -115,6 +117,183 @@ impl TimeRange {
         let last = Self::ALL.len() as isize - 1;
         Self::ALL[(i + delta).clamp(0, last) as usize]
     }
+}
+
+/// Which set of charts the Trend tab is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrendView {
+    /// Usage over the burn rate, on one time axis, with the data coverage
+    /// beneath them.
+    UsagePace,
+    /// Where the window was projected to land, and the pace it could afford
+    /// against the pace it ran at — both as they stood at every reading.
+    Forecast,
+    /// Every window of the account on one axis.
+    AllWindows,
+    /// What became of past window instances, and when in the day quota goes.
+    History,
+}
+
+impl TrendView {
+    /// Views in display order.
+    pub const ALL: [TrendView; 4] = [
+        TrendView::UsagePace,
+        TrendView::Forecast,
+        TrendView::AllWindows,
+        TrendView::History,
+    ];
+
+    /// Label for the view strip.
+    pub fn label(self) -> &'static str {
+        match self {
+            TrendView::UsagePace => "Usage·Pace",
+            TrendView::Forecast => "Forecast",
+            TrendView::AllWindows => "All windows",
+            TrendView::History => "History",
+        }
+    }
+
+    fn shift(self, delta: isize) -> Self {
+        let i = Self::ALL.iter().position(|v| *v == self).unwrap_or(0) as isize;
+        let len = Self::ALL.len() as isize;
+        Self::ALL[(i + delta).rem_euclid(len) as usize]
+    }
+
+    /// Whether the view draws the selected window's own series and so can be
+    /// split into a session and a weekly column.
+    pub fn splits(self) -> bool {
+        matches!(self, TrendView::UsagePace | TrendView::Forecast)
+    }
+}
+
+/// What a series beyond the selected window's own is fetched for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Purpose {
+    /// The other family's window, for the split columns: the weekly window
+    /// beside a session one, or the reverse.
+    Sibling,
+    /// Every window of the selected account over the charted range.
+    AllWindows,
+    /// A month of the selected window's rollovers, whose last readings are
+    /// the peaks past instances reached.
+    Outcomes,
+    /// A week of the selected window's readings, for burn by hour of day.
+    Burn,
+}
+
+/// A month: how far back the past-window outcomes reach. Rollovers are never
+/// downsampled, so the reach costs only their count.
+pub const OUTCOMES_SPAN_DAYS: i64 = 30;
+
+/// A week: how far back burn by hour of day reaches — every hour of the day
+/// seven times over, so one unusual day does not make the shape.
+pub const BURN_SPAN_DAYS: i64 = 7;
+
+/// How long the History view's month and week of series are reused before
+/// they are fetched again.
+const SLOW_EXTRA_TTL: Duration = Duration::minutes(10);
+
+/// Points for the burn-by-hour series: ten-minute buckets over the week,
+/// fine enough that no hour's burn is folded into its neighbour's.
+const BURN_MAX_POINTS: u32 = 1008;
+
+/// Whether a window is a session-length one rather than a weekly one — the
+/// two families the split view sets side by side.
+pub fn is_session(view: &WindowView) -> bool {
+    view.window
+        .span()
+        .is_some_and(|span| span <= Duration::days(1))
+}
+
+/// Where a chart was drawn and what its columns mean.
+///
+/// Recorded by the renderer, the only place that knows both, so a click can
+/// be turned back into the instant or the bar under it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChartHit {
+    /// The plot's cells, axes and labels excluded.
+    pub plot: Rect,
+    /// What a column of the plot is.
+    pub axis: HitAxis,
+}
+
+/// The x axis of a recorded chart.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HitAxis {
+    /// Time, `secs` of it from `left` across the plot's width, charting the
+    /// readings of `window`.
+    Time {
+        /// Instant at the plot's left edge.
+        left: DateTime<Utc>,
+        /// Seconds spanned by the plot's full width.
+        secs: f64,
+        /// Whose readings a click snaps to.
+        window: WindowId,
+    },
+    /// Bars of `width` cells separated by `gap`, each with what it shows.
+    Bars {
+        /// Cells per bar.
+        width: u16,
+        /// Cells between bars.
+        gap: u16,
+        /// One readout per bar, left to right.
+        readouts: Vec<String>,
+    },
+}
+
+impl ChartHit {
+    /// The instant under `column`, for a time axis. The middle of the cell,
+    /// since a cell covers a stretch of time rather than an instant.
+    pub fn instant_at(&self, column: u16) -> Option<DateTime<Utc>> {
+        let HitAxis::Time { left, secs, .. } = &self.axis else {
+            return None;
+        };
+        if self.plot.width == 0 || column < self.plot.x || column >= self.plot.right() {
+            return None;
+        }
+        let fraction = (f64::from(column - self.plot.x) + 0.5) / f64::from(self.plot.width);
+        Some(*left + Duration::milliseconds((fraction * secs * 1000.0) as i64))
+    }
+
+    /// The bar under `column`, for a bar chart.
+    pub fn bar_at(&self, column: u16) -> Option<usize> {
+        let HitAxis::Bars {
+            width,
+            gap,
+            readouts,
+        } = &self.axis
+        else {
+            return None;
+        };
+        let offset = column.checked_sub(self.plot.x)?;
+        let stride = width + gap;
+        if stride == 0 || offset % stride >= *width {
+            return None;
+        }
+        let index = usize::from(offset / stride);
+        (index < readouts.len()).then_some(index)
+    }
+}
+
+/// What the chart cursor is on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Inspect {
+    /// A reading of `window`, taken at `ts`.
+    Reading {
+        /// Whose reading.
+        window: WindowId,
+        /// When it was taken.
+        ts: DateTime<Utc>,
+    },
+    /// The `index`th bar of the bar chart whose plot starts at `plot`.
+    Bar {
+        /// The plot's position, which tells the bar charts apart.
+        plot: Rect,
+        /// Which bar. What it says is read off the bar chart as drawn, not
+        /// captured at the click: the bars move under a cursor kept by
+        /// position whenever a rollover lands or the pane is resized.
+        index: usize,
+    },
 }
 
 /// A modal drawn over the dashboard.
@@ -240,11 +419,31 @@ pub enum DetailQuery {
         until: DateTime<Utc>,
         /// The request to send.
         request: Request,
+        /// What else the current view charts, each fetched alongside.
+        extras: Vec<ExtraQuery>,
     },
     /// Recent poll log.
     Activity(Request),
     /// Provider health.
     Health(Request),
+}
+
+/// One auxiliary series the Trend tab needs fetched.
+pub struct ExtraQuery {
+    /// What it is for.
+    pub purpose: Purpose,
+    /// Account to query.
+    pub account: AccountId,
+    /// The window it describes, which is what the reply is checked against.
+    pub window: WindowId,
+    /// Display title.
+    pub title: String,
+    /// Range it is charted over.
+    pub range: TimeRange,
+    /// Right edge of the interval.
+    pub until: DateTime<Utc>,
+    /// The request to send.
+    pub request: Request,
 }
 
 /// What the event loop should do after a key press.
@@ -314,12 +513,48 @@ pub struct App {
     pub detail_area: Rect,
     /// Loaded trend series, if any.
     pub trend: Option<Trend>,
+    /// Which charts the Trend tab is showing.
+    pub trend_view: TrendView,
+    /// Whether the splittable views set the session and weekly windows side
+    /// by side.
+    pub family_split: bool,
+    /// Series beyond the selected window's own, by what they were fetched
+    /// for.
+    extras: HashMap<Purpose, Trend>,
+    /// Every chart drawn on the last frame, for hit-testing the pointer.
+    pub chart_hits: Vec<ChartHit>,
+    /// The view strip's entries as drawn on the last frame.
+    pub view_tabs: Vec<(Rect, TrendView)>,
+    /// What the chart cursor is on, if it is out.
+    pub inspect: Option<Inspect>,
     /// Recent history per window, for the burn rates the rows draw. Keyed by
     /// window rather than held on [`Trend`] because every row needs its own,
     /// not just the selected one.
     recent: HashMap<(AccountId, WindowId), Vec<QuotaSnapshot>>,
     /// Loaded poll log.
     pub activity: Vec<PollEvent>,
+    /// The poll the Activity cursor is on, by id: the log is refetched on
+    /// every update and new polls arrive at the top, so an index would slide
+    /// onto a different poll each time one landed.
+    activity_cursor: Option<PollId>,
+    /// Where the cursor last resolved, for when its poll falls off the end of
+    /// the fetched log: the cursor stays at that position rather than
+    /// vanishing.
+    activity_cursor_index: usize,
+    /// Whether the cursor moved since the last frame, so the renderer should
+    /// scroll it into view. Only then: the wheel browses the log without
+    /// moving the cursor, and following it on every frame would undo that.
+    pub activity_follow: bool,
+    /// Whether the Details pane is open beside the log.
+    pub activity_details: bool,
+    /// Where the log's rows were drawn on the last frame.
+    pub activity_list_area: Rect,
+    /// Where the Details pane was drawn on the last frame; empty when shut.
+    pub activity_details_area: Rect,
+    /// Rows the Details pane is scrolled down by.
+    pub details_scroll: usize,
+    /// Largest useful [`App::details_scroll`], as last measured.
+    pub details_scroll_max: usize,
     /// Loaded provider health.
     pub health: Vec<ProviderHealth>,
     /// Modal drawn over the dashboard, if any.
@@ -361,8 +596,22 @@ impl App {
             quotas_area: Rect::ZERO,
             detail_area: Rect::ZERO,
             trend: None,
+            trend_view: TrendView::UsagePace,
+            family_split: false,
+            extras: HashMap::new(),
+            chart_hits: Vec::new(),
+            view_tabs: Vec::new(),
+            inspect: None,
             recent: HashMap::new(),
             activity: Vec::new(),
+            activity_cursor: None,
+            activity_cursor_index: 0,
+            activity_follow: false,
+            activity_details: false,
+            activity_list_area: Rect::ZERO,
+            activity_details_area: Rect::ZERO,
+            details_scroll: 0,
+            details_scroll_max: 0,
             health: Vec::new(),
             overlay: None,
             config: None,
@@ -471,6 +720,7 @@ impl App {
             // carrying the offset across would open the new chart on empty
             // time rather than on its data.
             self.trend_pan_secs = 0;
+            self.inspect = None;
         }
         self.selection = target;
         self.user_moved = true;
@@ -531,6 +781,138 @@ impl App {
             .filter(|t| t.account == status.account.id && t.window == view.window.id)
     }
 
+    /// The window the split view sets beside the selected one: the first of
+    /// the other family on the same account.
+    pub fn sibling_window(&self) -> Option<(&AccountStatus, &WindowView)> {
+        let (status, view) = self.selected_window()?;
+        let session = is_session(view);
+        status
+            .windows
+            .iter()
+            .find(|w| w.window.reset_at.is_some() && is_session(w) != session)
+            .map(|w| (status, w))
+    }
+
+    /// The window an auxiliary series must describe to be charted now.
+    fn extra_target(&self, purpose: Purpose) -> Option<(&AccountStatus, &WindowView)> {
+        match purpose {
+            Purpose::Sibling => self.sibling_window(),
+            _ => self.selected_window(),
+        }
+    }
+
+    /// An auxiliary series, only while it still describes what the view is
+    /// about — the same guard [`App::charted_trend`] applies to the main one.
+    pub fn extra(&self, purpose: Purpose) -> Option<&Trend> {
+        let (status, view) = self.extra_target(purpose)?;
+        self.extras
+            .get(&purpose)
+            .filter(|t| t.account == status.account.id && t.window == view.window.id)
+    }
+
+    /// Install an auxiliary series.
+    pub fn set_extra(&mut self, purpose: Purpose, trend: Trend) {
+        self.extras.insert(purpose, trend);
+        self.resnap_inspect();
+    }
+
+    /// Keep the chart cursor on a reading the charts still draw.
+    ///
+    /// A refetch is not the same series again: the daemon keeps the highest
+    /// reading of each bucket, and on a live chart the buckets are anchored
+    /// to an edge that moves with every update, so the reading the cursor was
+    /// on can simply be gone from the next page. Left alone the cursor would
+    /// sit on nothing — no readout, and `,`/`.` with no position to step
+    /// from. It moves to the nearest reading instead, and is put away once
+    /// its instant has scrolled off the series altogether.
+    fn resnap_inspect(&mut self) {
+        let Some(Inspect::Reading { window, ts }) = self.inspect.clone() else {
+            return;
+        };
+        let times = self.reading_times(&window);
+        let first = times.first().copied();
+        self.inspect = match (first, self.nearest_reading(&window, ts)) {
+            (Some(first), Some(nearest)) if ts >= first => Some(Inspect::Reading {
+                window,
+                ts: nearest,
+            }),
+            _ => None,
+        };
+    }
+
+    /// The auxiliary series the current view needs, as queries.
+    fn extra_queries(&self, until: DateTime<Utc>, now: DateTime<Utc>) -> Vec<ExtraQuery> {
+        let wanted: &[Purpose] = match self.trend_view {
+            TrendView::UsagePace | TrendView::Forecast if self.family_split => &[Purpose::Sibling],
+            TrendView::UsagePace | TrendView::Forecast => &[],
+            TrendView::AllWindows => &[Purpose::AllWindows],
+            TrendView::History => &[Purpose::Outcomes, Purpose::Burn],
+        };
+        wanted
+            .iter()
+            // A month of rollovers and a week of readings barely move
+            // between polls; refetching them on every update would make the
+            // History view the most expensive thing the TUI asks for.
+            .filter(|&&purpose| {
+                !matches!(purpose, Purpose::Outcomes | Purpose::Burn)
+                    || self
+                        .extra(purpose)
+                        .is_none_or(|t| now - t.fetched_at >= SLOW_EXTRA_TTL)
+            })
+            .filter_map(|&purpose| {
+                let (status, view) = self.extra_target(purpose)?;
+                let account = status.account.id.clone();
+                let window = view.window.id.clone();
+                let (since, until, window_filter, max_points) = match purpose {
+                    Purpose::Sibling => (
+                        until - self.range.duration(),
+                        until,
+                        Some(window.clone()),
+                        self.range.max_points(),
+                    ),
+                    Purpose::AllWindows => (
+                        until - self.range.duration(),
+                        until,
+                        None,
+                        self.range.max_points(),
+                    ),
+                    // Only the rollovers are wanted, which come undownsampled
+                    // whatever the budget; one point keeps the reply small.
+                    Purpose::Outcomes => (
+                        now - Duration::days(OUTCOMES_SPAN_DAYS),
+                        now,
+                        Some(window.clone()),
+                        1,
+                    ),
+                    Purpose::Burn => (
+                        now - Duration::days(BURN_SPAN_DAYS),
+                        now,
+                        Some(window.clone()),
+                        BURN_MAX_POINTS,
+                    ),
+                };
+                // Panned or not only matters to the range-shaped series.
+                let pinned = matches!(purpose, Purpose::Sibling | Purpose::AllWindows)
+                    && self.trend_pan_secs > 0;
+                Some(ExtraQuery {
+                    purpose,
+                    account: account.clone(),
+                    window,
+                    title: format!("{} — {}", status.account.label, view.window.label),
+                    range: self.range,
+                    until,
+                    request: Request::History {
+                        account,
+                        window: window_filter,
+                        since,
+                        until: pinned.then_some(until),
+                        max_points: Some(max_points),
+                    },
+                })
+            })
+            .collect()
+    }
+
     /// Furthest the chart may pan back, in seconds: far enough to bring the
     /// oldest stored point to the left edge of the plot, and no further.
     ///
@@ -567,6 +949,7 @@ impl App {
         } else {
             self.trend_pan_secs.clamp(0, max)
         };
+        self.resnap_inspect();
     }
 
     /// Install one account's recent history, bucketed per window.
@@ -600,6 +983,7 @@ impl App {
             return Action::None;
         }
         self.trend_pan_secs = panned;
+        self.inspect = None;
         // The visible interval moved, so the series must be refetched.
         Action::ReloadDetail
     }
@@ -630,7 +1014,12 @@ impl App {
     fn scroll_detail(&mut self, delta: isize) -> Action {
         match self.detail {
             DetailTab::Trend => self.pan_trend(delta as i64 * self.trend_key_step_secs()),
-            DetailTab::Activity | DetailTab::Health => {
+            // The log has a row cursor; sideways is `<`/`>` and the wheel.
+            DetailTab::Activity => {
+                self.move_activity_cursor(delta);
+                Action::None
+            }
+            DetailTab::Health => {
                 self.scroll_detail_columns(delta * DETAIL_HSCROLL_STEP);
                 Action::None
             }
@@ -655,6 +1044,10 @@ impl App {
     /// of a row, the present moment on the chart.
     fn reset_detail_scroll(&mut self) -> Action {
         let panned = self.trend_pan_secs > 0;
+        if panned {
+            // Back to the present is a pan, and a pan puts the cursor away.
+            self.inspect = None;
+        }
         self.trend_pan_secs = 0;
         self.detail_hscroll = 0;
         if panned {
@@ -686,6 +1079,17 @@ impl App {
         // One notch, one line. A wheel gesture arrives as a stream of these
         // events, so anything coarser turns a flick of the finger into a jump
         // across the whole pane.
+        let at = Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => return self.click(at),
+            MouseEventKind::Down(MouseButton::Right) => {
+                if self.detail_area.contains(at) {
+                    self.inspect = None;
+                }
+                return Action::None;
+            }
+            _ => {}
+        }
         let (rows, columns) = match mouse.kind {
             MouseEventKind::ScrollDown => (1, 0),
             MouseEventKind::ScrollUp => (-1, 0),
@@ -693,10 +1097,9 @@ impl App {
             MouseEventKind::ScrollLeft => (0, -1),
             _ => return Action::None,
         };
-        let at = Position::new(mouse.column, mouse.row);
         if self.detail_area.contains(at) {
             self.focus = Pane::Detail;
-            self.wheel_detail(rows, columns)
+            self.wheel_detail(at, rows, columns)
         } else if self.quotas_area.contains(at) {
             self.focus = Pane::List;
             // The list is one column of rows; a sideways gesture has nowhere
@@ -711,11 +1114,130 @@ impl App {
         }
     }
 
+    /// A left click: on the detail pane it picks a view, or reads the chart
+    /// under the pointer; anywhere it moves the cursor to the pane clicked.
+    fn click(&mut self, at: Position) -> Action {
+        if self.quotas_area.contains(at) {
+            self.focus = Pane::List;
+            return Action::None;
+        }
+        if !self.detail_area.contains(at) {
+            return Action::None;
+        }
+        self.focus = Pane::Detail;
+        match self.detail {
+            DetailTab::Trend => {
+                if let Some(&(_, view)) = self.view_tabs.iter().find(|(r, _)| r.contains(at)) {
+                    return self.set_trend_view(view);
+                }
+                let Some(hit) = self
+                    .chart_hits
+                    .iter()
+                    .find(|h| h.plot.contains(at))
+                    .cloned()
+                else {
+                    return Action::None;
+                };
+                let target = match &hit.axis {
+                    HitAxis::Time { window, .. } => hit.instant_at(at.x).and_then(|ts| {
+                        self.nearest_reading(window, ts).map(|ts| Inspect::Reading {
+                            window: window.clone(),
+                            ts,
+                        })
+                    }),
+                    HitAxis::Bars { .. } => hit.bar_at(at.x).map(|index| Inspect::Bar {
+                        plot: hit.plot,
+                        index,
+                    }),
+                };
+                // The same point again puts the cursor away.
+                self.inspect = if target == self.inspect { None } else { target };
+                Action::None
+            }
+            DetailTab::Activity => self.click_activity(at),
+            DetailTab::Health => Action::None,
+        }
+    }
+
+    /// The series the current view draws `window`'s readings from.
+    ///
+    /// One series, never a merge: the same window can be loaded twice —
+    /// as the selection's own trend and inside the all-windows page — each
+    /// downsampled on its own, and a cursor stepping through the union would
+    /// land on readings the chart under it never drew.
+    pub fn charted_series(&self, window: &WindowId) -> Option<&Trend> {
+        match self.trend_view {
+            TrendView::AllWindows => self.extra(Purpose::AllWindows),
+            TrendView::UsagePace | TrendView::Forecast => {
+                [self.charted_trend(), self.extra(Purpose::Sibling)]
+                    .into_iter()
+                    .flatten()
+                    .find(|t| &t.window == window)
+            }
+            TrendView::History => None,
+        }
+    }
+
+    /// When `window` was read, oldest first, in the series the current view
+    /// draws it from.
+    fn reading_times(&self, window: &WindowId) -> Vec<DateTime<Utc>> {
+        let mut times: Vec<DateTime<Utc>> = self
+            .charted_series(window)
+            .into_iter()
+            .flat_map(|t| t.snapshots.iter())
+            .filter(|s| &s.window == window)
+            .map(|s| s.ts)
+            .collect();
+        times.sort();
+        times.dedup();
+        times
+    }
+
+    /// The reading of `window` nearest `ts`: a click lands between readings
+    /// far more often than on one, and only a reading has numbers to show.
+    fn nearest_reading(&self, window: &WindowId, ts: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.reading_times(window)
+            .into_iter()
+            .min_by_key(|t| (*t - ts).num_milliseconds().abs())
+    }
+
+    /// Put the chart cursor out on the newest reading, or away.
+    fn toggle_inspect(&mut self) -> Action {
+        if self.inspect.is_some() {
+            self.inspect = None;
+            return Action::None;
+        }
+        if let Some((_, view)) = self.selected_window() {
+            let window = view.window.id.clone();
+            self.inspect = self
+                .reading_times(&window)
+                .last()
+                .map(|&ts| Inspect::Reading { window, ts });
+        }
+        Action::None
+    }
+
+    /// Step the chart cursor `delta` readings along its series.
+    fn step_inspect(&mut self, delta: isize) -> Action {
+        let Some(Inspect::Reading { window, ts }) = self.inspect.clone() else {
+            return self.toggle_inspect();
+        };
+        let times = self.reading_times(&window);
+        if let Some(i) = times.iter().position(|t| *t == ts) {
+            let next = (i as isize + delta).clamp(0, times.len() as isize - 1) as usize;
+            self.inspect = Some(Inspect::Reading {
+                window,
+                ts: times[next],
+            });
+        }
+        Action::None
+    }
+
     /// Wheel handling for the detail pane, where each tab has its own axes:
     /// the chart has only time, the text tabs have rows down and columns
     /// across. Unlike `j`/`k`, which must pick one axis per pane, the wheel
     /// reports which one the user asked for.
-    fn wheel_detail(&mut self, rows: isize, columns: isize) -> Action {
+    fn wheel_detail(&mut self, at: Position, rows: isize, columns: isize) -> Action {
         match self.detail {
             DetailTab::Trend => {
                 // Time is the chart's only axis, so both gestures travel along
@@ -723,12 +1245,98 @@ impl App {
                 let delta = if columns != 0 { columns } else { rows };
                 self.pan_trend(delta as i64 * self.trend_wheel_step_secs())
             }
+            DetailTab::Activity if self.activity_details_area.contains(at) => {
+                let max = self.details_scroll_max as isize;
+                self.details_scroll = (self.details_scroll as isize + rows).clamp(0, max) as usize;
+                Action::None
+            }
             DetailTab::Activity | DetailTab::Health => {
                 self.scroll_detail_rows(rows);
                 self.scroll_detail_columns(columns);
                 Action::None
             }
         }
+    }
+
+    /// The Activity row the cursor is on, if it has been put on one.
+    pub fn activity_index(&self) -> Option<usize> {
+        let id = self.activity_cursor?;
+        if self.activity.is_empty() {
+            return None;
+        }
+        Some(
+            self.activity
+                .iter()
+                .position(|e| e.id == id)
+                .unwrap_or(self.activity_cursor_index.min(self.activity.len() - 1)),
+        )
+    }
+
+    /// The poll the Activity cursor is on.
+    pub fn activity_selected(&self) -> Option<&PollEvent> {
+        self.activity.get(self.activity_index()?)
+    }
+
+    /// Put the Activity cursor on row `index`, clamped to the log.
+    fn select_activity(&mut self, index: usize) {
+        if self.activity.is_empty() {
+            return;
+        }
+        let index = index.min(self.activity.len() - 1);
+        if Some(index) != self.activity_index() {
+            self.details_scroll = 0;
+        }
+        self.activity_cursor = Some(self.activity[index].id);
+        self.activity_cursor_index = index;
+        self.activity_follow = true;
+    }
+
+    /// Move the Activity cursor `delta` rows; the first press puts it on the
+    /// newest poll.
+    fn move_activity_cursor(&mut self, delta: isize) {
+        let next = match self.activity_index() {
+            Some(i) => (i as isize + delta).max(0) as usize,
+            None => 0,
+        };
+        self.select_activity(next);
+    }
+
+    /// Open or shut the Details pane, putting the cursor on the newest poll
+    /// if it is not on one yet.
+    fn toggle_details(&mut self) -> Action {
+        if self.activity_index().is_none() {
+            self.select_activity(0);
+        }
+        self.activity_details = !self.activity_details && self.activity_index().is_some();
+        self.details_scroll = 0;
+        Action::None
+    }
+
+    /// Record how far the Details pane overruns its viewport.
+    pub fn set_details_bounds(&mut self, rows: usize) {
+        self.details_scroll_max = rows;
+        self.details_scroll = self.details_scroll.min(rows);
+    }
+
+    /// A click on the Activity tab: a row selects it, and the selected row
+    /// again opens or shuts its details.
+    fn click_activity(&mut self, at: Position) -> Action {
+        let list = self.activity_list_area;
+        if !list.contains(at) {
+            return Action::None;
+        }
+        let index = self.detail_scroll + usize::from(at.y - list.y);
+        if index >= self.activity.len() {
+            return Action::None;
+        }
+        if Some(index) == self.activity_index() {
+            return self.toggle_details();
+        }
+        self.select_activity(index);
+        // Following would scroll a row the user just clicked, which is on
+        // screen by definition.
+        self.activity_follow = false;
+        Action::None
     }
 
     /// Distinct providers currently displayed.
@@ -768,6 +1376,7 @@ impl App {
                         until: (self.trend_pan_secs > 0).then_some(until),
                         max_points: Some(self.range.max_points()),
                     },
+                    extras: self.extra_queries(until, now),
                 })
             }
             DetailTab::Activity => Some(DetailQuery::Activity(Request::RecentPolls {
@@ -977,9 +1586,15 @@ impl App {
                 Action::LoadConfig
             }
             KeyCode::Esc => {
-                // Step back out of the detail pane first; only once the cursor
-                // is already in the list does Esc mean "get out of the way".
-                if self.focus == Pane::Detail {
+                // Put the chart cursor away first, then step back out of the
+                // detail pane; only once the cursor is already in the list
+                // does Esc mean "get out of the way".
+                if self.inspect.is_some() && self.detail == DetailTab::Trend && self.detail_visible
+                {
+                    self.inspect = None;
+                } else if self.activity_details && self.detail == DetailTab::Activity {
+                    self.activity_details = false;
+                } else if self.focus == Pane::Detail {
                     self.focus = Pane::List;
                 } else {
                     self.detail_visible = false;
@@ -1006,6 +1621,9 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => self.focus_pane(Pane::Detail),
             KeyCode::Char('g') | KeyCode::Home => {
                 if self.detail_focused() {
+                    if self.detail == DetailTab::Activity {
+                        self.select_activity(0);
+                    }
                     return self.reset_detail_scroll();
                 }
                 self.select(0);
@@ -1019,6 +1637,10 @@ impl App {
                     if self.detail == DetailTab::Trend {
                         return self.reset_detail_scroll();
                     }
+                    if self.detail == DetailTab::Activity {
+                        self.select_activity(usize::MAX);
+                        return Action::None;
+                    }
                     self.detail_hscroll = self.detail_hscroll_max;
                     return Action::None;
                 }
@@ -1027,6 +1649,14 @@ impl App {
                     self.select(len - 1);
                 }
                 Action::ReloadDetail
+            }
+            KeyCode::PageDown if self.detail == DetailTab::Activity => {
+                self.move_activity_cursor(DETAIL_PAGE);
+                Action::None
+            }
+            KeyCode::PageUp if self.detail == DetailTab::Activity => {
+                self.move_activity_cursor(-DETAIL_PAGE);
+                Action::None
             }
             KeyCode::PageDown => {
                 self.scroll_detail_rows(DETAIL_PAGE);
@@ -1045,14 +1675,24 @@ impl App {
             // something different either side of a zoom; start from the
             // present rather than from a distance that no longer applies.
             KeyCode::Char('[') => {
+                self.inspect = None;
                 self.range = self.range.shift(-1);
                 self.trend_pan_secs = 0;
                 Action::ReloadDetail
             }
             KeyCode::Char(']') => {
+                self.inspect = None;
                 self.range = self.range.shift(1);
                 self.trend_pan_secs = 0;
                 Action::ReloadDetail
+            }
+            KeyCode::Char('v') => self.set_trend_view(self.trend_view.shift(1)),
+            KeyCode::Char('V') => self.set_trend_view(self.trend_view.shift(-1)),
+            KeyCode::Char('f') => {
+                self.family_split = !self.family_split;
+                // The cursor may be on the column the split just removed.
+                self.inspect = None;
+                self.set_tab(DetailTab::Trend)
             }
             KeyCode::Char('d') => {
                 self.detail_visible = !self.detail_visible;
@@ -1063,6 +1703,29 @@ impl App {
                     self.focus = Pane::List;
                     Action::None
                 }
+            }
+            KeyCode::Enter if self.detail_focused() && self.detail == DetailTab::Trend => {
+                self.toggle_inspect()
+            }
+            KeyCode::Enter if self.detail_focused() && self.detail == DetailTab::Activity => {
+                self.toggle_details()
+            }
+            // Enter polls only from the list; a pane with nothing to open
+            // takes it as a no-op rather than polling behind the user's back.
+            KeyCode::Enter if self.detail_focused() => Action::None,
+            KeyCode::Char('<') if self.detail_focused() => {
+                self.scroll_detail_columns(-DETAIL_HSCROLL_STEP);
+                Action::None
+            }
+            KeyCode::Char('>') if self.detail_focused() => {
+                self.scroll_detail_columns(DETAIL_HSCROLL_STEP);
+                Action::None
+            }
+            KeyCode::Char(',') if self.detail_visible && self.detail == DetailTab::Trend => {
+                self.step_inspect(-1)
+            }
+            KeyCode::Char('.') if self.detail_visible && self.detail == DetailTab::Trend => {
+                self.step_inspect(1)
             }
             KeyCode::Char('r') | KeyCode::Enter => match self.selected_row() {
                 Some(row) => {
@@ -1091,6 +1754,15 @@ impl App {
             }
             _ => Action::None,
         }
+    }
+
+    /// Show `view` on the Trend tab, switching to the tab if need be.
+    fn set_trend_view(&mut self, view: TrendView) -> Action {
+        if view != self.trend_view {
+            self.inspect = None;
+        }
+        self.trend_view = view;
+        self.set_tab(DetailTab::Trend)
     }
 
     fn set_tab(&mut self, tab: DetailTab) -> Action {
@@ -1307,6 +1979,27 @@ mod tests {
         assert_eq!(app.polling.len(), 1);
         app.poll_refused(&"openai".to_owned(), Some(&AccountId::from("openai:c")));
         assert!(app.polling.is_empty());
+    }
+
+    /// Enter polls from the list; in a pane it opens something or nothing.
+    #[test]
+    fn enter_in_the_health_pane_does_not_poll() {
+        let mut app = App::new();
+        app.set_statuses(vec![status("claude", "a", 1)]);
+        app.detail = DetailTab::Health;
+        app.focus = Pane::Detail;
+        assert!(matches!(app.handle_key(code(KeyCode::Enter)), Action::None));
+        assert!(app.polling.is_empty());
+
+        // `r` still polls from anywhere, and Enter from the list.
+        assert!(matches!(app.handle_key(key('r')), Action::Send(_)));
+        app.focus = Pane::List;
+        app.polling.clear();
+        assert!(matches!(
+            app.handle_key(code(KeyCode::Enter)),
+            Action::Send(_)
+        ));
+        assert_eq!(app.polling.len(), 1);
     }
 
     #[test]
@@ -1539,12 +2232,14 @@ mod tests {
 
         app.handle_key(key('l'));
         assert_eq!(app.focus, Pane::Detail);
-        app.handle_key(key('j'));
-        app.handle_key(key('j'));
+        // In the log `j`/`k` move its row cursor, so sideways is `<`/`>`.
+        app.handle_key(key('>'));
+        app.handle_key(key('>'));
         assert_eq!(app.detail_hscroll, 2 * DETAIL_HSCROLL_STEP as usize);
+        app.handle_key(key('j'));
         assert_eq!(app.selected_index(), Some(2), "the selection was dragged");
 
-        app.handle_key(key('k'));
+        app.handle_key(key('<'));
         assert_eq!(app.detail_hscroll, DETAIL_HSCROLL_STEP as usize);
         // Esc steps back out of the pane before it collapses it.
         app.handle_key(code(KeyCode::Esc));
@@ -1607,6 +2302,139 @@ mod tests {
             earliest: Some(now - history),
             fetched_at: now,
         }
+    }
+
+    /// What an extra query's history request asks for:
+    /// `(purpose, window, since, until, max_points)`.
+    type ExtraShape = (
+        Purpose,
+        Option<WindowId>,
+        DateTime<Utc>,
+        Option<DateTime<Utc>>,
+        Option<u32>,
+    );
+
+    fn extra_shapes(queries: &[ExtraQuery]) -> Vec<ExtraShape> {
+        queries
+            .iter()
+            .map(|q| match &q.request {
+                Request::History {
+                    window,
+                    since,
+                    until,
+                    max_points,
+                    ..
+                } => (q.purpose, window.clone(), *since, *until, *max_points),
+                other => panic!("expected History, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Each view asks for the extra series it draws and no others; History's
+    /// month and week are reused for ten minutes; the range-shaped series
+    /// follow a pan, the fixed-span ones never do.
+    #[test]
+    fn each_view_requests_the_extra_series_it_draws() {
+        let now = Utc::now();
+        let mut app = App::new();
+        let mut account = status("claude", "a", 2);
+        for (view, span) in account.windows.iter_mut().zip([5 * 3600, 7 * 86400]) {
+            view.window.reset_kind = ResetKind::Rolling(std::time::Duration::from_secs(span));
+            view.window.reset_at = Some(now + Duration::hours(1));
+        }
+        app.set_statuses(vec![account]);
+        let range = app.range.duration();
+        let points = Some(app.range.max_points());
+
+        app.trend_view = TrendView::UsagePace;
+        assert!(app.extra_queries(now, now).is_empty());
+        app.trend_view = TrendView::Forecast;
+        assert!(app.extra_queries(now, now).is_empty());
+
+        // The split asks for the other family's window over the same range.
+        app.family_split = true;
+        assert_eq!(
+            extra_shapes(&app.extra_queries(now, now)),
+            vec![(
+                Purpose::Sibling,
+                Some(WindowId::from("w1")),
+                now - range,
+                None,
+                points
+            )]
+        );
+        app.trend_view = TrendView::UsagePace;
+        assert_eq!(app.extra_queries(now, now).len(), 1);
+
+        // Every window, unfiltered.
+        app.trend_view = TrendView::AllWindows;
+        assert_eq!(
+            extra_shapes(&app.extra_queries(now, now)),
+            vec![(Purpose::AllWindows, None, now - range, None, points)]
+        );
+
+        // A month of rollovers in one point, and a week of readings.
+        app.trend_view = TrendView::History;
+        let w0 = Some(WindowId::from("w0"));
+        assert_eq!(
+            extra_shapes(&app.extra_queries(now, now)),
+            vec![
+                (
+                    Purpose::Outcomes,
+                    w0.clone(),
+                    now - Duration::days(OUTCOMES_SPAN_DAYS),
+                    None,
+                    Some(1)
+                ),
+                (
+                    Purpose::Burn,
+                    w0.clone(),
+                    now - Duration::days(BURN_SPAN_DAYS),
+                    None,
+                    Some(BURN_MAX_POINTS)
+                ),
+            ]
+        );
+        app.set_extra(
+            Purpose::Outcomes,
+            trend_with_history(&app, Duration::days(30), now),
+        );
+        app.set_extra(
+            Purpose::Burn,
+            trend_with_history(&app, Duration::days(30), now),
+        );
+        let fresh = now + SLOW_EXTRA_TTL - Duration::seconds(1);
+        assert!(
+            app.extra_queries(fresh, fresh).is_empty(),
+            "reused for ten minutes"
+        );
+        let stale = now + SLOW_EXTRA_TTL;
+        assert_eq!(app.extra_queries(stale, stale).len(), 2);
+
+        // Panned, the range-shaped series pin their right edge; the fixed
+        // spans still end at the present.
+        app.trend_pan_secs = 3600;
+        let until = now - Duration::hours(1);
+        app.trend_view = TrendView::AllWindows;
+        assert_eq!(
+            extra_shapes(&app.extra_queries(until, now)),
+            vec![(
+                Purpose::AllWindows,
+                None,
+                until - range,
+                Some(until),
+                points
+            )]
+        );
+        app.trend_view = TrendView::Forecast;
+        assert_eq!(
+            extra_shapes(&app.extra_queries(until, now))[0].3,
+            Some(until)
+        );
+        app.trend_view = TrendView::History;
+        assert!(extra_shapes(&app.extra_queries(until, stale))
+            .iter()
+            .all(|q| q.3.is_none()));
     }
 
     /// Panning the chart is a horizontal scroll through time: it moves the
