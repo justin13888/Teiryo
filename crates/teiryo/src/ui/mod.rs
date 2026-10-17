@@ -1190,6 +1190,71 @@ mod tests {
         assert_eq!(app.activity_index(), Some(1));
     }
 
+    /// The wheel over the Details pane scrolls the details, not the log, one
+    /// line a notch, and stops where the content ends.
+    #[test]
+    fn the_wheel_scrolls_the_details_pane_and_stops_at_its_end() {
+        let mut app = on_activity();
+        // An error long enough to wrap past the bottom of the pane.
+        app.activity[1].outcome =
+            PollOutcome::AuthError("token expired — run `claude` to refresh. ".repeat(8));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let out = rendered(&mut app, 100, 26);
+        let max = app.details_scroll_max;
+        assert!(max > 0, "the details overrun a short pane:\n{out}");
+        let area = app.activity_details_area;
+        let (column, row) = (area.x + 2, area.y + 2);
+        let notch = |app: &mut App, kind| {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        notch(&mut app, MouseEventKind::ScrollDown);
+        assert_eq!(app.details_scroll, 1);
+        for _ in 0..max + 5 {
+            notch(&mut app, MouseEventKind::ScrollDown);
+        }
+        assert_eq!(app.details_scroll, max, "no further than the content");
+        assert_eq!(app.detail_scroll, 0, "the log stays put");
+        let out = rendered(&mut app, 100, 26);
+        assert_eq!(app.details_scroll, max, "and the next frame agrees:\n{out}");
+        for _ in 0..max + 5 {
+            notch(&mut app, MouseEventKind::ScrollUp);
+        }
+        assert_eq!(app.details_scroll, 0);
+    }
+
+    /// A right click on the pane puts the chart cursor away; one elsewhere
+    /// leaves it.
+    #[test]
+    fn a_right_click_on_the_pane_puts_the_chart_cursor_away() {
+        let mut app = charted();
+        app.focus = Pane::Detail;
+        rendered(&mut app, 120, 60);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.inspect.is_some());
+        let right = |app: &mut App, at: Rect| {
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: at.x + 1,
+                row: at.y + 1,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let quotas = app.quotas_area;
+        right(&mut app, quotas);
+        assert!(app.inspect.is_some(), "outside the pane it stays");
+        let plot = app.chart_hits[0].plot;
+        right(&mut app, plot);
+        assert_eq!(app.inspect, None);
+    }
+
     #[test]
     fn the_cursor_stays_on_its_poll_when_newer_ones_arrive() {
         let mut app = on_activity();
