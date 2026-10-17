@@ -832,10 +832,10 @@ fn coverage_line(
             Span::styled("•", Style::default().fg(theme::ACCENT))
         } else {
             let before = times.iter().rev().find(|t| **t < from);
-            let after = times.iter().find(|t| **t >= to).copied().or_else(|| {
-                // After the newest reading, the present is the far side.
-                (to <= now).then_some(now)
-            });
+            // After the newest reading, the present is the far side — also in
+            // the column the present falls inside, which `from > now` above
+            // already guarantees has begun.
+            let after = times.iter().find(|t| **t >= to).copied().or(Some(now));
             match (before, after) {
                 (Some(b), Some(a)) if a - *b <= gap => Span::styled("─", theme::dim()),
                 _ => Span::styled("░", Style::default().fg(theme::WARN)),
@@ -1416,6 +1416,49 @@ mod tests {
         assert_eq!(rate_bound(&[0.3, 0.9]), 2.0);
         assert_eq!(rate_bound(&[2.6]), 3.0);
         assert_eq!(rate_bound(&[40.0, f64::INFINITY]), 10.0);
+    }
+
+    fn glyphs(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// The column the present falls in has not finished yet: with no reading
+    /// in it so far, it is the stretch since the last one, not a hole.
+    #[test]
+    fn the_column_holding_the_present_is_not_a_hole() {
+        let left = Utc::now() - Duration::minutes(30);
+        // Ten one-minute columns of past, ten of lead to the reset.
+        let axis = TimeAxis {
+            left,
+            span: 600.0,
+            lead: 600.0,
+        };
+        let now = left + Duration::seconds(630);
+        let snapshots: Vec<QuotaSnapshot> = (0..10)
+            .map(|i| QuotaSnapshot {
+                poll_id: teiryo_core::PollId::generate(),
+                ts: left + Duration::seconds(30 + 60 * i),
+                window: WindowId::from("w"),
+                label: "w".into(),
+                unit: QuotaUnit::Percent,
+                used: 10.0,
+                limit: None,
+                reset_at: None,
+            })
+            .collect();
+        let line = coverage_line(&axis, 20, &snapshots, Duration::minutes(5), now);
+        assert_eq!(
+            glyphs(&line),
+            format!("{}─{}", "•".repeat(10), " ".repeat(9))
+        );
+
+        // A present far past the last reading is still a hole.
+        let late = left + Duration::seconds(1110);
+        let line = coverage_line(&axis, 20, &snapshots, Duration::minutes(5), late);
+        assert_eq!(
+            glyphs(&line),
+            format!("{}{} ", "•".repeat(10), "░".repeat(9))
+        );
     }
 
     #[test]
