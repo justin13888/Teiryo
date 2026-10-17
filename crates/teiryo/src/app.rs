@@ -2304,17 +2304,17 @@ mod tests {
         }
     }
 
-    /// The history requests of a set of extra queries, by purpose:
-    /// `(window, since, until, max_points)`.
-    fn extra_shapes(
-        queries: &[ExtraQuery],
-    ) -> Vec<(
+    /// What an extra query's history request asks for:
+    /// `(purpose, window, since, until, max_points)`.
+    type ExtraShape = (
         Purpose,
         Option<WindowId>,
         DateTime<Utc>,
         Option<DateTime<Utc>>,
         Option<u32>,
-    )> {
+    );
+
+    fn extra_shapes(queries: &[ExtraQuery]) -> Vec<ExtraShape> {
         queries
             .iter()
             .map(|q| match &q.request {
