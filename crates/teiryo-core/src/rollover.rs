@@ -276,7 +276,7 @@ fn classify(
 /// restarted at.
 ///
 /// It is deliberately *not* a rule every consumer shares. `teiryo`'s
-/// `recent_pace` asks a narrower question — whether to cut a series at a
+/// `estimate_rate` asks a narrower question — whether to cut a series at a
 /// falling reading — and answers it with its own, much smaller epsilon,
 /// because a restart too small for this rule to see is one it must still not
 /// average across. The two are different questions about the same event, and

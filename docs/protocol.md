@@ -147,7 +147,7 @@ enum ConfigEdit {
 
 **Windows carry where they actually began.** `reset_at` minus the roll duration is a window's start only while the provider moves `reset_at` with the reset; where it does not, that arithmetic describes a window that is over, and every rate derived from it reads low. `observed_start` is the bracket around the last restart the daemon saw (`ObservedStart { not_before, not_after }` — see [domain.md](domain.md#window-rollovers)), and the client reconciles the two in `metrics::effective_window`.
 
-It has to travel on `Status` rather than be derived client-side: the restart anchoring a weekly window is routinely days older than the 12 hours of series a dashboard fetches, and it is inferred from consecutive polls the client never sees individually. `None` means no restart has been observed, in which case the provider's own arithmetic is all there is. Added in protocol v6.
+It has to travel on `Status` rather than be derived client-side: the restart anchoring a weekly window is routinely days older than the 48 hours of series a dashboard fetches, and it is inferred from consecutive polls the client never sees individually. `None` means no restart has been observed, in which case the provider's own arithmetic is all there is. Added in protocol v6.
 
 **`last_poll` vs. `last_success`.** `windows` is served from the latest *successful* poll while `last_poll` is the latest poll of any outcome. After a failure the two diverge, and only `last_success` says how stale the displayed windows are — a client that reports staleness from `last_poll` would claim fresh data it does not have.
 

@@ -77,7 +77,7 @@ restart it actually saw (see [domain.md](domain.md#window-rollovers)), and
   and projecting divides the span back out, so the start cancels. The help
   overlay lists the mark.
 
-Only the daemon can supply this. The TUI fetches 12 hours of series, and the
+Only the daemon can supply this. The TUI fetches 48 hours of series, and the
 reset anchoring a weekly window is routinely days older than that, so there is
 nothing client-side to reconstruct it from.
 
