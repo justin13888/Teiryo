@@ -1710,6 +1710,9 @@ impl App {
             KeyCode::Enter if self.detail_focused() && self.detail == DetailTab::Activity => {
                 self.toggle_details()
             }
+            // Enter polls only from the list; a pane with nothing to open
+            // takes it as a no-op rather than polling behind the user's back.
+            KeyCode::Enter if self.detail_focused() => Action::None,
             KeyCode::Char('<') if self.detail_focused() => {
                 self.scroll_detail_columns(-DETAIL_HSCROLL_STEP);
                 Action::None
@@ -1976,6 +1979,27 @@ mod tests {
         assert_eq!(app.polling.len(), 1);
         app.poll_refused(&"openai".to_owned(), Some(&AccountId::from("openai:c")));
         assert!(app.polling.is_empty());
+    }
+
+    /// Enter polls from the list; in a pane it opens something or nothing.
+    #[test]
+    fn enter_in_the_health_pane_does_not_poll() {
+        let mut app = App::new();
+        app.set_statuses(vec![status("claude", "a", 1)]);
+        app.detail = DetailTab::Health;
+        app.focus = Pane::Detail;
+        assert!(matches!(app.handle_key(code(KeyCode::Enter)), Action::None));
+        assert!(app.polling.is_empty());
+
+        // `r` still polls from anywhere, and Enter from the list.
+        assert!(matches!(app.handle_key(key('r')), Action::Send(_)));
+        app.focus = Pane::List;
+        app.polling.clear();
+        assert!(matches!(
+            app.handle_key(code(KeyCode::Enter)),
+            Action::Send(_)
+        ));
+        assert_eq!(app.polling.len(), 1);
     }
 
     #[test]
