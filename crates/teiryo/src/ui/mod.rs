@@ -1342,6 +1342,35 @@ mod tests {
         assert_eq!(app.inspect, None);
     }
 
+    /// A reading published without a reset has no rate behind it, but its
+    /// time and usage are still worth reading out.
+    #[test]
+    fn a_reading_without_a_reset_still_reads_out_its_time_and_usage() {
+        let mut app = charted();
+        app.focus = Pane::Detail;
+        let trend = app.trend.as_mut().unwrap();
+        let last = trend.snapshots.last_mut().unwrap();
+        last.reset_at = None;
+        let (ts, used) = (last.ts, last.used);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.inspect,
+            Some(Inspect::Reading {
+                window: WindowId::from("session_5h"),
+                ts
+            })
+        );
+        let out = rendered(&mut app, 120, 60);
+        let time = ts
+            .with_timezone(&chrono::Local)
+            .format("%a %H:%M")
+            .to_string();
+        assert!(
+            out.contains(&format!("{time} · {used:.0}% used")),
+            "readout:\n{out}"
+        );
+    }
+
     #[test]
     fn returning_to_the_present_puts_the_chart_cursor_away() {
         let mut app = charted();

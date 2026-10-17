@@ -1354,29 +1354,34 @@ pub fn readout(app: &App, hits: &[ChartHit], now: DateTime<Utc>) -> Option<Strin
             let gap = chart_gap(range, status.poll_interval_secs);
             let span = view.window.span().unwrap_or_else(|| Duration::hours(5));
             let effective = metrics::effective_window(view, now);
+            // A reading with no reset carries no window instance to measure a
+            // rate against, so the series has no point for it — but its time
+            // and usage still stand on their own.
             let point = metrics::rate_series(window, span, effective.as_ref(), snapshots, gap)
                 .into_iter()
-                .find(|p| p.ts == *ts)?;
-            if let Some(rate) = point.rate {
-                parts.push(format!("now {:.2}× {}", rate.pace, rate_interval(&rate)));
-            }
-            if let Some(average) = metrics::pace(&point.window, point.ts) {
-                parts.push(format!("avg {average:.2}×"));
-            }
-            if let Some(projection) = point
-                .rate
-                .and_then(|r| metrics::project(&point.window, &r, point.ts))
-            {
-                let at = projection.at_reset;
-                parts.push(format!(
-                    "→{:.0}% ({:.0}–{:.0}%)",
-                    at.mid * 100.0,
-                    at.low * 100.0,
-                    at.high * 100.0
-                ));
-            }
-            if let Some(afford) = metrics::affordable_pace(&point.window, point.ts) {
-                parts.push(format!("afford {afford:.2}×"));
+                .find(|p| p.ts == *ts);
+            if let Some(point) = point {
+                if let Some(rate) = point.rate {
+                    parts.push(format!("now {:.2}× {}", rate.pace, rate_interval(&rate)));
+                }
+                if let Some(average) = metrics::pace(&point.window, point.ts) {
+                    parts.push(format!("avg {average:.2}×"));
+                }
+                if let Some(projection) = point
+                    .rate
+                    .and_then(|r| metrics::project(&point.window, &r, point.ts))
+                {
+                    let at = projection.at_reset;
+                    parts.push(format!(
+                        "→{:.0}% ({:.0}–{:.0}%)",
+                        at.mid * 100.0,
+                        at.low * 100.0,
+                        at.high * 100.0
+                    ));
+                }
+                if let Some(afford) = metrics::affordable_pace(&point.window, point.ts) {
+                    parts.push(format!("afford {afford:.2}×"));
+                }
             }
             Some(parts.join(" · "))
         }
