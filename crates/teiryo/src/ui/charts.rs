@@ -863,6 +863,33 @@ fn legend(frame: &mut Frame<'_>, plot: Rect, entries: &[(&str, Color)]) {
     }
 }
 
+/// What the Forecast view plots at each reading: the projection from the
+/// rate as it stood then (`None` without a rate), and the pace the rest of
+/// that reading's window could afford.
+fn forecast_values(points: &[&RatePoint]) -> (Vec<Option<metrics::Projection>>, Vec<Option<f64>>) {
+    let projections = points
+        .iter()
+        .map(|p| p.rate.and_then(|r| metrics::project(&p.window, &r, p.ts)))
+        .collect();
+    let affords = points
+        .iter()
+        .map(|p| metrics::affordable_pace(&p.window, p.ts))
+        .collect();
+    (projections, affords)
+}
+
+/// Top of the at-reset axis, in percent: room above the highest end of any
+/// band, in steps of 50, never below 120% so the cap line has air above it,
+/// and never above 400% so one wild early estimate cannot flatten the rest.
+fn forecast_bound(projections: &[Option<metrics::Projection>]) -> f64 {
+    let peak = projections
+        .iter()
+        .flatten()
+        .map(|p| p.at_reset.high * 100.0)
+        .fold(0.0_f64, f64::max);
+    ((peak * 1.05 / 50.0).ceil() * 50.0).clamp(120.0, 400.0)
+}
+
 /// The forecast as it stood at each reading, over the pace it could afford
 /// against the pace it ran at.
 fn forecast_stack(
@@ -881,21 +908,8 @@ fn forecast_stack(
         .iter()
         .filter(|p| axis.contains(p.ts))
         .collect();
-    let projections: Vec<Option<metrics::Projection>> = visible
-        .iter()
-        .map(|p| p.rate.and_then(|r| metrics::project(&p.window, &r, p.ts)))
-        .collect();
-    let affords: Vec<Option<f64>> = visible
-        .iter()
-        .map(|p| metrics::affordable_pace(&p.window, p.ts))
-        .collect();
-
-    let at_reset_peak = projections
-        .iter()
-        .flatten()
-        .map(|p| p.at_reset.high * 100.0)
-        .fold(0.0_f64, f64::max);
-    let forecast_max = ((at_reset_peak * 1.05 / 50.0).ceil() * 50.0).clamp(120.0, 400.0);
+    let (projections, affords) = forecast_values(&visible);
+    let forecast_max = forecast_bound(&projections);
     let forecast_text = [
         "0%".to_owned(),
         format!("{:.0}%", forecast_max / 2.0),
@@ -1464,6 +1478,66 @@ mod tests {
             glyphs(&line),
             format!("{}{} ", "•".repeat(10), "░".repeat(9))
         );
+    }
+
+    /// A reading halfway through a 10-hour window at 50% used: at the
+    /// central rate it reaches the cap exactly at the reset.
+    fn halfway(rate: Option<(f64, f64, f64)>) -> RatePoint {
+        let ts = Utc::now();
+        RatePoint {
+            ts,
+            window: EffectiveWindow {
+                window: WindowId::from("w"),
+                start: ts - Duration::hours(5),
+                reset_at: ts + Duration::hours(5),
+                start_uncertainty: Duration::zero(),
+                used: Some(0.5),
+            },
+            rate: rate.map(|(low, pace, high)| metrics::RateEstimate {
+                pace,
+                low,
+                high,
+                from: ts - Duration::minutes(30),
+                to: ts,
+                readings: 16,
+                quantum: 0.01,
+            }),
+        }
+    }
+
+    #[test]
+    fn the_forecast_plots_each_readings_band_at_reset_and_what_it_could_afford() {
+        let with = halfway(Some((0.8, 1.0, 1.4)));
+        let without = halfway(None);
+        let (projections, affords) = forecast_values(&[&with, &without]);
+        let at = projections[0].expect("a rate projects").at_reset;
+        // 50% used, plus the rate times the half of the window left.
+        for (got, want) in [(at.low, 0.9), (at.mid, 1.0), (at.high, 1.2)] {
+            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+        }
+        assert_eq!(projections[1], None, "no rate, no band");
+        // Half the budget over half the window is exactly the average pace,
+        // with or without a rate.
+        assert_eq!(affords, vec![Some(1.0), Some(1.0)]);
+
+        // 120% band top, with headroom, rounded up to the next 50.
+        assert_eq!(forecast_bound(&projections), 150.0);
+    }
+
+    #[test]
+    fn the_forecast_axis_is_clamped_between_120_and_400_percent() {
+        let band = |high: f64| {
+            let point = halfway(Some((0.0, high, high)));
+            forecast_values(&[&point]).0
+        };
+        assert_eq!(forecast_bound(&[]), 120.0, "nothing projected");
+        assert_eq!(forecast_bound(&[None]), 120.0);
+        // 60% at reset still leaves the cap line in view.
+        assert_eq!(forecast_bound(&band(0.2)), 120.0);
+        // 250% * 1.05 rounds up to 300.
+        assert_eq!(forecast_bound(&band(4.0)), 300.0);
+        // A wild early estimate is cut off rather than flattening the rest.
+        assert_eq!(forecast_bound(&band(40.0)), 400.0);
     }
 
     #[test]
