@@ -2304,6 +2304,139 @@ mod tests {
         }
     }
 
+    /// The history requests of a set of extra queries, by purpose:
+    /// `(window, since, until, max_points)`.
+    fn extra_shapes(
+        queries: &[ExtraQuery],
+    ) -> Vec<(
+        Purpose,
+        Option<WindowId>,
+        DateTime<Utc>,
+        Option<DateTime<Utc>>,
+        Option<u32>,
+    )> {
+        queries
+            .iter()
+            .map(|q| match &q.request {
+                Request::History {
+                    window,
+                    since,
+                    until,
+                    max_points,
+                    ..
+                } => (q.purpose, window.clone(), *since, *until, *max_points),
+                other => panic!("expected History, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Each view asks for the extra series it draws and no others; History's
+    /// month and week are reused for ten minutes; the range-shaped series
+    /// follow a pan, the fixed-span ones never do.
+    #[test]
+    fn each_view_requests_the_extra_series_it_draws() {
+        let now = Utc::now();
+        let mut app = App::new();
+        let mut account = status("claude", "a", 2);
+        for (view, span) in account.windows.iter_mut().zip([5 * 3600, 7 * 86400]) {
+            view.window.reset_kind = ResetKind::Rolling(std::time::Duration::from_secs(span));
+            view.window.reset_at = Some(now + Duration::hours(1));
+        }
+        app.set_statuses(vec![account]);
+        let range = app.range.duration();
+        let points = Some(app.range.max_points());
+
+        app.trend_view = TrendView::UsagePace;
+        assert!(app.extra_queries(now, now).is_empty());
+        app.trend_view = TrendView::Forecast;
+        assert!(app.extra_queries(now, now).is_empty());
+
+        // The split asks for the other family's window over the same range.
+        app.family_split = true;
+        assert_eq!(
+            extra_shapes(&app.extra_queries(now, now)),
+            vec![(
+                Purpose::Sibling,
+                Some(WindowId::from("w1")),
+                now - range,
+                None,
+                points
+            )]
+        );
+        app.trend_view = TrendView::UsagePace;
+        assert_eq!(app.extra_queries(now, now).len(), 1);
+
+        // Every window, unfiltered.
+        app.trend_view = TrendView::AllWindows;
+        assert_eq!(
+            extra_shapes(&app.extra_queries(now, now)),
+            vec![(Purpose::AllWindows, None, now - range, None, points)]
+        );
+
+        // A month of rollovers in one point, and a week of readings.
+        app.trend_view = TrendView::History;
+        let w0 = Some(WindowId::from("w0"));
+        assert_eq!(
+            extra_shapes(&app.extra_queries(now, now)),
+            vec![
+                (
+                    Purpose::Outcomes,
+                    w0.clone(),
+                    now - Duration::days(OUTCOMES_SPAN_DAYS),
+                    None,
+                    Some(1)
+                ),
+                (
+                    Purpose::Burn,
+                    w0.clone(),
+                    now - Duration::days(BURN_SPAN_DAYS),
+                    None,
+                    Some(BURN_MAX_POINTS)
+                ),
+            ]
+        );
+        app.set_extra(
+            Purpose::Outcomes,
+            trend_with_history(&app, Duration::days(30), now),
+        );
+        app.set_extra(
+            Purpose::Burn,
+            trend_with_history(&app, Duration::days(30), now),
+        );
+        let fresh = now + SLOW_EXTRA_TTL - Duration::seconds(1);
+        assert!(
+            app.extra_queries(fresh, fresh).is_empty(),
+            "reused for ten minutes"
+        );
+        let stale = now + SLOW_EXTRA_TTL;
+        assert_eq!(app.extra_queries(stale, stale).len(), 2);
+
+        // Panned, the range-shaped series pin their right edge; the fixed
+        // spans still end at the present.
+        app.trend_pan_secs = 3600;
+        let until = now - Duration::hours(1);
+        app.trend_view = TrendView::AllWindows;
+        assert_eq!(
+            extra_shapes(&app.extra_queries(until, now)),
+            vec![(
+                Purpose::AllWindows,
+                None,
+                until - range,
+                Some(until),
+                points
+            )]
+        );
+        app.trend_view = TrendView::Forecast;
+        assert_eq!(
+            extra_shapes(&app.extra_queries(until, now))[0].3,
+            Some(until)
+        );
+        app.trend_view = TrendView::History;
+        assert!(extra_shapes(&app.extra_queries(until, stale))
+            .iter()
+            .all(|q| q.3.is_none()));
+    }
+
     /// Panning the chart is a horizontal scroll through time: it moves the
     /// requested interval, not just the drawing.
     #[test]
