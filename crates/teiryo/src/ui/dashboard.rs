@@ -46,7 +46,15 @@ fn identity_line(app: &App) -> Line<'static> {
     let accounts = app.statuses.len();
     let windows: usize = app.statuses.iter().map(|s| s.windows.len()).sum();
     if accounts == 0 {
-        spans.push(Span::styled("  waiting for the daemon", theme::dim()));
+        // Connected with nothing to show is either "not reported yet" or
+        // "discovery failed", and only the second has something to say.
+        match app.discovery_failure() {
+            Some(why) => spans.push(Span::styled(
+                format!("  {why}"),
+                Style::default().fg(theme::WARN),
+            )),
+            None => spans.push(Span::styled("  waiting for the daemon", theme::dim())),
+        }
         return Line::from(spans);
     }
     let names: Vec<String> = app
@@ -191,10 +199,17 @@ pub fn render_quotas(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: Date
     let window_rows = rows.iter().filter(|r| r.window.is_some()).count();
     let two_line = rows.len() + window_rows <= inner.height as usize;
     let items: Vec<ListItem<'_>> = if rows.is_empty() {
-        vec![ListItem::new(Line::from(Span::styled(
-            "  no accounts discovered yet — waiting for the daemon",
-            theme::dim(),
-        )))]
+        let line = match app.discovery_failure() {
+            Some(why) => Line::from(Span::styled(
+                format!("  no accounts discovered — {why}"),
+                Style::default().fg(theme::WARN),
+            )),
+            None => Line::from(Span::styled(
+                "  no accounts discovered yet — waiting for the daemon",
+                theme::dim(),
+            )),
+        };
+        vec![ListItem::new(line)]
     } else {
         rows.iter()
             .map(|row| {

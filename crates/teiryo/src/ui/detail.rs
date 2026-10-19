@@ -661,8 +661,8 @@ fn render_health(
 }
 
 fn provider_line(provider: &ProviderHealth) -> Line<'static> {
-    let healthy = provider.consecutive_failures == 0;
-    Line::from(vec![
+    let healthy = provider.consecutive_failures == 0 && provider.discovery_error.is_none();
+    let mut spans = vec![
         Span::styled(
             if healthy { " ● " } else { " ▲ " },
             Style::default().fg(if healthy { theme::OK } else { theme::CRIT }),
@@ -683,7 +683,14 @@ fn provider_line(provider: &ProviderHealth) -> Line<'static> {
             ),
             theme::dim(),
         ),
-    ])
+    ];
+    if let Some(error) = &provider.discovery_error {
+        spans.push(Span::styled(
+            format!("  discovery failed: {error}"),
+            Style::default().fg(theme::CRIT),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn account_lines(provider: &ProviderHealth, now: DateTime<Utc>) -> Vec<Line<'static>> {
@@ -1009,6 +1016,7 @@ mod tests {
                 }],
                 consecutive_failures: 0,
                 last_error: None,
+                discovery_error: None,
             };
             let lines = account_lines(&health, now());
             // Gutter again: five cells of indent, the ok/fail flag, then the

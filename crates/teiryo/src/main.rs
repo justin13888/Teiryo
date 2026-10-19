@@ -239,7 +239,16 @@ async fn refresh_status(command: &mut Client, app: &mut App) {
     };
     match command.request(&request).await {
         Ok(Response::Status(statuses)) => app.set_statuses(statuses),
-        other => note_unexpected(app, other),
+        other => return note_unexpected(app, other),
+    }
+    // An empty dashboard needs a reason. `Status` cannot carry one — a
+    // provider whose discovery failed has no accounts to report on — so ask
+    // for the provider rollup, which can.
+    if app.statuses.is_empty() {
+        match command.request(&Request::Providers).await {
+            Ok(Response::Providers(health)) => app.health = health,
+            other => note_unexpected(app, other),
+        }
     }
 }
 

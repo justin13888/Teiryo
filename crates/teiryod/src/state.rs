@@ -73,6 +73,11 @@ pub struct SharedState {
     /// at all: the reset that anchors a weekly window is routinely older than
     /// any history a dashboard fetches.
     pub observed_starts: HashMap<(AccountId, WindowId), ObservedStart>,
+    /// Why account discovery failed, per provider. Discovery runs once at
+    /// startup, so an entry stands for the life of the process; it is what
+    /// lets `Providers` explain an empty dashboard instead of leaving the
+    /// failure in the log alone.
+    pub discovery_errors: HashMap<ProviderId, String>,
 }
 
 /// How far back [`Daemon::hydrate_account`] looks for the reset that anchors a
@@ -286,6 +291,7 @@ impl Daemon {
                 known_providers,
                 presenters: HashMap::new(),
                 observed_starts: HashMap::new(),
+                discovery_errors: HashMap::new(),
             })),
             watch_tx,
             config_tx,
@@ -608,6 +614,7 @@ impl Daemon {
                     accounts: Vec::new(),
                     consecutive_failures: 0,
                     last_error: None,
+                    discovery_error: None,
                 });
             let counters = st
                 .health
@@ -627,6 +634,18 @@ impl Daemon {
                 last_poll_ts: st.latest_poll.get(&account.id).map(|e| e.ts),
                 poll_interval_secs: interval_secs(st.poll_intervals.get(&account.id)),
             });
+        }
+        for (provider, error) in &st.discovery_errors {
+            by_provider
+                .entry(provider.as_str())
+                .or_insert_with(|| ProviderHealth {
+                    provider: provider.clone(),
+                    accounts: Vec::new(),
+                    consecutive_failures: 0,
+                    last_error: None,
+                    discovery_error: None,
+                })
+                .discovery_error = Some(error.clone());
         }
         let mut list: Vec<_> = by_provider.into_values().collect();
         list.sort_by(|a, b| a.provider.cmp(&b.provider));

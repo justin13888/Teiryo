@@ -624,6 +624,20 @@ impl App {
         }
     }
 
+    /// Why the daemon has no accounts to show, when it says so: every
+    /// provider whose account discovery failed, as `provider: error`.
+    pub fn discovery_failure(&self) -> Option<String> {
+        let failures: Vec<String> = self
+            .health
+            .iter()
+            .filter_map(|p| {
+                let error = p.discovery_error.as_ref()?;
+                Some(format!("{}: {error}", p.provider))
+            })
+            .collect();
+        (!failures.is_empty()).then(|| failures.join("; "))
+    }
+
     /// Replace statuses (sorted for stable display), keeping the selection
     /// pinned to the same account/window where it still exists.
     pub fn set_statuses(&mut self, mut statuses: Vec<AccountStatus>) {

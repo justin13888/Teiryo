@@ -276,4 +276,11 @@ pub struct ProviderHealth {
     pub consecutive_failures: u32,
     /// First error found across the provider's accounts, if any.
     pub last_error: Option<String>,
+    /// Why account discovery failed for this provider, if it did.
+    ///
+    /// A provider whose discovery failed has no accounts, so without this it
+    /// would be indistinguishable from one the daemon has not reported on yet
+    /// — which is how a missing login used to read as "waiting for the
+    /// daemon". Such a provider is listed with an empty `accounts`.
+    pub discovery_error: Option<String>,
 }

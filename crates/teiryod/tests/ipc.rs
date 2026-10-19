@@ -345,6 +345,7 @@ fn full_ipc_roundtrip() {
                 assert_eq!(health.len(), 1);
                 assert_eq!(health[0].provider, "stub");
                 assert_eq!(health[0].consecutive_failures, 0);
+                assert_eq!(health[0].discovery_error, None);
                 // Per-account rows, not just the provider-wide rollup.
                 assert_eq!(health[0].accounts.len(), 1);
                 let account = &health[0].accounts[0];
@@ -1109,6 +1110,119 @@ fn an_unusable_credential_is_reported_with_no_countdown_to_offer() {
 
         send_request(&mut sink, &Request::Shutdown).await;
         let _ = recv_response(&mut source).await;
+        let _ = server.await;
+        std::fs::remove_file(&socket).ok();
+        std::fs::remove_dir_all(config.parent().unwrap()).ok();
+    });
+}
+
+/// An adapter with no local login: discovery fails, as Claude's did on macOS
+/// before it read the Keychain.
+struct NoLoginAdapter;
+
+#[async_trait]
+impl Authenticator for NoLoginAdapter {
+    async fn discover_accounts(&self) -> Result<Vec<Account>, AuthError> {
+        Err(AuthError::NotLoggedIn(
+            "no login found; log in first".into(),
+        ))
+    }
+    async fn credential_for(&self, _account: &Account) -> Result<Credential, AuthError> {
+        unreachable!("an account that was never discovered is never polled")
+    }
+}
+
+#[async_trait]
+impl Prober for NoLoginAdapter {
+    async fn probe(
+        &self,
+        _account: &Account,
+        _cred: &Credential,
+    ) -> Result<RawResponse, ProbeError> {
+        unreachable!("an account that was never discovered is never probed")
+    }
+}
+
+impl QuotaParser for NoLoginAdapter {
+    fn parse(&self, _raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
+        unreachable!("nothing is ever probed")
+    }
+}
+
+impl WindowPresenter for NoLoginAdapter {
+    fn render_hint(&self, _window: &QuotaWindow) -> RenderHint {
+        RenderHint {
+            style: BarStyle::Percent,
+            warn_threshold: 0.8,
+            critical_threshold: 0.95,
+            note: None,
+        }
+    }
+}
+
+impl ProviderAdapter for NoLoginAdapter {
+    fn id(&self) -> String {
+        "nologin".into()
+    }
+}
+
+/// A provider whose discovery failed has no accounts, so `Status` cannot say
+/// anything about it; `Providers` still lists it, with the adapter's own
+/// reason, beside the providers that did come up.
+#[test]
+fn a_failed_discovery_is_reported_on_providers() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let socket = test_socket_path();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let adapters: Vec<Rc<dyn ProviderAdapter>> =
+            vec![Rc::new(NoLoginAdapter), Rc::new(StubAdapter)];
+        let config = test_config("poll_interval_secs = 3600\n");
+        let server =
+            tokio::task::spawn_local(teiryod::run(listener, storage, adapters, config.clone()));
+
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        client_handshake(&mut stream).await.expect("handshake");
+        let (mut sink, mut source) = framed(stream).split();
+
+        send_request(
+            &mut sink,
+            &Request::Status {
+                provider: None,
+                account: None,
+            },
+        )
+        .await;
+        match recv_response(&mut source).await {
+            Response::Status(statuses) => {
+                assert_eq!(statuses.len(), 1);
+                assert_eq!(statuses[0].account.provider, "stub");
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+
+        send_request(&mut sink, &Request::Providers).await;
+        match recv_response(&mut source).await {
+            Response::Providers(health) => {
+                assert_eq!(health.len(), 2, "{health:?}");
+                let failed = health.iter().find(|p| p.provider == "nologin").unwrap();
+                assert!(failed.accounts.is_empty());
+                let error = failed.discovery_error.as_deref().expect("a reason");
+                assert!(error.contains("log in first"), "{error}");
+                let ok = health.iter().find(|p| p.provider == "stub").unwrap();
+                assert_eq!(ok.discovery_error, None);
+                assert_eq!(ok.accounts.len(), 1);
+            }
+            other => panic!("expected Providers, got {other:?}"),
+        }
+
+        send_request(&mut sink, &Request::Shutdown).await;
+        assert!(matches!(recv_response(&mut source).await, Response::Ack));
         let _ = server.await;
         std::fs::remove_file(&socket).ok();
         std::fs::remove_dir_all(config.parent().unwrap()).ok();
