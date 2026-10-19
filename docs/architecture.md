@@ -6,7 +6,8 @@
 - **Startup**: `teiryo` spawns `teiryod` on first connect if the socket is unreachable (its own process group, stdout/stderr redirected to the log file, reaped in the background so it never lingers as a zombie) — tmux's client/server pattern. No manual double-fork.
 - **Single instance**: the UDS bind *is* the lock. `EADDRINUSE` → a daemon is already running → exit 0. No separate pidfile/lockfile.
 - **Stale socket**: on bind failure, try connecting as a client first; `ECONNREFUSED` means the socket is stale from a crash → unlink and rebind.
-- **Shutdown**: SIGTERM/SIGINT → flush DB, unlink socket. The TUI quitting never kills the daemon; daemon shutdown is only via the explicit `Shutdown` request or a signal.
+- **Shutdown**: SIGTERM/SIGINT → flush DB, unlink socket. The TUI quitting never kills the daemon; daemon shutdown is only via the explicit `Shutdown` request or a signal. A shutdown does not stick while another TUI is open: the TUI that sent `Shutdown` quits, but every other one sees its connection drop and respawns the daemon on its next reconnect attempt.
+- **Reconnect**: a TUI that loses the daemon reconnects in a background task, so it keeps drawing and handling keys meanwhile. Attempts back off from 1 s, doubling to a 30 s cap, and each may spawn the daemon once. The handshake is bounded at 2 s, so a daemon that accepts but never answers cannot hang the client. A daemon that rejects the client's protocol version ends reconnecting for that TUI: retrying would only respawn a daemon that exits against the stale one, so the header says to stop it instead.
 
 ## Crate layout
 
