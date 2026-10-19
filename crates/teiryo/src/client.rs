@@ -26,10 +26,17 @@ use crate::spawn::connect_or_spawn;
 pub const AWAIT_TIMEOUT_MS: u32 = 25_000;
 
 /// How long a daemon that accepted the connection has to answer the
-/// handshake. A healthy daemon answers in microseconds; one that bound its
-/// socket but never reached its accept loop would otherwise hang the TUI
-/// before the terminal is even set up.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+/// handshake. One that bound its socket but never reached its accept loop
+/// would otherwise hang the TUI before the terminal is even set up.
+///
+/// The connect succeeds as soon as the daemon has bound, but it answers only
+/// once it reaches its accept loop, after opening the database and running
+/// account discovery. Discovery may read the macOS Keychain through
+/// `/usr/bin/security` under a 5 s bound, which a pending access prompt runs
+/// out, so a freshly spawned daemon can legitimately take that long before
+/// answering. This bound sits well above that worst case: a slow
+/// first launch waits instead of failing.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// First wait before a reconnect attempt; it doubles on each failure.
 const RECONNECT_BASE: Duration = Duration::from_secs(1);
@@ -454,6 +461,58 @@ mod tests {
         )
         .await;
         assert_eq!(*asked.borrow(), [0, 1, 2, 3]);
+    }
+
+    /// A successful attempt hands its connection to the TUI and ends the loop:
+    /// one `Reconnected`, and no attempt after it.
+    #[tokio::test]
+    async fn success_reports_reconnected_and_stops() {
+        let path = temp_socket("reconnected");
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            teiryo_core::protocol::handshake::server_handshake(&mut stream)
+                .await
+                .unwrap();
+            stream
+        });
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let client = Client::handshake(stream, Duration::from_secs(2))
+            .await
+            .unwrap();
+        let _server_side = server.await.unwrap();
+
+        let mut ready = Some(client);
+        let calls = std::cell::Cell::new(0u32);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        reconnect_loop(
+            || {
+                calls.set(calls.get() + 1);
+                // First attempt fails; the second gets the real connection.
+                // A third would get a mismatch, which ends the loop, so a
+                // loop that kept going after success fails the count below
+                // instead of hanging.
+                let next = if calls.get() == 1 {
+                    Err(ClientError::Closed)
+                } else {
+                    ready
+                        .take()
+                        .ok_or(ClientError::Handshake(HandshakeError::Rejected(1)))
+                };
+                async move { next }
+            },
+            |_| Duration::ZERO,
+            tx,
+        )
+        .await;
+
+        assert_eq!(calls.get(), 2, "no attempt after the success");
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(events[0], NetEvent::ReconnectFailed(_)));
+        assert!(matches!(events[1], NetEvent::Reconnected(_)), "{events:?}");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A TUI that has gone away stops the loop instead of retrying forever.
