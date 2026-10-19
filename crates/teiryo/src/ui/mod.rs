@@ -737,6 +737,18 @@ mod tests {
         draw(&mut app, 80, 40);
     }
 
+    /// A mismatched daemon is final, so the header must stop saying
+    /// "reconnecting…" and say what to do instead.
+    #[test]
+    fn incompatible_daemon_replaces_the_reconnecting_notice() {
+        let mut app = populated();
+        app.disconnected = true;
+        app.incompatible = Some(crate::client::version_mismatch_message());
+        let screen = rendered(&mut app, 200, 40);
+        assert!(screen.contains("pkill teiryod"), "{screen}");
+        assert!(!screen.contains("reconnecting"), "{screen}");
+    }
+
     /// The visibility complaint this feature exists to fix: the overlay has to
     /// say what each value is *and* where it came from, or "60s" is ambiguous
     /// between a default and a deliberate choice.
