@@ -49,6 +49,10 @@ pub const ENV_BASE_URL: &str = "TEIRYO_CLAUDE_BASE_URL";
 /// probes the OAuth usage endpoint, and parses headroom percentages.
 pub struct ClaudeAdapter {
     credentials_path: PathBuf,
+    /// Read the macOS Keychain when `credentials_path` does not exist. Only
+    /// for the default path: a path someone named explicitly is the one they
+    /// meant, and silently reading a different store would hide a typo.
+    keychain_fallback: bool,
     base_url: String,
     /// One persistent HTTP client per account — separate accounts must not
     /// share a connection pool; reuse across probes keeps connection fidelity.
@@ -64,21 +68,40 @@ impl Default for ClaudeAdapter {
 impl ClaudeAdapter {
     /// Adapter with default paths, honoring the `TEIRYO_CLAUDE_*` env
     /// overrides.
+    ///
+    /// On macOS, with no `TEIRYO_CLAUDE_CREDENTIALS` override, credentials
+    /// come from `~/.claude/.credentials.json` when it exists and from the
+    /// login Keychain otherwise — where Claude Code keeps them by default.
     pub fn new() -> Self {
-        let credentials_path = std::env::var_os(ENV_CREDENTIALS_PATH)
-            .map(PathBuf::from)
-            .unwrap_or_else(credentials::default_path);
+        let overridden = std::env::var_os(ENV_CREDENTIALS_PATH).map(PathBuf::from);
+        let keychain_fallback = cfg!(target_os = "macos") && overridden.is_none();
+        let credentials_path = overridden.unwrap_or_else(credentials::default_path);
         let base_url = std::env::var(ENV_BASE_URL).unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
-        Self::with_config(credentials_path, base_url)
+        Self {
+            keychain_fallback,
+            ..Self::with_config(credentials_path, base_url)
+        }
     }
 
-    /// Adapter with explicit credentials path and API base URL.
+    /// Adapter with explicit credentials path and API base URL. Reads that
+    /// file only, never the Keychain.
     pub fn with_config(credentials_path: PathBuf, base_url: String) -> Self {
         Self {
             credentials_path,
+            keychain_fallback: false,
             base_url,
             clients: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Load the current credentials from wherever this adapter reads them.
+    /// Decided per call: a credentials file that appears later wins from then
+    /// on, as it does for Claude Code itself.
+    async fn load_credentials(&self) -> Result<credentials::ClaudeCredentials, AuthError> {
+        if self.keychain_fallback && !self.credentials_path.exists() {
+            return credentials::load_keychain().await;
+        }
+        credentials::load(&self.credentials_path)
     }
 
     /// The persistent client for `account`, built on first use.
@@ -100,7 +123,7 @@ impl ClaudeAdapter {
 #[async_trait]
 impl teiryo_core::Authenticator for ClaudeAdapter {
     async fn discover_accounts(&self) -> Result<Vec<Account>, AuthError> {
-        credentials::load(&self.credentials_path)?;
+        self.load_credentials().await?;
         Ok(vec![Account {
             id: AccountId::from("claude:default"),
             provider: PROVIDER_ID.to_owned(),
@@ -109,7 +132,7 @@ impl teiryo_core::Authenticator for ClaudeAdapter {
     }
 
     async fn credential_for(&self, _account: &Account) -> Result<Credential, AuthError> {
-        let creds = credentials::load(&self.credentials_path)?;
+        let creds = self.load_credentials().await?;
         if creds.is_expired() {
             return Err(AuthError::Expired(
                 "Claude Code access token is past its expiry; run `claude` to refresh".into(),

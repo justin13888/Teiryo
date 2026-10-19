@@ -20,6 +20,6 @@
 
 Require direct inspection of the installed CLI/client, not an architecture call:
 
-- Claude Code's actual credential storage path/format (Keychain vs. `~/.claude/...`), and whether it supports multiple concurrent local logins or needs separate config dirs per account.
+- Whether Claude Code supports multiple concurrent local logins or needs separate config dirs per account. (Its storage is settled: `~/.claude/.credentials.json`, or on macOS the same JSON in the Keychain item `Claude Code-credentials` — see [providers.md](providers.md).)
 - The exact low-cost endpoint each provider's real client hits for usage/rate-limit data, and its header/UA fingerprint.
 - ChatGPT's credential model (session cookie vs. token) and whether it is locally readable at all or needs an interactive `teiryo auth chatgpt` login flow.
