@@ -22,8 +22,19 @@ use teiryo_core::{ErrorKind, Request, Response};
 use app::{Action, App, DetailQuery, Trend};
 use client::{is_version_mismatch, newest_poll_id, spawn_update_loop, Client, NetEvent};
 
+/// The one-line description `--help` prints under the version.
+const ABOUT: &str = "Live dashboard for LLM subscription quotas. \
+                     Starts teiryod on demand when it is not running.";
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Before anything touches the socket or the terminal: `-V` must not spawn
+    // a daemon or open the dashboard.
+    if let Some(code) =
+        teiryo_core::version::handle_args("teiryo", ABOUT, &teiryo_core::build_info!())
+    {
+        std::process::exit(code);
+    }
     match run().await {
         Ok(()) => {}
         Err(err) => {

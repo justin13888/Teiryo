@@ -10,7 +10,17 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
+/// The one-line description `--help` prints under the version.
+const ABOUT: &str = "Teiryo daemon: polls LLM subscription quotas and serves them \
+                     over a Unix socket. Normally started by teiryo; runs in the foreground.";
+
 fn main() -> anyhow::Result<()> {
+    // Before path resolution and the bind: `-V` must not start a daemon.
+    if let Some(code) =
+        teiryo_core::version::handle_args("teiryod", ABOUT, &teiryo_core::build_info!())
+    {
+        std::process::exit(code);
+    }
     let paths = Paths::resolve().context("resolving XDG paths")?;
     init_logging(&paths)?;
 

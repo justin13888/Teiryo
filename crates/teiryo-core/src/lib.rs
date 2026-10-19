@@ -10,6 +10,7 @@ pub mod error;
 pub mod protocol;
 pub mod rollover;
 pub mod storage;
+pub mod version;
 
 pub use adapter::{
     Authenticator, BarStyle, Credential, Prober, ProviderAdapter, QuotaParser, RawResponse,
