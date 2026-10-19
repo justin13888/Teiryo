@@ -68,6 +68,14 @@ fn identity_line(app: &App) -> Line<'static> {
 
 /// Connection dot, staleness, and the next scheduled poll.
 fn connection_line(app: &App, now: DateTime<Utc>) -> Line<'static> {
+    // Ahead of the disconnected case: nothing is reconnecting any more, and
+    // "reconnecting…" would promise a recovery that cannot come.
+    if let Some(message) = &app.incompatible {
+        return Line::from(Span::styled(
+            format!("✗ {message}"),
+            Style::default().fg(theme::CRIT),
+        ));
+    }
     if app.disconnected {
         return Line::from(Span::styled(
             "◌ daemon unreachable — reconnecting…",

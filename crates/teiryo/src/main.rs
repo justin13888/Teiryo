@@ -20,7 +20,9 @@ use teiryo_core::protocol::handshake::PROTOCOL_VERSION;
 use teiryo_core::{ErrorKind, Request, Response};
 
 use app::{Action, App, DetailQuery, Trend};
-use client::{is_version_mismatch, newest_poll_id, spawn_update_loop, Client, NetEvent};
+use client::{
+    is_version_mismatch, newest_poll_id, spawn_reconnect, spawn_update_loop, Client, NetEvent,
+};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -106,9 +108,10 @@ async fn event_loop(
     let mut term_events = EventStream::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut update_task: Option<JoinHandle<()>> = None;
+    let mut reconnect_task: Option<JoinHandle<()>> = None;
 
-    // Whatever happens below, the reconnect-created long-poll task must not
-    // outlive this function.
+    // Whatever happens below, neither the reconnect task nor the long-poll
+    // task it re-created may outlive this function.
     let result = drive(
         &mut terminal,
         app,
@@ -118,9 +121,13 @@ async fn event_loop(
         &mut term_events,
         &mut tick,
         &mut update_task,
+        &mut reconnect_task,
     )
     .await;
-    if let Some(task) = update_task.take() {
+    for task in [update_task.take(), reconnect_task.take()]
+        .into_iter()
+        .flatten()
+    {
         task.abort();
     }
     result
@@ -136,6 +143,7 @@ async fn drive(
     term_events: &mut EventStream,
     tick: &mut tokio::time::Interval,
     update_task: &mut Option<JoinHandle<()>>,
+    reconnect_task: &mut Option<JoinHandle<()>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         terminal.draw(|frame| ui::render(frame, app))?;
@@ -174,6 +182,9 @@ async fn drive(
                     }
                     Action::ShutdownDaemon => {
                         let _ = command.request(&Request::Shutdown).await;
+                        // Quitting is what keeps this TUI from respawning the
+                        // daemon it just stopped: the reconnect task dies with
+                        // the loop. Any *other* open TUI still respawns it.
                         return Ok(());
                     }
                 }
@@ -201,28 +212,40 @@ async fn drive(
                     app.disconnected = true;
                     app.error = Some(message);
                 }
+                NetEvent::ReconnectFailed(message) => app.error = Some(message),
+                NetEvent::Incompatible(message) => {
+                    app.disconnected = true;
+                    app.incompatible = Some(message);
+                }
+                NetEvent::Reconnected(client) => {
+                    // Replaces both connections: this one for requests, and a
+                    // fresh long-poll below.
+                    *command = *client;
+                    app.disconnected = false;
+                    app.error = None;
+                    refresh_status(command, app).await;
+                    refresh_recent(command, app).await;
+                    reload_detail(command, app).await;
+                    // The daemon may have restarted onto a different config;
+                    // a stale generation would also make the new long-poll
+                    // miss the next reload.
+                    load_config(command, app).await;
+                    if let Some(task) = update_task.take() {
+                        task.abort();
+                    }
+                    *update_task = start_update_loop(app, net_tx.clone()).await;
+                }
             },
             _ = tick.tick() => {
                 app.spinner = app.spinner.wrapping_add(1);
-                if app.disconnected {
-                    // Reconnect both connections; Client::connect respawns the
-                    // daemon if its socket is gone.
-                    if let Ok(client) = Client::connect().await {
-                        *command = client;
-                        app.disconnected = false;
-                        app.error = None;
-                        refresh_status(command, app).await;
-                        refresh_recent(command, app).await;
-                        reload_detail(command, app).await;
-                        // The daemon may have restarted onto a different
-                        // config; a stale generation would also make the new
-                        // long-poll miss the next reload.
-                        load_config(command, app).await;
-                        if let Some(task) = update_task.take() {
-                            task.abort();
-                        }
-                        *update_task = start_update_loop(app, net_tx.clone()).await;
-                    }
+                // Reconnecting runs in the background so the loop keeps
+                // drawing and answering keys while the daemon is down; the
+                // tick only notices that one is needed. A mismatched daemon
+                // is final: reconnecting would only respawn a daemon that
+                // exits at once against the stale one.
+                let idle = reconnect_task.as_ref().is_none_or(JoinHandle::is_finished);
+                if app.disconnected && app.incompatible.is_none() && idle {
+                    *reconnect_task = Some(spawn_reconnect(net_tx.clone()));
                 }
                 // Otherwise the tick just redraws countdowns and the spinner.
             }

@@ -572,6 +572,10 @@ pub struct App {
     pub error: Option<String>,
     /// True when the daemon connection is lost and reconnection is pending.
     pub disconnected: bool,
+    /// Set once a reconnect finds a daemon speaking another protocol version.
+    /// Final for this TUI: reconnecting stops, and the message stays up
+    /// because only the user can replace that daemon.
+    pub incompatible: Option<String>,
     /// Time of the most recent update, for the header.
     pub last_update: Option<DateTime<Utc>>,
 }
@@ -620,6 +624,7 @@ impl App {
             spinner: 0,
             error: None,
             disconnected: false,
+            incompatible: None,
             last_update: None,
         }
     }

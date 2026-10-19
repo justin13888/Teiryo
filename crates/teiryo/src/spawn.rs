@@ -94,7 +94,7 @@ fn spawn_error(binary: &Path, e: &io::Error) -> ClientError {
 /// Wait on `child` in the background. Nothing here waits on the daemon inline —
 /// it deliberately outlives the TUI — but a `Child` dropped unwaited leaves the
 /// daemon `<defunct>` in our process table for as long as we run, and the
-/// reconnect loop spawns one per second per connection while the socket is
+/// reconnect loop may spawn one per backoff step for as long as the socket is
 /// down. The thread parks in `wait` and dies with the process, which reparents
 /// a daemon that is still running to init.
 fn reap_in_background(mut child: Child) {
