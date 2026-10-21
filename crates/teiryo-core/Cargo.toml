@@ -11,6 +11,7 @@ async-trait.workspace = true
 bincode.workspace = true
 bytes.workspace = true
 chrono.workspace = true
+libc = "0.2"
 rusqlite.workspace = true
 secrecy.workspace = true
 serde.workspace = true

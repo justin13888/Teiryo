@@ -1,10 +1,13 @@
 //! XDG path resolution and Unix-socket binding with single-instance handling.
 
+use std::fs::File;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
-use directories::{BaseDirs, ProjectDirs};
+use directories::ProjectDirs;
+use teiryo_core::paths::{lock_path, socket_path};
 
 /// Resolved filesystem locations for one daemon run.
 #[derive(Debug, Clone)]
@@ -20,9 +23,10 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// Resolve per §13: `$XDG_RUNTIME_DIR/teiryo.sock` (fallback
-    /// `/tmp/teiryo-$UID.sock`), `$XDG_DATA_HOME/teiryo/{teiryo.db,teiryo.log}`,
-    /// `$XDG_CONFIG_HOME/teiryo/config.toml`. Creates the data/config dirs.
+    /// Resolve the socket through [`teiryo_core::paths::socket_path`], which
+    /// the TUI shares, and `teiryo/{teiryo.db,teiryo.log}` and
+    /// `teiryo/config.toml` under the platform's data and config dirs.
+    /// Creates the data/config dirs.
     pub fn resolve() -> io::Result<Self> {
         let dirs = ProjectDirs::from("", "", "teiryo")
             .ok_or_else(|| io::Error::other("cannot resolve home directory"))?;
@@ -39,34 +43,79 @@ impl Paths {
     }
 }
 
-/// Socket path: `$XDG_RUNTIME_DIR/teiryo.sock`, else `/tmp/teiryo-$UID.sock`.
-pub fn socket_path() -> PathBuf {
-    if let Some(base) = BaseDirs::new() {
-        if let Some(runtime) = base.runtime_dir() {
-            return runtime.join("teiryo.sock");
-        }
-    }
-    let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/teiryo-{uid}.sock"))
-}
-
 /// Outcome of trying to become the single daemon instance.
 pub enum BindOutcome {
-    /// We own the socket and may serve. Already non-blocking, so the caller
-    /// hands it to `tokio::net::UnixListener::from_std` — from *inside* the
-    /// runtime, since that call panics without a reactor.
-    Bound(std::os::unix::net::UnixListener),
-    /// A live daemon already owns the socket; exit 0.
+    /// We own the socket and may serve. The listener is already non-blocking,
+    /// so the caller hands it to `tokio::net::UnixListener::from_std` — from
+    /// *inside* the runtime, since that call panics without a reactor. The
+    /// guard holds the instance lock and unlinks the socket when dropped, so
+    /// it must live as long as the daemon does.
+    Bound(std::os::unix::net::UnixListener, SocketGuard),
+    /// Another daemon holds the instance lock or answers on the socket; exit 0.
     AlreadyRunning,
 }
 
-/// Bind the daemon socket. The bind *is* the single-instance lock: on
-/// `EADDRINUSE` we try connecting — success means another daemon is live;
-/// `ECONNREFUSED` means the socket is stale from a crash, so unlink and
-/// rebind. The socket file is chmod'd to 0600.
+/// Ownership of the daemon socket for the life of the process.
 ///
-/// Deliberately reactor-free: the daemon binds before it builds its runtime.
-pub fn bind_socket(path: &std::path::Path) -> io::Result<BindOutcome> {
+/// Holds the exclusive `flock` on the lock file beside the socket, and on drop
+/// unlinks the socket only while it is still the inode this process bound:
+/// an orphan that outlived its socket must not delete the live daemon's.
+/// Dropping the guard releases the lock after the unlink, never before.
+pub struct SocketGuard {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    _lock: File,
+}
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        if let Ok(meta) = std::fs::symlink_metadata(&self.path) {
+            if meta.dev() == self.dev && meta.ino() == self.ino {
+                std::fs::remove_file(&self.path).ok();
+            }
+        }
+    }
+}
+
+/// Take the instance lock beside `socket`, without blocking. `None` means
+/// another process holds it. The file is opened `O_NOFOLLOW`, so a symlink
+/// planted at the lock's name cannot redirect the create elsewhere.
+fn acquire_lock(socket: &Path) -> io::Result<Option<File>> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(lock_path(socket))?;
+    // SAFETY: the descriptor is open for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() == io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(err)
+    }
+}
+
+/// Bind the daemon socket as the single instance.
+///
+/// The exclusive `flock` on `teiryo.lock` comes first and is held for the
+/// process lifetime: losing it means another daemon is starting or running,
+/// so this one is `AlreadyRunning`. Only the lock holder ever unlinks a stale
+/// socket, which is what stops two daemons started together from each
+/// unlinking the other's fresh one. A socket that still answers despite the
+/// lock is a daemon from a build without it, and is left alone. The socket
+/// file is chmod'd to 0600.
+///
+/// Deliberately reactor-free: nothing here needs the runtime.
+pub fn bind_socket(path: &Path) -> io::Result<BindOutcome> {
+    let Some(lock) = acquire_lock(path)? else {
+        return Ok(BindOutcome::AlreadyRunning);
+    };
     let listener = match std::os::unix::net::UnixListener::bind(path) {
         Ok(l) => l,
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
@@ -81,9 +130,18 @@ pub fn bind_socket(path: &std::path::Path) -> io::Result<BindOutcome> {
         }
         Err(e) => return Err(e),
     };
+    let meta = std::fs::symlink_metadata(path)?;
+    // Created before the remaining fallible steps, so a failure there still
+    // unlinks the socket this call bound.
+    let guard = SocketGuard {
+        path: path.to_path_buf(),
+        dev: meta.dev(),
+        ino: meta.ino(),
+        _lock: lock,
+    };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    Ok(BindOutcome::Bound(listener))
+    Ok(BindOutcome::Bound(listener, guard))
 }
 
 #[cfg(test)]
@@ -98,43 +156,122 @@ mod tests {
         std::env::temp_dir().join(format!("teiryod-paths-{}-{n}.sock", std::process::id()))
     }
 
-    /// Deliberately a plain `#[test]`: `bind_socket` runs before the daemon
-    /// builds its runtime, so anything reactor-dependent in it panics on every
-    /// start, before `tracing` can record why.
+    /// Remove what a test left behind: the socket, if any, and the lock file,
+    /// which nothing in the daemon ever removes.
+    fn cleanup(path: &Path) {
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(lock_path(path)).ok();
+    }
+
+    /// Deliberately a plain `#[test]`: nothing in `bind_socket` may need the
+    /// runtime, or it would panic on every start, before `tracing` can record
+    /// why.
     #[test]
     fn binds_without_a_runtime() {
         let path = temp_socket();
-        let Ok(BindOutcome::Bound(_listener)) = bind_socket(&path) else {
+        let Ok(BindOutcome::Bound(_listener, _guard)) = bind_socket(&path) else {
             panic!("a fresh path should bind");
         };
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "socket must be owner-only");
-        std::fs::remove_file(&path).ok();
+        let lock_mode = std::fs::metadata(lock_path(&path))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(lock_mode & 0o777, 0o600, "lock must be owner-only");
+        cleanup(&path);
     }
 
     #[test]
-    fn live_socket_reports_already_running() {
+    fn second_binder_reports_already_running() {
         let path = temp_socket();
-        let Ok(BindOutcome::Bound(_held)) = bind_socket(&path) else {
+        let Ok(BindOutcome::Bound(_listener, _guard)) = bind_socket(&path) else {
             panic!("first bind should own the socket");
         };
         assert!(matches!(
             bind_socket(&path),
             Ok(BindOutcome::AlreadyRunning)
         ));
-        std::fs::remove_file(&path).ok();
+        assert!(
+            path.exists(),
+            "the loser must not touch the winner's socket"
+        );
+        cleanup(&path);
+    }
+
+    /// The race the lock closes: a daemon that holds the lock but has not yet
+    /// bound. The connect probe alone would find no socket and bind a second
+    /// daemon; the lock turns the loser away before it looks.
+    #[test]
+    fn held_lock_wins_before_any_socket_exists() {
+        let path = temp_socket();
+        let Some(_lock) = acquire_lock(&path).unwrap() else {
+            panic!("a fresh lock should be free");
+        };
+        assert!(matches!(
+            bind_socket(&path),
+            Ok(BindOutcome::AlreadyRunning)
+        ));
+        assert!(!path.exists(), "the loser must not bind");
+        cleanup(&path);
+    }
+
+    /// A daemon from a build that predates the lock answers on the socket
+    /// without holding it, and is left serving.
+    #[test]
+    fn live_socket_without_the_lock_reports_already_running() {
+        let path = temp_socket();
+        let _old = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(matches!(
+            bind_socket(&path),
+            Ok(BindOutcome::AlreadyRunning)
+        ));
+        assert!(path.exists());
+        cleanup(&path);
     }
 
     #[test]
     fn stale_socket_is_unlinked_and_rebound() {
         let path = temp_socket();
-        let Ok(BindOutcome::Bound(listener)) = bind_socket(&path) else {
+        // A `kill -9`'d daemon leaves the file on disk with nothing listening,
+        // and the kernel releases its lock.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(path.exists(), "dropping a listener keeps the socket file");
+        assert!(matches!(bind_socket(&path), Ok(BindOutcome::Bound(..))));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn dropping_the_guard_unlinks_and_releases() {
+        let path = temp_socket();
+        let Ok(BindOutcome::Bound(listener, guard)) = bind_socket(&path) else {
             panic!("first bind should own the socket");
         };
-        // A crashed daemon leaves the file on disk with nothing listening.
         drop(listener);
-        assert!(path.exists(), "dropping a listener keeps the socket file");
-        assert!(matches!(bind_socket(&path), Ok(BindOutcome::Bound(_))));
-        std::fs::remove_file(&path).ok();
+        drop(guard);
+        assert!(!path.exists(), "the owner removes its own socket");
+        assert!(
+            matches!(bind_socket(&path), Ok(BindOutcome::Bound(..))),
+            "the lock is released with the guard"
+        );
+        cleanup(&path);
+    }
+
+    /// The falsifier for the test above: a socket replaced since the bind is
+    /// someone else's, and survives the guard.
+    #[test]
+    fn guard_leaves_a_replaced_socket_in_place() {
+        let path = temp_socket();
+        let Ok(BindOutcome::Bound(_listener, guard)) = bind_socket(&path) else {
+            panic!("first bind should own the socket");
+        };
+        // Bound elsewhere and renamed over the original, so both inodes exist
+        // at once and the replacement cannot reuse the original's number.
+        let staged = temp_socket();
+        let _other = std::os::unix::net::UnixListener::bind(&staged).unwrap();
+        std::fs::rename(&staged, &path).unwrap();
+        drop(guard);
+        assert!(path.exists(), "a replaced socket must not be unlinked");
+        cleanup(&path);
     }
 }

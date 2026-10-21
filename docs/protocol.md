@@ -2,7 +2,7 @@
 
 ## Transport & framing
 
-- `tokio::net::UnixListener` / `UnixStream` on the socket path given in [architecture.md](architecture.md); socket file mode 0600 in `$XDG_RUNTIME_DIR` (itself 0700). Cross-user access is therefore not a threat model; the handshake below guards against *stale/mismatched builds*, not attackers.
+- `tokio::net::UnixListener` / `UnixStream` on the socket path given in [architecture.md](architecture.md); socket file mode 0600 in a per-user directory that is itself 0700 (`$XDG_RUNTIME_DIR` on Linux, the per-user temp dir on macOS). Cross-user access is therefore not a threat model, except on the `/tmp/teiryo-$UID.sock` fallback used when no such directory exists: `/tmp` is world-writable, so another local user who claims that name (or its `.lock`) first can keep the daemon from starting, or answer the TUI in its place. The 0600 mode still keeps them from talking to a daemon that did bind; the handshake below guards against *stale/mismatched builds*, not attackers.
 - Framing: `tokio_util::codec::LengthDelimitedCodec`, u32 **little-endian** length prefix, `max_frame_length` = 1 MiB. Oversized/garbage frames from a misbehaving peer are rejected instead of buffered unbounded. Daemon and TUI must construct the codec identically (shared constructor in `teiryo-core`).
 
 ## Serialization

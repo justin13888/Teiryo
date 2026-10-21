@@ -1,8 +1,9 @@
-//! Socket path resolution and spawn-on-demand of `teiryod`.
+//! Spawn-on-demand of `teiryod`.
 //!
 //! The TUI never manages the daemon's lifecycle beyond this: if the socket is
 //! unreachable it spawns `teiryod` detached (tmux's client/server pattern) and
-//! retries the connection.
+//! retries the connection. The socket path comes from
+//! [`teiryo_core::paths::socket_path`], the rule the daemon binds by.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use directories::ProjectDirs;
+use teiryo_core::paths::socket_path;
 use tokio::net::UnixStream;
 
 use crate::client::ClientError;
@@ -18,20 +20,6 @@ use crate::client::ClientError;
 const CONNECT_ATTEMPTS: u32 = 25;
 /// Delay between connection attempts.
 const CONNECT_BACKOFF: Duration = Duration::from_millis(200);
-
-/// The daemon socket path: `$XDG_RUNTIME_DIR/teiryo.sock`, falling back to
-/// `/tmp/teiryo-$UID.sock`. Must match the daemon's resolution exactly.
-pub fn socket_path() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("teiryo.sock"),
-        _ => PathBuf::from(format!("/tmp/teiryo-{}.sock", uid())),
-    }
-}
-
-fn uid() -> u32 {
-    // SAFETY: getuid is always safe to call.
-    unsafe { libc::getuid() }
-}
 
 /// Where `teiryod` sits next to the current executable — the common
 /// cargo/packaging layout.
@@ -103,17 +91,38 @@ fn reap_in_background(mut child: Child) {
     });
 }
 
-/// Spawn `teiryod` detached in its own session-like process group, stdio
-/// routed away from the TUI's terminal.
+/// Spawn `teiryod` detached: in a session of its own, so it has no
+/// controlling terminal and the TUI's terminal closing cannot signal it; with
+/// `/` as its working directory, so it never pins the directory the TUI was
+/// launched from (and with it a volume that could otherwise be ejected); and
+/// with stdio routed away from the TUI's terminal.
 fn spawn_daemon(binary: &Path) -> io::Result<()> {
+    let mut cmd = detached(binary);
+    cmd.stdin(Stdio::null())
+        .stdout(daemon_output())
+        .stderr(daemon_output());
+    cmd.spawn().map(reap_in_background)
+}
+
+/// `binary` as a command that starts in a new session with `/` as its
+/// working directory. Stdio is the caller's to set.
+fn detached(binary: &Path) -> Command {
     use std::os::unix::process::CommandExt;
 
     let mut cmd = Command::new(binary);
-    cmd.stdin(Stdio::null())
-        .stdout(daemon_output())
-        .stderr(daemon_output())
-        .process_group(0);
-    cmd.spawn().map(reap_in_background)
+    cmd.current_dir("/");
+    // SAFETY: runs in the forked child before exec, where only
+    // async-signal-safe calls are allowed; setsid is one, and nothing here
+    // allocates.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd
 }
 
 /// Connect to the daemon socket, spawning the daemon if it is not running.
@@ -158,33 +167,35 @@ pub async fn connect_or_spawn() -> Result<UnixStream, ClientError> {
 mod tests {
     use super::*;
 
-    // Env mutation is process-global; keep it inside one test to avoid races.
+    /// The spawned daemon leads a session of its own and runs from `/`, so it
+    /// neither shares the TUI's terminal session nor pins its directory.
     #[test]
-    fn socket_path_resolution() {
-        let orig = std::env::var_os("XDG_RUNTIME_DIR");
+    fn detached_child_has_its_own_session_and_root_cwd() {
+        use std::io::BufRead;
 
-        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
-        assert_eq!(
-            socket_path(),
-            PathBuf::from("/run/user/1000/teiryo.sock"),
-            "XDG_RUNTIME_DIR takes precedence"
-        );
+        let mut child = detached(Path::new("/bin/sh"))
+            .arg("-c")
+            .arg("pwd; exec sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("/bin/sh should be spawnable");
+        let mut cwd = String::new();
+        io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut cwd)
+            .unwrap();
+        let pid = i32::try_from(child.id()).expect("a pid fits in pid_t");
+        // SAFETY: getsid only reads the process table.
+        let sid = unsafe { libc::getsid(pid) };
+        // SAFETY: getsid(0) is the caller's own session.
+        let ours = unsafe { libc::getsid(0) };
+        child.kill().ok();
+        child.wait().ok();
 
-        std::env::remove_var("XDG_RUNTIME_DIR");
-        let fallback = socket_path();
-        assert_eq!(
-            fallback,
-            PathBuf::from(format!("/tmp/teiryo-{}.sock", uid())),
-            "falls back to /tmp with the real uid"
-        );
-
-        std::env::set_var("XDG_RUNTIME_DIR", "");
-        assert_eq!(socket_path(), fallback, "empty XDG_RUNTIME_DIR is ignored");
-
-        match orig {
-            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
-            None => std::env::remove_var("XDG_RUNTIME_DIR"),
-        }
+        assert_eq!(cwd.trim_end(), "/");
+        assert_eq!(sid, pid, "the child leads a new session");
+        assert_ne!(sid, ours);
     }
 
     /// A zombie keeps its pid valid for the life of its parent, so polling the
