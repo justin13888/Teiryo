@@ -2,7 +2,8 @@
 //!
 //! First 6 bytes on every connection, raw — not bincode, so the handshake
 //! itself can never go stale across versions. The daemon replies with a
-//! single fixed byte and closes the connection on mismatch.
+//! single fixed byte; on mismatch it follows it with its own version (u16
+//! little-endian, since v8) and closes the connection.
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -11,10 +12,11 @@ use crate::error::HandshakeError;
 /// Magic bytes opening every connection.
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"TEIR";
 /// Current wire protocol version (little-endian u16 on the wire).
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 /// Daemon reply: handshake accepted, bincode frames may follow.
 pub const HELLO_ACCEPTED: u8 = 0x00;
-/// Daemon reply: protocol version mismatch, connection will be closed.
+/// Daemon reply: protocol version mismatch. Since v8 the daemon's own
+/// version follows as a little-endian u16, then the connection is closed.
 pub const HELLO_REJECTED_VERSION: u8 = 0x01;
 
 /// The 6-byte hello: magic followed by the protocol version.
@@ -63,16 +65,32 @@ where
     stream.read_exact(&mut reply).await?;
     match reply[0] {
         HELLO_ACCEPTED => Ok(()),
-        HELLO_REJECTED_VERSION => Err(HandshakeError::Rejected(HELLO_REJECTED_VERSION)),
+        HELLO_REJECTED_VERSION => Err(HandshakeError::Rejected {
+            daemon: read_daemon_version(stream).await,
+        }),
         other => Err(HandshakeError::UnexpectedReply(other)),
     }
+}
+
+/// The version a rejecting daemon sends after the reject byte, or `None` where
+/// it closed without one. A daemon older than v8 sends only the byte, and the
+/// reject is already known, so a failed read means "unknown" rather than an
+/// error.
+async fn read_daemon_version<S>(stream: &mut S) -> Option<u16>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut version = [0u8; 2];
+    stream.read_exact(&mut version).await.ok()?;
+    Some(u16::from_le_bytes(version))
 }
 
 /// Server side: read the peer's hello, accept or reject it.
 ///
 /// On success the accept byte has been written and bincode frames may follow.
-/// On failure the reject byte has been written (where applicable) and the
-/// caller must close the connection without decoding anything further.
+/// On failure the reject byte and our version have been written (where
+/// applicable) and the caller must close the connection without decoding
+/// anything further.
 pub async fn server_handshake<S>(stream: &mut S) -> Result<(), HandshakeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -84,7 +102,8 @@ where
         return Err(HandshakeError::BadMagic(hello.magic));
     }
     if hello.protocol_version != PROTOCOL_VERSION {
-        stream.write_all(&[HELLO_REJECTED_VERSION]).await?;
+        let [lo, hi] = PROTOCOL_VERSION.to_le_bytes();
+        stream.write_all(&[HELLO_REJECTED_VERSION, lo, hi]).await?;
         stream.flush().await?;
         return Err(HandshakeError::VersionMismatch {
             ours: PROTOCOL_VERSION,
@@ -128,9 +147,10 @@ mod tests {
             protocol_version: 999,
         };
         client.write_all(&stale.to_bytes()).await.unwrap();
-        let mut reply = [0u8; 1];
+        let mut reply = [0u8; 3];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply[0], HELLO_REJECTED_VERSION);
+        assert_eq!(u16::from_le_bytes([reply[1], reply[2]]), PROTOCOL_VERSION);
 
         match server_task.await.unwrap() {
             Err(HandshakeError::VersionMismatch { ours, theirs }) => {
@@ -156,7 +176,7 @@ mod tests {
     /// a revert nobody meant.
     #[test]
     fn the_hello_bytes_are_recorded_not_recomputed() {
-        assert_eq!(Hello::current().to_bytes(), [b'T', b'E', b'I', b'R', 7, 0]);
+        assert_eq!(Hello::current().to_bytes(), [b'T', b'E', b'I', b'R', 8, 0]);
     }
 
     #[tokio::test]
@@ -168,5 +188,71 @@ mod tests {
             Err(HandshakeError::BadMagic(m)) => assert_eq!(&m, b"NOPE"),
             other => panic!("expected bad magic, got {other:?}"),
         }
+    }
+
+    /// A daemon that rejects us with `reply` and then closes; what the client
+    /// makes of it.
+    async fn client_against_rejecting_daemon(reply: &'static [u8]) -> HandshakeError {
+        let (mut client, mut daemon) = tokio::io::duplex(64);
+        let daemon_task = tokio::spawn(async move {
+            let mut hello = [0u8; 6];
+            daemon.read_exact(&mut hello).await.unwrap();
+            daemon.write_all(reply).await.unwrap();
+            // Dropping `daemon` closes the connection, as a real reject does.
+        });
+        let err = client_handshake(&mut client)
+            .await
+            .expect_err("the daemon rejected us");
+        daemon_task.await.unwrap();
+        err
+    }
+
+    /// The acceptance case: a daemon one version ahead, and one behind, is
+    /// reported with both versions named.
+    #[tokio::test]
+    async fn a_reject_names_the_daemon_version_and_ours() {
+        const AHEAD: [u8; 3] = {
+            let [lo, hi] = (PROTOCOL_VERSION + 1).to_le_bytes();
+            [HELLO_REJECTED_VERSION, lo, hi]
+        };
+        const BEHIND: [u8; 3] = {
+            let [lo, hi] = (PROTOCOL_VERSION - 1).to_le_bytes();
+            [HELLO_REJECTED_VERSION, lo, hi]
+        };
+        for (reply, daemon) in [
+            (&AHEAD, PROTOCOL_VERSION + 1),
+            (&BEHIND, PROTOCOL_VERSION - 1),
+        ] {
+            let err = client_against_rejecting_daemon(reply).await;
+            assert!(
+                matches!(err, HandshakeError::Rejected { daemon: Some(v) } if v == daemon),
+                "{err:?}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!(
+                    "daemon is v{daemon}, client is v{PROTOCOL_VERSION}"
+                )),
+                "{message}"
+            );
+        }
+    }
+
+    /// A daemon from before v8 sends the reject byte alone. The client still
+    /// reports a mismatch, says the daemon's version is unknown, and names
+    /// its own.
+    #[tokio::test]
+    async fn a_pre_v8_reject_without_a_version_is_still_a_reject() {
+        let err = client_against_rejecting_daemon(&[HELLO_REJECTED_VERSION]).await;
+        assert!(
+            matches!(err, HandshakeError::Rejected { daemon: None }),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("older than v8"), "{message}");
+        assert!(
+            message.contains(&format!("client is v{PROTOCOL_VERSION}")),
+            "{message}"
+        );
     }
 }

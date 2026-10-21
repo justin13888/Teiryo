@@ -12,7 +12,7 @@ use teiryo_core::{
     Authenticator, BarStyle, ConfigEdit, ConfigState, Credential, ErrorKind, ParseError, PollId,
     PollOutcome, PollTrigger, ProbeError, Prober, ProviderAdapter, QuotaParser, QuotaUnit,
     QuotaWindow, RawResponse, RenderHint, Request, ResetKind, Response, Storage, WindowId,
-    WindowPresenter, WindowScope, PROTOCOL_MAGIC,
+    WindowPresenter, WindowScope, PROTOCOL_MAGIC, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -539,7 +539,7 @@ fn settings_round_trip_and_hot_reload() {
 }
 
 #[test]
-fn version_mismatch_is_rejected_with_0x01() {
+fn version_mismatch_is_rejected_with_0x01_and_the_daemon_version() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -559,9 +559,11 @@ fn version_mismatch_is_rejected_with_0x01() {
         hello[..4].copy_from_slice(&PROTOCOL_MAGIC);
         hello[4..].copy_from_slice(&999u16.to_le_bytes());
         stream.write_all(&hello).await.unwrap();
-        let mut reply = [0u8; 1];
+        let mut reply = [0u8; 3];
         stream.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply[0], 0x01);
+        // Since v8 the reject names the daemon's own version.
+        assert_eq!(u16::from_le_bytes([reply[1], reply[2]]), PROTOCOL_VERSION);
         // Daemon closes the connection after rejecting.
         let mut rest = Vec::new();
         let n = stream.read_to_end(&mut rest).await.unwrap();

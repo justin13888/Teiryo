@@ -21,7 +21,8 @@ use teiryo_core::{ErrorKind, Request, Response};
 
 use app::{Action, App, DetailQuery, Trend};
 use client::{
-    is_version_mismatch, newest_poll_id, spawn_reconnect, spawn_update_loop, Client, NetEvent,
+    daemon_version_label, newest_poll_id, spawn_reconnect, spawn_update_loop, version_mismatch,
+    Client, NetEvent,
 };
 
 /// The one-line description `--help` prints under the version.
@@ -51,16 +52,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // so connection errors print normally.
     let mut command = match Client::connect().await {
         Ok(c) => c,
-        Err(e) if is_version_mismatch(&e) => {
-            eprintln!(
-                "teiryo: the running daemon speaks a different protocol version \
-                 (this client is v{PROTOCOL_VERSION}).\n\
-                 Stop the stale daemon (e.g. `pkill teiryod`) and relaunch — \
-                 teiryo will respawn the matching daemon automatically."
-            );
-            std::process::exit(2);
-        }
-        Err(e) => return Err(e.into()),
+        Err(e) => match version_mismatch(&e) {
+            Some(daemon) => {
+                eprintln!(
+                    "teiryo: the running daemon speaks protocol {}; this client is \
+                     v{PROTOCOL_VERSION}.\n\
+                     Stop the stale daemon (e.g. `pkill teiryod`) and relaunch — \
+                     teiryo will respawn the matching daemon automatically.",
+                    daemon_version_label(daemon)
+                );
+                std::process::exit(2);
+            }
+            None => return Err(e.into()),
+        },
     };
 
     let mut app = App::new();

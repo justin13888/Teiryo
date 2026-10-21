@@ -19,11 +19,11 @@ A hand-decoded, **never-changing** preamble runs before any bincode bytes:
 
 ```rust
 // First 6 bytes on every connection, raw — not bincode, so it can never itself go stale
-struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 7 */ }
+struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 8 */ }
 ```
 
-- Client sends the 6-byte Hello. Daemon replies with **one raw byte**: `0x00` accepted, `0x01` version mismatch — then closes the connection on mismatch without ever attempting to decode a `Request`.
-- On mismatch the TUI reports "daemon is vX, client is vY — restart the daemon". **No negotiation, no backward compat** in v1: daemon and TUI ship together; the handshake fails loudly on the unclean case (stale daemon left running across an upgrade), it does not support long-term protocol drift.
+- Client sends the 6-byte Hello. Daemon replies with **one raw status byte**: `0x00` accepted, `0x01` version mismatch. After `0x01` the daemon (since v8) sends its own `PROTOCOL_VERSION` as a little-endian `u16`, then closes the connection without ever attempting to decode a `Request`.
+- On mismatch the TUI reports "daemon is vX, client is vY — restart the daemon". A daemon older than v8 sends `0x01` alone and closes; the client reads the missing version as "older than v8" and still reports the mismatch. The trailing version is the one addition the never-changing preamble allows: a client that predates it reads only the first byte and closes, so it is unaffected. **No negotiation, no backward compat** in v1: daemon and TUI ship together; the handshake fails loudly on the unclean case (stale daemon left running across an upgrade), it does not support long-term protocol drift.
 - Any wire-protocol change (variant added/reordered/removed, field change) **must** bump `PROTOCOL_VERSION`.
 - Two recorded fixtures enforce that pairing rather than trusting it: the six Hello bytes are pinned in `handshake.rs`, and one encoded `WindowView` frame is pinned byte for byte in `codec.rs`. A round-trip test cannot see a wire change — both sides move together — so without them a rename, a reorder, or a forgotten bump all passed silently. When either fails legitimately, bump the version, update this file, and re-record the bytes together.
 
