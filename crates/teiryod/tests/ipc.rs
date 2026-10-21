@@ -1228,3 +1228,162 @@ fn a_failed_discovery_is_reported_on_providers() {
         std::fs::remove_dir_all(config.parent().unwrap()).ok();
     });
 }
+
+/// An adapter whose user logs in after the daemon started: discovery fails
+/// until `logins_after` attempts have been made, then finds the stub account.
+/// Everything past discovery behaves like [`StubAdapter`].
+struct LateLoginAdapter {
+    discoveries: std::sync::atomic::AtomicU32,
+    logins_after: u32,
+}
+
+#[async_trait]
+impl Authenticator for LateLoginAdapter {
+    async fn discover_accounts(&self) -> Result<Vec<Account>, AuthError> {
+        let attempt = self
+            .discoveries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if attempt < self.logins_after {
+            Err(AuthError::NotLoggedIn("no login yet; log in first".into()))
+        } else {
+            Ok(vec![stub_account()])
+        }
+    }
+    async fn credential_for(&self, account: &Account) -> Result<Credential, AuthError> {
+        StubAdapter.credential_for(account).await
+    }
+}
+
+#[async_trait]
+impl Prober for LateLoginAdapter {
+    async fn probe(&self, account: &Account, cred: &Credential) -> Result<RawResponse, ProbeError> {
+        StubAdapter.probe(account, cred).await
+    }
+}
+
+impl QuotaParser for LateLoginAdapter {
+    fn parse(&self, raw: &RawResponse) -> Result<Vec<QuotaWindow>, ParseError> {
+        StubAdapter.parse(raw)
+    }
+}
+
+impl WindowPresenter for LateLoginAdapter {
+    fn render_hint(&self, window: &QuotaWindow) -> RenderHint {
+        StubAdapter.render_hint(window)
+    }
+}
+
+impl ProviderAdapter for LateLoginAdapter {
+    fn id(&self) -> String {
+        StubAdapter.id()
+    }
+}
+
+/// Logging in after the daemon started produces a polled account without a
+/// restart: a provider with no accounts re-runs discovery on the credential
+/// re-check's cadence, and once it finds the account, starts it exactly as
+/// startup would have — a startup poll, a cadence, and no stale error.
+///
+/// Takes about one re-check interval (10 s, the config floor) of real time.
+#[test]
+fn a_login_after_startup_is_discovered_and_polled() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let socket = test_socket_path();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let adapter = Rc::new(LateLoginAdapter {
+            discoveries: std::sync::atomic::AtomicU32::new(0),
+            logins_after: 1,
+        });
+        let adapters: Vec<Rc<dyn ProviderAdapter>> = vec![adapter.clone()];
+        let config = test_config("poll_interval_secs = 10\n");
+        let server =
+            tokio::task::spawn_local(teiryod::run(listener, storage, adapters, config.clone()));
+
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        client_handshake(&mut stream).await.expect("handshake");
+        let (mut sink, mut source) = framed(stream).split();
+
+        // Before the login: no account, and the reason is on the wire.
+        send_request(&mut sink, &Request::Providers).await;
+        match recv_response(&mut source).await {
+            Response::Providers(health) => {
+                assert_eq!(health.len(), 1, "{health:?}");
+                assert!(health[0].accounts.is_empty());
+                let error = health[0].discovery_error.as_deref().expect("a reason");
+                assert!(error.contains("log in first"), "{error}");
+            }
+            other => panic!("expected Providers, got {other:?}"),
+        }
+
+        // The re-discovery finds the account and its poll task's first poll
+        // arrives. The bound covers the jittered 10 s re-check with room.
+        send_request(
+            &mut sink,
+            &Request::AwaitUpdate {
+                since: PollId::zero(),
+                config_gen: u64::MAX,
+                timeout_ms: 20_000,
+            },
+        )
+        .await;
+        match recv_response(&mut source).await {
+            Response::Update(event) => {
+                assert_eq!(event.account, stub_account().id);
+                assert_eq!(event.trigger, PollTrigger::Startup);
+                assert!(matches!(event.outcome, PollOutcome::Success { .. }));
+            }
+            other => panic!("expected the late account's first poll, got {other:?}"),
+        }
+
+        send_request(
+            &mut sink,
+            &Request::Status {
+                provider: None,
+                account: None,
+            },
+        )
+        .await;
+        match recv_response(&mut source).await {
+            Response::Status(statuses) => {
+                assert_eq!(statuses.len(), 1);
+                assert_eq!(statuses[0].account, stub_account());
+                assert_eq!(statuses[0].windows.len(), 1);
+                assert_eq!(statuses[0].poll_interval_secs, 10);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+
+        send_request(&mut sink, &Request::Providers).await;
+        match recv_response(&mut source).await {
+            Response::Providers(health) => {
+                assert_eq!(health.len(), 1, "{health:?}");
+                assert_eq!(
+                    health[0].discovery_error, None,
+                    "a stale reason outlived the login"
+                );
+                assert_eq!(health[0].accounts.len(), 1);
+            }
+            other => panic!("expected Providers, got {other:?}"),
+        }
+
+        // Once found, discovery stops: the account's poll task owns it now.
+        assert_eq!(
+            adapter
+                .discoveries
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+
+        send_request(&mut sink, &Request::Shutdown).await;
+        assert!(matches!(recv_response(&mut source).await, Response::Ack));
+        let _ = server.await;
+        std::fs::remove_file(&socket).ok();
+        std::fs::remove_dir_all(config.parent().unwrap()).ok();
+    });
+}

@@ -29,3 +29,5 @@ ulid.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 secrecy.workspace = true
+# Paused-clock tests of the scheduler's waits.
+tokio = { workspace = true, features = ["test-util"] }
