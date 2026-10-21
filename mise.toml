@@ -50,16 +50,30 @@ description = "Install teiryo and teiryod, then restart the daemon"
 # artifacts instead of recompiling the dependency graph (bundled SQLite
 # included) from scratch; --force is required because the version is pinned, so
 # reinstalling the same version is the normal case.
+#
+# An open TUI respawns the daemon within a second of losing it, from whichever
+# build that TUI came from, so it races the restart and no outcome of that race
+# is right. The task refuses instead: once before building, so nothing is
+# replaced, and again before the restart, for a TUI opened during the build.
 run = [
+  '''
+set -eu
+if command -v pgrep >/dev/null 2>&1 && pgrep -x -u "$(id -u)" teiryo >/dev/null 2>&1; then
+  echo "install: a teiryo TUI is running; quit it and re-run" >&2
+  exit 1
+fi
+''',
   "cargo install --path crates/teiryod --locked --force --target-dir target",
   "cargo install --path crates/teiryo --locked --force --target-dir target",
   '''
 set -eu
 
-# Explicit, because the fallback is worse than failing: without pgrep we cannot
-# tell a running daemon from none, would skip the restart below, and would then
-# accept the *old* daemon as proof that the new one works.
-for tool in pgrep pkill; do
+# Explicit, because the fallback is worse than failing: without pgrep and ps we
+# cannot tell a running daemon from none, would skip the restart below, and
+# would then accept the *old* daemon as proof that the new one works. perl is
+# how the task takes the daemon's instance lock (macOS has no flock(1)) and,
+# where setsid(1) is missing, how it detaches the new daemon.
+for tool in pgrep ps perl; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "install: $tool is required to restart the daemon" >&2
     exit 1
@@ -91,20 +105,26 @@ fi
 uid=$(id -u)
 daemon="$daemon_dir/teiryod"
 # Asked of the binary just installed rather than recomputed here, so the task
-# can never disagree with the daemon about where it binds.
+# can never disagree with the daemon about where it binds or logs. Asking for
+# the log path also creates its directory, which the redirect below needs.
 sock=$("$daemon" --print-socket-path)
+log=$("$daemon" --print-log-path)
+# The daemon's instance lock: the socket's name with a `.lock` extension
+# (teiryo_core::paths::lock_path).
+lock="${sock%.sock}.lock"
 
-# An open TUI respawns the daemon within a second of losing it, using whichever
-# build that TUI came from. It races the restart below, and being the older
-# build it then fails its own handshake against the daemon it just spawned.
+# Checked again here, not only before the build: a TUI opened since would
+# respawn the daemon this task is about to stop. See the comment above `run`.
 if pgrep -x -u "$uid" teiryo >/dev/null 2>&1; then
-  echo "install: a teiryo TUI is running; quit and relaunch it once this finishes" >&2
+  echo "install: a teiryo TUI is running; quit it and re-run" >&2
+  echo "install: the binaries are installed, but the old teiryod was left running" >&2
+  exit 1
 fi
 
-# The TUI spawns the daemon and drops the handle without ever waiting on it, so
-# a daemon it outlives lingers as a zombie until the TUI itself exits. Zombies
-# answer pgrep but hold no socket, and counting one would stall every stop below
-# on a process that cannot exit.
+# A TUI reaps the daemon it spawns, but a build from before it did would leave
+# one it outlived as a zombie until the TUI itself exited. Zombies answer pgrep
+# but hold no socket, and counting one would stall every stop below on a process
+# that cannot exit.
 live_daemon_pids() {
   for pid in $(pgrep -x -u "$uid" teiryod 2>/dev/null || true); do
     state=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d " \t\n" || true)
@@ -116,19 +136,24 @@ live_daemon_pids() {
 }
 
 # "Some teiryod is alive" is not the question — the stale one and the installed
-# one are both that. Ask which binary it is, wherever the OS will say.
-if [ -r "/proc/$$/exe" ]; then introspect=1; else introspect=0; fi
+# one are both that. Ask which binary it is, wherever the OS will say: Linux
+# through /proc, and macOS, which has no /proc, through `ps -o comm=`, which
+# there prints the path the process was executed from. A pid neither answers
+# for absolutely is not counted, so a stale daemon is never taken for the new.
+want=$(readlink -f "$daemon")
+binary_of() {
+  if [ -r "/proc/$1/exe" ]; then
+    readlink -f "/proc/$1/exe" 2>/dev/null || true
+    return
+  fi
+  comm=$(ps -o comm= -p "$1" 2>/dev/null || true)
+  case "$comm" in
+    /*) readlink -f "$comm" 2>/dev/null || true ;;
+  esac
+}
 installed_daemon_running() {
-  pids=$(live_daemon_pids)
-  if [ -z "$pids" ]; then
-    return 1
-  fi
-  if [ "$introspect" = 0 ]; then
-    return 0
-  fi
-  want=$(readlink -f "$daemon")
-  for pid in $pids; do
-    if [ "$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)" = "$want" ]; then
+  for pid in $(live_daemon_pids); do
+    if [ "$(binary_of "$pid")" = "$want" ]; then
       return 0
     fi
   done
@@ -137,33 +162,58 @@ installed_daemon_running() {
 
 # A daemon outlives the TUI, and the two ship together with no protocol
 # compatibility: left running across an upgrade, the old one keeps the socket
-# and the new TUI dies at the handshake.
-if [ -n "$(live_daemon_pids)" ]; then
+# and the new TUI dies at the handshake. Signalled by pid, so only the
+# processes counted here are touched.
+pids=$(live_daemon_pids)
+if [ -n "$pids" ]; then
   echo "install: stopping the running teiryod"
-  pkill -TERM -x -u "$uid" teiryod || true
+  kill -TERM $pids 2>/dev/null || true
   waited=0
   while [ -n "$(live_daemon_pids)" ]; do
     waited=$((waited + 1))
     if [ "$waited" -gt 50 ]; then
-      pkill -KILL -x -u "$uid" teiryod || true
+      kill -KILL $(live_daemon_pids) 2>/dev/null || true
       break
     fi
     sleep 0.1
   done
 fi
 
-# Nothing of ours should hold the socket now, so a file still sitting there is
-# debris from a crash or from the SIGKILL above. Clearing it is what makes the
-# file reappearing below proof that the new daemon bound, rather than something
-# the old one left behind.
-rm -f "$sock"
+# A socket file still sitting there is debris from a crash or from the SIGKILL
+# above, unless a daemon holds it: that is what the instance lock says. Taking
+# the lock first and removing the socket while holding it means a live
+# daemon's socket is never deleted, and with it gone, the file reappearing
+# below is proof that the new daemon bound rather than something the old one
+# left behind. Exit 1 from perl is the lock being held; anything else failed.
+held=0
+perl -e '
+  use Fcntl qw(:flock O_WRONLY O_CREAT O_NOFOLLOW);
+  my ($lock, $sock) = @ARGV;
+  sub fail { print STDERR "install: $_[0]: $!\n"; exit 2 }
+  sysopen(my $fh, $lock, O_WRONLY | O_CREAT | O_NOFOLLOW, 0600)
+    or fail("cannot open $lock");
+  flock($fh, LOCK_EX | LOCK_NB) or ($!{EWOULDBLOCK} ? exit 1 : fail("cannot lock $lock"));
+  unlink($sock) or $!{ENOENT} or fail("cannot remove $sock");
+  exit 0;
+' "$lock" "$sock" || held=$?
+if [ "$held" = 1 ]; then
+  echo "install: a teiryod that could not be stopped still holds $lock" >&2
+  exit 1
+elif [ "$held" != 0 ]; then
+  exit 1
+fi
 
 # teiryod does not detach itself — the TUI is what normally starts it in a
-# session of its own — so the task has to.
+# session of its own — so the task has to: in a session of its own, so a
+# Ctrl-C during the wait below cannot reach it. Its output is appended to the
+# log, where a failure before logging starts would otherwise be lost. macOS
+# has no setsid(1); perl's POSIX::setsid is the same call. Neither fails here,
+# because a background job of a non-interactive shell never leads its group.
 if command -v setsid >/dev/null 2>&1; then
-  setsid "$daemon" </dev/null >/dev/null 2>&1 &
+  setsid "$daemon" </dev/null >>"$log" 2>&1 &
 else
-  nohup "$daemon" </dev/null >/dev/null 2>&1 &
+  perl -MPOSIX -e 'POSIX::setsid() or die "setsid: $!\n"; exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n"' \
+    "$daemon" </dev/null >>"$log" 2>&1 &
 fi
 
 # Both conditions, because either alone accepts what it should not: the socket
@@ -184,9 +234,9 @@ done
 
 echo "install: the binaries are installed, but $daemon is not serving $sock" >&2
 if pgrep -x -u "$uid" teiryo >/dev/null 2>&1; then
-  echo "install: a running teiryo TUI keeps respawning its own daemon — quit it and re-run" >&2
+  echo "install: a teiryo TUI started meanwhile and is respawning its own daemon — quit it and re-run" >&2
 else
-  echo "install: see ${XDG_DATA_HOME:-$HOME/.local/share}/teiryo/teiryo.log" >&2
+  echo "install: see $log" >&2
 fi
 exit 1
 ''',
@@ -195,12 +245,49 @@ exit 1
 [tasks.uninstall]
 description = "Stop the daemon and remove the installed teiryo and teiryod"
 # The daemon first: removing its binary while it still holds the socket leaves a
-# running process no client can replace.
+# running process no client can replace. An open TUI would respawn it from the
+# binary about to be removed, so the task refuses while one runs. The daemon
+# unlinks its own socket on SIGTERM; one left by the SIGKILL fallback is
+# cleared by the next daemon to take the lock.
 run = [
   '''
 set -eu
-if command -v pkill >/dev/null 2>&1; then
-  pkill -TERM -x -u "$(id -u)" teiryod || true
+for tool in pgrep ps; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "uninstall: $tool is required to stop the daemon" >&2
+    exit 1
+  fi
+done
+uid=$(id -u)
+if pgrep -x -u "$uid" teiryo >/dev/null 2>&1; then
+  echo "uninstall: a teiryo TUI is running; quit it and re-run" >&2
+  exit 1
+fi
+
+# Zombies hold no socket and cannot exit; see the install task.
+live_daemon_pids() {
+  for pid in $(pgrep -x -u "$uid" teiryod 2>/dev/null || true); do
+    state=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d " \t\n" || true)
+    case "$state" in
+      Z* | "") ;;
+      *) echo "$pid" ;;
+    esac
+  done
+}
+
+pids=$(live_daemon_pids)
+if [ -n "$pids" ]; then
+  echo "uninstall: stopping the running teiryod"
+  kill -TERM $pids 2>/dev/null || true
+  waited=0
+  while [ -n "$(live_daemon_pids)" ]; do
+    waited=$((waited + 1))
+    if [ "$waited" -gt 50 ]; then
+      kill -KILL $(live_daemon_pids) 2>/dev/null || true
+      break
+    fi
+    sleep 0.1
+  done
 fi
 ''',
   "cargo uninstall teiryo teiryod",
