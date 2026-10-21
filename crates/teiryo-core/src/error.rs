@@ -16,17 +16,34 @@ pub enum HandshakeError {
         /// The peer's protocol version.
         theirs: u16,
     },
-    /// Daemon replied with a reject code (client side).
-    #[error(
-        "daemon rejected handshake (code {0:#04x}): daemon and client protocol versions differ — restart the daemon"
-    )]
-    Rejected(u8),
+    /// Daemon rejected our protocol version (client side).
+    #[error("{}", rejected_message(*.daemon))]
+    Rejected {
+        /// The protocol version the daemon speaks, which it sends after the
+        /// reject byte since v8. `None` when the daemon closed without
+        /// sending one: it predates v8.
+        daemon: Option<u16>,
+    },
     /// Daemon replied with an unknown code.
     #[error("unexpected handshake reply {0:#04x}")]
     UnexpectedReply(u8),
     /// I/O failure during the handshake.
     #[error("handshake i/o: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// `HandshakeError::Rejected`'s text, naming both sides' protocol versions.
+fn rejected_message(daemon: Option<u16>) -> String {
+    let client = crate::protocol::handshake::PROTOCOL_VERSION;
+    match daemon {
+        Some(daemon) => format!(
+            "daemon rejected handshake: daemon is v{daemon}, client is v{client} — restart the daemon"
+        ),
+        None => format!(
+            "daemon rejected handshake: daemon is older than v8 (it did not say which version), \
+             client is v{client} — restart the daemon"
+        ),
+    }
 }
 
 /// Frame (de)serialization failure.

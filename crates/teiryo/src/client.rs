@@ -94,23 +94,37 @@ impl From<WireError> for ClientError {
     }
 }
 
-/// Whether a handshake failure is the "stale daemon of a different protocol
-/// version" case that the user must resolve by letting the daemon restart.
-pub fn is_version_mismatch(err: &ClientError) -> bool {
-    matches!(
-        err,
-        ClientError::Handshake(HandshakeError::Rejected(_))
-            | ClientError::Handshake(HandshakeError::VersionMismatch { .. })
-    )
+/// The daemon's protocol version when a handshake failure is the "stale
+/// daemon of a different protocol version" case that the user must resolve
+/// by letting the daemon restart: `Some(Some(v))` names it, `Some(None)` is a
+/// daemon older than v8, which does not say. `None` for any other failure.
+pub fn version_mismatch(err: &ClientError) -> Option<Option<u16>> {
+    match err {
+        ClientError::Handshake(HandshakeError::Rejected { daemon }) => Some(*daemon),
+        ClientError::Handshake(HandshakeError::VersionMismatch { theirs, .. }) => {
+            Some(Some(*theirs))
+        }
+        _ => None,
+    }
+}
+
+/// How a mismatched daemon's version reads to the user: `v9`, or what is
+/// known about a daemon that did not say.
+pub fn daemon_version_label(daemon: Option<u16>) -> String {
+    match daemon {
+        Some(v) => format!("v{v}"),
+        None => "older than v8".to_owned(),
+    }
 }
 
 /// What the user is told once a reconnect finds a daemon of another protocol
 /// version. Retrying cannot fix it — the stale daemon keeps the socket — so it
 /// stays on screen until the user acts.
-pub fn version_mismatch_message() -> String {
+pub fn version_mismatch_message(daemon: Option<u16>) -> String {
     format!(
-        "daemon speaks another protocol than this client (v{PROTOCOL_VERSION}) — \
-         stop it (`pkill teiryod`) and relaunch teiryo"
+        "daemon speaks protocol {}, this client v{PROTOCOL_VERSION} — \
+         stop it (`pkill teiryod`) and relaunch teiryo",
+        daemon_version_label(daemon)
     )
 }
 
@@ -206,11 +220,11 @@ async fn reconnect_loop<F, Fut>(
                 let _ = tx.send(NetEvent::Reconnected(Box::new(client)));
                 return;
             }
-            Err(e) if is_version_mismatch(&e) => {
-                let _ = tx.send(NetEvent::Incompatible(version_mismatch_message()));
-                return;
-            }
             Err(e) => {
+                if let Some(daemon) = version_mismatch(&e) {
+                    let _ = tx.send(NetEvent::Incompatible(version_mismatch_message(daemon)));
+                    return;
+                }
                 if tx.send(NetEvent::ReconnectFailed(e.to_string())).is_err() {
                     return; // TUI is gone
                 }
@@ -395,6 +409,30 @@ mod tests {
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
 
+    /// A reject carries the daemon's version through to what the user reads;
+    /// a pre-v8 daemon that sent none is still a mismatch, named as such.
+    #[test]
+    fn a_mismatch_names_both_versions() {
+        let ahead = ClientError::Handshake(HandshakeError::Rejected {
+            daemon: Some(PROTOCOL_VERSION + 1),
+        });
+        assert_eq!(version_mismatch(&ahead), Some(Some(PROTOCOL_VERSION + 1)));
+        assert!(
+            version_mismatch_message(Some(PROTOCOL_VERSION + 1)).contains(&format!(
+                "daemon speaks protocol v{}, this client v{PROTOCOL_VERSION}",
+                PROTOCOL_VERSION + 1
+            ))
+        );
+
+        let old = ClientError::Handshake(HandshakeError::Rejected { daemon: None });
+        assert_eq!(version_mismatch(&old), Some(None));
+        assert!(version_mismatch_message(None).contains(&format!(
+            "daemon speaks protocol older than v8, this client v{PROTOCOL_VERSION}"
+        )));
+
+        assert_eq!(version_mismatch(&ClientError::Closed), None);
+    }
+
     /// Ordinary failures retry; a version mismatch ends the loop, because
     /// every further attempt would hit the same stale daemon — and spawn
     /// another daemon that exits at once — for as long as the TUI runs.
@@ -412,7 +450,9 @@ mod tests {
                             std::io::ErrorKind::ConnectionRefused.into(),
                         ))
                     } else {
-                        Err(ClientError::Handshake(HandshakeError::Rejected(1)))
+                        Err(ClientError::Handshake(HandshakeError::Rejected {
+                            daemon: Some(PROTOCOL_VERSION + 1),
+                        }))
                     }
                 }
             },
@@ -430,7 +470,10 @@ mod tests {
             panic!("the last event names the mismatch: {events:?}");
         };
         assert!(
-            message.contains(&format!("v{PROTOCOL_VERSION}")),
+            message.contains(&format!(
+                "daemon speaks protocol v{}, this client v{PROTOCOL_VERSION}",
+                PROTOCOL_VERSION + 1
+            )),
             "{message}"
         );
     }
@@ -449,7 +492,9 @@ mod tests {
                     if n < 4 {
                         Err(ClientError::Closed)
                     } else {
-                        Err(ClientError::Handshake(HandshakeError::Rejected(1)))
+                        Err(ClientError::Handshake(HandshakeError::Rejected {
+                            daemon: None,
+                        }))
                     }
                 }
             },
@@ -498,7 +543,9 @@ mod tests {
                 } else {
                     ready
                         .take()
-                        .ok_or(ClientError::Handshake(HandshakeError::Rejected(1)))
+                        .ok_or(ClientError::Handshake(HandshakeError::Rejected {
+                            daemon: None,
+                        }))
                 };
                 async move { next }
             },
