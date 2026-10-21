@@ -6,7 +6,9 @@
 //! [`teiryo_core::paths::socket_path`], the rule the daemon binds by, and the
 //! log the spawned daemon writes to from [`teiryo_core::paths::log_path`].
 
+use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -81,13 +83,56 @@ fn reap_in_background(mut child: Child) {
     });
 }
 
+/// The variables a spawned daemon keeps from the TUI's environment, besides
+/// every `TEIRYO_*` one ([`INHERITED_PREFIX`]). The daemon is shared by every
+/// later TUI, from any shell, for as long as it runs, so it must not carry
+/// whatever the first TUI's shell happened to hold: per-directory mise
+/// `[env]` values, proxy and certificate settings, `cargo run`'s variables.
+///
+/// `HOME`, `TMPDIR` and the `XDG_*` base directories are what the socket,
+/// database, config and log paths resolve from; dropping one would make the
+/// daemon bind or write somewhere other than where the TUI looks.
+const INHERITED: &[&str] = &[
+    "HOME",
+    "PATH",
+    "USER",
+    "TMPDIR",
+    "LANG",
+    "TEIRYOD_LOG",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+];
+
+/// The prefix of the daemon's own settings (`TEIRYO_CLAUDE_CREDENTIALS`,
+/// `TEIRYO_CLAUDE_BASE_URL`, …), all of which a spawned daemon keeps.
+const INHERITED_PREFIX: &[u8] = b"TEIRYO_";
+
+/// Whether a spawned daemon keeps the variable `name`.
+fn inherited(name: &OsStr) -> bool {
+    let name = name.as_bytes();
+    name.starts_with(INHERITED_PREFIX) || INHERITED.iter().any(|kept| kept.as_bytes() == name)
+}
+
+/// The command that starts `binary` as the daemon: [`detached`], with an
+/// environment of only the variables of `env` that [`inherited`] keeps.
+/// Production passes [`std::env::vars_os`]; tests pass their own. Stdio is
+/// the caller's to set.
+fn daemon_command(binary: &Path, env: impl IntoIterator<Item = (OsString, OsString)>) -> Command {
+    let mut cmd = detached(binary);
+    cmd.env_clear()
+        .envs(env.into_iter().filter(|(name, _)| inherited(name)));
+    cmd
+}
+
 /// Spawn `teiryod` detached: in a session of its own, so it has no
 /// controlling terminal and the TUI's terminal closing cannot signal it; with
 /// `/` as its working directory, so it never pins the directory the TUI was
-/// launched from (and with it a volume that could otherwise be ejected); and
-/// with stdio routed away from the TUI's terminal.
+/// launched from (and with it a volume that could otherwise be ejected); with
+/// only the environment [`daemon_command`] keeps; and with stdio routed away
+/// from the TUI's terminal.
 fn spawn_daemon(binary: &Path) -> io::Result<()> {
-    let mut cmd = detached(binary);
+    let mut cmd = daemon_command(binary, std::env::vars_os());
     cmd.stdin(Stdio::null())
         .stdout(daemon_output())
         .stderr(daemon_output());
@@ -186,6 +231,75 @@ mod tests {
         assert_eq!(cwd.trim_end(), "/");
         assert_eq!(sid, pid, "the child leads a new session");
         assert_ne!(sid, ours);
+    }
+
+    /// A daemon spawned from a shell with arbitrary extra variables starts
+    /// with only the allowlisted ones and the `TEIRYO_*` settings: the child
+    /// is `env` itself, so its output is exactly the environment it got.
+    #[test]
+    fn daemon_command_passes_only_the_allowlist() {
+        let parent = [
+            ("HOME", "/home/u"),
+            ("PATH", "/usr/bin:/bin"),
+            ("USER", "u"),
+            ("TMPDIR", "/tmp/u"),
+            ("LANG", "C.UTF-8"),
+            ("TEIRYOD_LOG", "debug"),
+            ("XDG_CONFIG_HOME", "/home/u/.config"),
+            ("XDG_DATA_HOME", "/home/u/.local/share"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("TEIRYO_CLAUDE_BASE_URL", "http://127.0.0.1:1"),
+            ("HTTPS_PROXY", "http://proxy:3128"),
+            ("SSL_CERT_FILE", "/etc/custom.pem"),
+            ("CARGO_MANIFEST_DIR", "/src/teiryo"),
+            ("MISE_ENV_VALUE", "x"),
+            // Neither a prefix match nor a case-insensitive one.
+            ("TEIRYO", "bare"),
+            ("teiryo_lower", "x"),
+            ("HOMEDIR", "/elsewhere"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+
+        let output = daemon_command(Path::new("/usr/bin/env"), parent)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .expect("/usr/bin/env should be spawnable");
+        assert!(output.status.success());
+        let mut got: Vec<String> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        got.sort();
+
+        let mut want = vec![
+            "HOME=/home/u",
+            "LANG=C.UTF-8",
+            "PATH=/usr/bin:/bin",
+            "TEIRYOD_LOG=debug",
+            "TEIRYO_CLAUDE_BASE_URL=http://127.0.0.1:1",
+            "TMPDIR=/tmp/u",
+            "USER=u",
+            "XDG_CONFIG_HOME=/home/u/.config",
+            "XDG_DATA_HOME=/home/u/.local/share",
+            "XDG_RUNTIME_DIR=/run/user/1000",
+        ];
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    /// The falsifier for the test above: the test process's own environment
+    /// (cargo sets `CARGO_*` for every test run) never leaks past the clear.
+    #[test]
+    fn daemon_command_does_not_inherit_the_real_environment() {
+        let output = daemon_command(Path::new("/usr/bin/env"), std::iter::empty())
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .expect("/usr/bin/env should be spawnable");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
     }
 
     /// A zombie keeps its pid valid for the life of its parent, so polling the
