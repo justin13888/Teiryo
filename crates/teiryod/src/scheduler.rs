@@ -442,6 +442,117 @@ pub fn spawn_poller(
     tx
 }
 
+/// Bring one discovered account into service: persist it, seed its health
+/// row, replay what the last run learned about it, and start its poll task.
+///
+/// The one path an account takes into the scheduler, whether discovery found
+/// it at startup or on a later re-discovery, so the two cannot drift.
+pub fn start_account(daemon: &Daemon, adapter: &Rc<dyn ProviderAdapter>, account: Account) {
+    let provider = adapter.id();
+    {
+        let mut st = daemon.state.borrow_mut();
+        if let Err(e) = st.storage.upsert_account(&account) {
+            tracing::error!(account = %account.id, error = %e, "failed to persist account");
+        }
+        st.accounts.push(account.clone());
+        st.health
+            .entry((provider.clone(), account.id.clone()))
+            .or_default();
+    }
+    // Serve what the last run already learned about this account while the
+    // first poll of this run is still in flight.
+    daemon.hydrate_account(&account);
+    let schedule_rx = daemon.register_poller(&account, adapter.clone());
+    let key = (provider, account.id.clone());
+    let tx = spawn_poller(daemon, adapter.clone(), account, schedule_rx);
+    daemon.state.borrow_mut().pollers.insert(key, tx);
+}
+
+/// How long to wait between discovery attempts for a provider with no
+/// accounts: the credential re-check's cadence, for the same reason — it is a
+/// local read that costs the provider nothing, and a login should be noticed
+/// about as fast as a re-login is.
+fn rediscovery_interval(daemon: &Daemon, provider: &str) -> Duration {
+    daemon
+        .state
+        .borrow()
+        .config
+        .poll_interval(provider)
+        .min(CREDENTIAL_RECHECK_MAX)
+}
+
+/// Keep re-running discovery for a provider that came up with no accounts,
+/// until it finds some; then start them exactly as startup does and stop.
+///
+/// Without this a provider whose login was missing when the daemon started —
+/// the user had not logged in yet, or the Keychain item was unavailable — had
+/// no account and no task for the life of the process, and logging in did
+/// nothing until a restart.
+///
+/// A disabled provider waits on the config instead, as its poll task would
+/// park: nobody is going to look at it, and re-enabling it re-discovers at
+/// once rather than after a full wait. Must be called from within a
+/// `tokio::task::LocalSet`.
+pub fn spawn_rediscovery(daemon: &Daemon, adapter: Rc<dyn ProviderAdapter>) {
+    let daemon = daemon.clone();
+    let mut shutdown_rx = daemon.shutdown_tx.subscribe();
+    let mut config_rx = daemon.config_tx.subscribe();
+    tokio::task::spawn_local(async move {
+        let provider = adapter.id();
+        let mut immediately = false;
+        loop {
+            let enabled = daemon.state.borrow().config.provider_enabled(&provider);
+            if !enabled {
+                immediately = true;
+                tokio::select! {
+                    _ = config_rx.changed() => continue,
+                    _ = shutdown_rx.changed() => break,
+                }
+            }
+            if !immediately {
+                let after = jittered(rediscovery_interval(&daemon, &provider));
+                tokio::select! {
+                    _ = tokio::time::sleep(after) => {}
+                    // A config edit may change the cadence or disable the
+                    // provider; re-read both before waiting again.
+                    _ = config_rx.changed() => continue,
+                    _ = shutdown_rx.changed() => break,
+                }
+            }
+            immediately = false;
+            match adapter.discover_accounts().await {
+                Ok(accounts) if accounts.is_empty() => {
+                    // No error to report, and nothing to start: an adapter
+                    // that answers "no accounts" is asked again later.
+                    daemon.state.borrow_mut().discovery_errors.remove(&provider);
+                }
+                Ok(accounts) => {
+                    daemon.state.borrow_mut().discovery_errors.remove(&provider);
+                    tracing::info!(
+                        provider,
+                        accounts = accounts.len(),
+                        "accounts discovered after startup — starting polls"
+                    );
+                    for account in accounts {
+                        start_account(&daemon, &adapter, account);
+                    }
+                    break;
+                }
+                Err(e) => {
+                    let message = e.to_string();
+                    let mut st = daemon.state.borrow_mut();
+                    // Logged on the edge, like a credential pause: the same
+                    // missing login every 30 s for hours says nothing new.
+                    if st.discovery_errors.get(&provider) != Some(&message) {
+                        tracing::warn!(provider, error = %message, "account discovery failed");
+                    }
+                    st.discovery_errors.insert(provider.clone(), message);
+                }
+            }
+        }
+    });
+}
+
 /// Run one poll: resolve credential, probe, parse; persist and publish the
 /// resulting event whatever the outcome. The result is handed back so the
 /// caller can adjust its backoff.

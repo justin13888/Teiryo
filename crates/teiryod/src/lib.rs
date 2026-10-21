@@ -49,37 +49,21 @@ pub async fn run(
                     .borrow_mut()
                     .discovery_errors
                     .insert(provider.clone(), e.to_string());
+                // A login that appears later must still be picked up.
+                scheduler::spawn_rediscovery(&daemon, adapter);
                 continue;
             }
         };
         if accounts.is_empty() {
             tracing::info!(provider, "no accounts discovered");
+            scheduler::spawn_rediscovery(&daemon, adapter);
+            continue;
         }
         if !daemon.state.borrow().config.provider_enabled(&provider) {
             tracing::info!(provider, "provider disabled in config; not polling");
         }
         for account in accounts {
-            {
-                let mut st = daemon.state.borrow_mut();
-                if let Err(e) = st.storage.upsert_account(&account) {
-                    tracing::error!(account = %account.id, error = %e, "failed to persist account");
-                }
-                st.accounts.push(account.clone());
-                st.health
-                    .entry((provider.clone(), account.id.clone()))
-                    .or_default();
-            }
-            // Serve what the last run already learned about this account
-            // while the first poll of this run is still in flight.
-            daemon.hydrate_account(&account);
-            let schedule_rx = daemon.register_poller(&account, adapter.clone());
-            let tx =
-                scheduler::spawn_poller(&daemon, adapter.clone(), account.clone(), schedule_rx);
-            daemon
-                .state
-                .borrow_mut()
-                .pollers
-                .insert((provider.clone(), account.id.clone()), tx);
+            scheduler::start_account(&daemon, &adapter, account);
         }
     }
 

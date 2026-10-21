@@ -33,7 +33,8 @@ pub struct HealthCounters {
 pub struct SharedState {
     /// Persistent storage.
     pub storage: Storage,
-    /// Accounts discovered at startup, in registry order.
+    /// Discovered accounts: startup's in registry order, then any a later
+    /// re-discovery found, in the order it found them.
     pub accounts: Vec<Account>,
     /// Latest completed poll per account (any outcome).
     pub latest_poll: HashMap<AccountId, PollEvent>,
@@ -73,8 +74,9 @@ pub struct SharedState {
     /// at all: the reset that anchors a weekly window is routinely older than
     /// any history a dashboard fetches.
     pub observed_starts: HashMap<(AccountId, WindowId), ObservedStart>,
-    /// Why account discovery failed, per provider. Discovery runs once at
-    /// startup, so an entry stands for the life of the process; it is what
+    /// Why account discovery failed, per provider. A provider with no
+    /// accounts re-runs discovery until it finds some, and each attempt
+    /// replaces or clears its entry, so an entry is the latest reason; it is what
     /// lets `Providers` explain an empty dashboard instead of leaving the
     /// failure in the log alone.
     pub discovery_errors: HashMap<ProviderId, String>,
