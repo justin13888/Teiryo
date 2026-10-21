@@ -963,4 +963,111 @@ mod tests {
             assert!(j <= Duration::from_secs(66), "{j:?}");
         }
     }
+
+    /// A provider whose discovery always fails, counting its attempts.
+    struct NoLogin {
+        discoveries: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl teiryo_core::Authenticator for NoLogin {
+        async fn discover_accounts(&self) -> Result<Vec<Account>, teiryo_core::AuthError> {
+            self.discoveries
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(teiryo_core::AuthError::NotLoggedIn("log in first".into()))
+        }
+        async fn credential_for(
+            &self,
+            _account: &Account,
+        ) -> Result<teiryo_core::Credential, teiryo_core::AuthError> {
+            Err(teiryo_core::AuthError::NotLoggedIn("log in first".into()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl teiryo_core::Prober for NoLogin {
+        async fn probe(
+            &self,
+            _account: &Account,
+            _cred: &teiryo_core::Credential,
+        ) -> Result<teiryo_core::RawResponse, ProbeError> {
+            Err(ProbeError::Network("never polled".into()))
+        }
+    }
+
+    impl teiryo_core::QuotaParser for NoLogin {
+        fn parse(
+            &self,
+            _raw: &teiryo_core::RawResponse,
+        ) -> Result<Vec<teiryo_core::QuotaWindow>, teiryo_core::ParseError> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl teiryo_core::WindowPresenter for NoLogin {
+        fn render_hint(&self, _window: &teiryo_core::QuotaWindow) -> teiryo_core::RenderHint {
+            teiryo_core::RenderHint {
+                style: teiryo_core::BarStyle::Percent,
+                warn_threshold: 0.8,
+                critical_threshold: 0.95,
+                note: None,
+            }
+        }
+    }
+
+    impl ProviderAdapter for NoLogin {
+        fn id(&self) -> String {
+            "stub".into()
+        }
+    }
+
+    /// A config edit during the re-discovery wait restarts the wait against
+    /// the new cadence: shortening the interval takes effect now, not after
+    /// the old wait finally elapses.
+    #[tokio::test(start_paused = true)]
+    async fn a_config_edit_restarts_the_rediscovery_wait_at_the_new_cadence() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let storage = teiryo_core::Storage::open_in_memory().unwrap();
+                let daemon = Daemon::new(storage, "config.toml".into(), vec!["stub".into()]);
+                let adapter = Rc::new(NoLogin {
+                    discoveries: std::sync::atomic::AtomicU32::new(0),
+                });
+                // The default 180 s cadence caps the wait at 30 s (27-33 s
+                // jittered).
+                spawn_rediscovery(&daemon, adapter.clone());
+
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                assert_eq!(
+                    adapter
+                        .discoveries
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "waited less than 27 s"
+                );
+
+                // Down to the 10 s floor: the next attempt is 9-11 s from now,
+                // well before the old wait would have ended at 27-33 s.
+                daemon.apply_config(crate::config::parse("poll_interval_secs = 10\n").unwrap());
+                tokio::time::sleep(Duration::from_secs(8)).await;
+                assert_eq!(
+                    adapter
+                        .discoveries
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "fired before the new wait"
+                );
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                assert_eq!(
+                    adapter
+                        .discoveries
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    1,
+                    "the wait was not restarted at the new cadence"
+                );
+
+                daemon.shutdown_tx.send_replace(true);
+            })
+            .await;
+    }
 }
