@@ -999,6 +999,44 @@ mod tests {
         }
     }
 
+    fn provider(discovery_error: Option<&str>) -> ProviderHealth {
+        ProviderHealth {
+            provider: "claude".to_owned(),
+            accounts: Vec::new(),
+            consecutive_failures: 0,
+            last_error: None,
+            discovery_error: discovery_error.map(str::to_owned),
+        }
+    }
+
+    /// A provider whose discovery failed has no failing polls to count, so
+    /// the discovery error alone has to mark it failed and say why.
+    #[test]
+    fn a_failed_discovery_marks_the_provider_failed_and_names_the_error() {
+        let line = provider_line(&provider(Some("no Claude Code login found")));
+        assert_eq!(line.spans[0].content, " ▲ ");
+        assert_eq!(line.spans[0].style.fg, Some(theme::CRIT));
+        let last = line.spans.last().expect("spans");
+        assert_eq!(
+            last.content,
+            "  discovery failed: no Claude Code login found"
+        );
+        assert_eq!(last.style.fg, Some(theme::CRIT));
+    }
+
+    /// Falsifier for the test above: without a discovery error the same
+    /// provider is healthy and carries no failure text.
+    #[test]
+    fn a_provider_without_a_discovery_error_is_healthy() {
+        let line = provider_line(&provider(None));
+        assert_eq!(line.spans[0].content, " ● ");
+        assert_eq!(line.spans[0].style.fg, Some(theme::OK));
+        assert!(line
+            .spans
+            .iter()
+            .all(|span| !span.content.contains("discovery failed")));
+    }
+
     /// And the Health tab's account column, which is the same pairing at a
     /// different width.
     #[test]
