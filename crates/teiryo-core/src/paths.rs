@@ -1,7 +1,9 @@
-//! Where the daemon's socket lives. The daemon binds it and the TUI connects
-//! to it, so both binaries resolve it here: two copies of the rule drifted
-//! once already, and a disagreement shows up only as a TUI that spawns a
-//! daemon it can never reach.
+//! Where the daemon's socket and log live. The daemon binds the socket and the
+//! TUI connects to it; the daemon writes the log and the TUI sends a spawned
+//! daemon's output there and names it in errors. Both binaries resolve both
+//! here: two copies of the socket rule drifted once already, and a
+//! disagreement shows up only as a TUI that spawns a daemon it can never
+//! reach, or points the user at a log that does not exist.
 //!
 //! A debug build (`cfg(debug_assertions)`, which is what `cargo run` and
 //! `mise run tui` produce) carries a `-dev` suffix on its socket and data
@@ -35,6 +37,33 @@ pub const DATA_DIR_NAME: &str = if cfg!(debug_assertions) {
 } else {
     "teiryo"
 };
+
+/// The log's file name inside [`data_dir`].
+pub const LOG_FILE_NAME: &str = "teiryo.log";
+
+/// The daemon's data directory, which holds the database and the log:
+/// [`DATA_DIR_NAME`] in the platform's data directory (`$XDG_DATA_HOME` on
+/// Linux, `~/Library/Application Support` on macOS). `None` when no home
+/// directory can be resolved. The daemon writes here and the TUI points the
+/// spawned daemon's output and its errors here, so both resolve it through
+/// this one rule.
+pub fn data_dir() -> Option<PathBuf> {
+    Some(
+        directories::ProjectDirs::from("", "", DATA_DIR_NAME)?
+            .data_dir()
+            .to_path_buf(),
+    )
+}
+
+/// The daemon's log file: [`LOG_FILE_NAME`] in `data_dir`.
+pub fn log_file(data_dir: &Path) -> PathBuf {
+    data_dir.join(LOG_FILE_NAME)
+}
+
+/// The daemon's log file, [`log_file`] in [`data_dir`].
+pub fn log_path() -> Option<PathBuf> {
+    data_dir().map(|dir| log_file(&dir))
+}
 
 /// The longest socket path, in bytes, that every supported platform can bind:
 /// `sun_path` holds 104 bytes on macOS (108 on Linux), terminator included.

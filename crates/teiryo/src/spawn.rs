@@ -3,15 +3,15 @@
 //! The TUI never manages the daemon's lifecycle beyond this: if the socket is
 //! unreachable it spawns `teiryod` detached (tmux's client/server pattern) and
 //! retries the connection. The socket path comes from
-//! [`teiryo_core::paths::socket_path`], the rule the daemon binds by.
+//! [`teiryo_core::paths::socket_path`], the rule the daemon binds by, and the
+//! log the spawned daemon writes to from [`teiryo_core::paths::log_path`].
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use directories::ProjectDirs;
-use teiryo_core::paths::{socket_path, DATA_DIR_NAME};
+use teiryo_core::paths::{log_path, socket_path};
 use tokio::net::UnixStream;
 
 use crate::client::ClientError;
@@ -34,17 +34,6 @@ fn daemon_binary() -> PathBuf {
         Some(sibling) if sibling.is_file() => sibling,
         _ => PathBuf::from("teiryod"),
     }
-}
-
-/// The daemon's log file, `teiryo.log` under [`DATA_DIR_NAME`] in the
-/// platform's data dir (`$XDG_DATA_HOME/teiryo`, or `teiryo-dev` in a debug
-/// build). Must match `teiryod`'s own resolution.
-fn log_path() -> Option<PathBuf> {
-    Some(
-        ProjectDirs::from("", "", DATA_DIR_NAME)?
-            .data_dir()
-            .join("teiryo.log"),
-    )
 }
 
 /// Where the spawned daemon's stdout/stderr go: the log file, so that a
