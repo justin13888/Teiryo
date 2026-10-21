@@ -11,7 +11,7 @@ use crate::error::HandshakeError;
 /// Magic bytes opening every connection.
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"TEIR";
 /// Current wire protocol version (little-endian u16 on the wire).
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 /// Daemon reply: handshake accepted, bincode frames may follow.
 pub const HELLO_ACCEPTED: u8 = 0x00;
 /// Daemon reply: protocol version mismatch, connection will be closed.
@@ -156,7 +156,7 @@ mod tests {
     /// a revert nobody meant.
     #[test]
     fn the_hello_bytes_are_recorded_not_recomputed() {
-        assert_eq!(Hello::current().to_bytes(), [b'T', b'E', b'I', b'R', 6, 0]);
+        assert_eq!(Hello::current().to_bytes(), [b'T', b'E', b'I', b'R', 7, 0]);
     }
 
     #[tokio::test]

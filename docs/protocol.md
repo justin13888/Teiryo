@@ -19,7 +19,7 @@ A hand-decoded, **never-changing** preamble runs before any bincode bytes:
 
 ```rust
 // First 6 bytes on every connection, raw — not bincode, so it can never itself go stale
-struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 6 */ }
+struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 7 */ }
 ```
 
 - Client sends the 6-byte Hello. Daemon replies with **one raw byte**: `0x00` accepted, `0x01` version mismatch — then closes the connection on mismatch without ever attempting to decode a `Request`.
@@ -97,6 +97,7 @@ struct ProviderHealth {
     accounts: Vec<AccountHealth>,        // per-account, not just ids
     consecutive_failures: u32,           // worst across the provider's accounts
     last_error: Option<String>,
+    discovery_error: Option<String>,     // why discovery found no accounts; listed with empty `accounts`
 }
 ```
 
@@ -149,6 +150,8 @@ enum ConfigEdit {
 
 It has to travel on `Status` rather than be derived client-side: the restart anchoring a weekly window is routinely days older than the 48 hours of series a dashboard fetches, and it is inferred from consecutive polls the client never sees individually. `None` means no restart has been observed, in which case the provider's own arithmetic is all there is. Added in protocol v6.
 
+**A provider whose discovery failed is still listed.** Account discovery is a local credential read the daemon makes once at startup; when it fails the provider has no accounts at all, so `Status` is empty and nothing else on the wire says why. `ProviderHealth.discovery_error` carries the adapter's own message (for Claude on macOS, e.g. that no Claude Code login is in the Keychain), on a `ProviderHealth` with empty `accounts`. A client showing an empty dashboard asks `Providers` and reports it, rather than claiming to wait for a daemon it is already talking to. Added in protocol v7.
+
 **`last_poll` vs. `last_success`.** `windows` is served from the latest *successful* poll while `last_poll` is the latest poll of any outcome. After a failure the two diverge, and only `last_success` says how stale the displayed windows are — a client that reports staleness from `last_poll` would claim fresh data it does not have.
 
 **Bounded `History`.** Nothing prunes `quota_snapshot`, so an unbounded `since` could exceed the 1 MiB frame cap. `until` bounds the far end; `max_points` downsamples each window's series independently. The daemon applies `MAX_HISTORY_POINTS` (2 000 per window) even when `max_points` is `None` — see [domain.md](domain.md).
@@ -171,6 +174,7 @@ It has to travel on `Status` rather than be derived client-side: the restart anc
 | Trend chart for the selected window | selection/range/pan change **and every update** | `History { account, window, since, until, max_points }` → `HistoryPage` |
 | Activity / poll log | tab active **and every update** | `RecentPolls { limit }` |
 | Provider/account health | tab active **and every update** | `Providers` |
+| Why there are no accounts | `Status` came back empty | `Providers` → `discovery_error` |
 | Quit | keypress | close connection; daemon persists |
 | Stop the daemon | explicit only | `Shutdown` — never bound to a casual key; gated behind a confirm prompt |
 

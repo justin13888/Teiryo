@@ -49,10 +49,27 @@ pub const ENV_BASE_URL: &str = "TEIRYO_CLAUDE_BASE_URL";
 /// probes the OAuth usage endpoint, and parses headroom percentages.
 pub struct ClaudeAdapter {
     credentials_path: PathBuf,
+    /// Read the macOS Keychain when `credentials_path` does not exist. Only
+    /// for the default path: a path someone named explicitly is the one they
+    /// meant, and silently reading a different store would hide a typo.
+    keychain_fallback: bool,
     base_url: String,
     /// One persistent HTTP client per account — separate accounts must not
     /// share a connection pool; reuse across probes keeps connection fidelity.
     clients: Mutex<HashMap<AccountId, reqwest::Client>>,
+}
+
+/// Where an adapter reads credentials from on a given call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialSource {
+    File,
+    Keychain,
+}
+
+/// Whether the Keychain may stand in for a missing credentials file: on
+/// macOS, and only when no `TEIRYO_CLAUDE_CREDENTIALS` path was given.
+fn keychain_fallback_for(overridden: Option<&std::path::Path>) -> bool {
+    cfg!(target_os = "macos") && overridden.is_none()
 }
 
 impl Default for ClaudeAdapter {
@@ -64,20 +81,48 @@ impl Default for ClaudeAdapter {
 impl ClaudeAdapter {
     /// Adapter with default paths, honoring the `TEIRYO_CLAUDE_*` env
     /// overrides.
+    ///
+    /// On macOS, with no `TEIRYO_CLAUDE_CREDENTIALS` override, credentials
+    /// come from `~/.claude/.credentials.json` when it exists and from the
+    /// login Keychain otherwise — where Claude Code keeps them by default.
     pub fn new() -> Self {
-        let credentials_path = std::env::var_os(ENV_CREDENTIALS_PATH)
-            .map(PathBuf::from)
-            .unwrap_or_else(credentials::default_path);
+        let overridden = std::env::var_os(ENV_CREDENTIALS_PATH).map(PathBuf::from);
+        let keychain_fallback = keychain_fallback_for(overridden.as_deref());
+        let credentials_path = overridden.unwrap_or_else(credentials::default_path);
         let base_url = std::env::var(ENV_BASE_URL).unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
-        Self::with_config(credentials_path, base_url)
+        Self {
+            keychain_fallback,
+            ..Self::with_config(credentials_path, base_url)
+        }
     }
 
-    /// Adapter with explicit credentials path and API base URL.
+    /// Adapter with explicit credentials path and API base URL. Reads that
+    /// file only, never the Keychain.
     pub fn with_config(credentials_path: PathBuf, base_url: String) -> Self {
         Self {
             credentials_path,
+            keychain_fallback: false,
             base_url,
             clients: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Load the current credentials from wherever this adapter reads them.
+    /// Decided per call: a credentials file that appears later wins from then
+    /// on, as it does for Claude Code itself.
+    async fn load_credentials(&self) -> Result<credentials::ClaudeCredentials, AuthError> {
+        match self.credential_source() {
+            CredentialSource::Keychain => credentials::load_keychain().await,
+            CredentialSource::File => credentials::load(&self.credentials_path),
+        }
+    }
+
+    /// Which store [`Self::load_credentials`] reads right now.
+    fn credential_source(&self) -> CredentialSource {
+        if self.keychain_fallback && !self.credentials_path.exists() {
+            CredentialSource::Keychain
+        } else {
+            CredentialSource::File
         }
     }
 
@@ -100,7 +145,7 @@ impl ClaudeAdapter {
 #[async_trait]
 impl teiryo_core::Authenticator for ClaudeAdapter {
     async fn discover_accounts(&self) -> Result<Vec<Account>, AuthError> {
-        credentials::load(&self.credentials_path)?;
+        self.load_credentials().await?;
         Ok(vec![Account {
             id: AccountId::from("claude:default"),
             provider: PROVIDER_ID.to_owned(),
@@ -109,7 +154,7 @@ impl teiryo_core::Authenticator for ClaudeAdapter {
     }
 
     async fn credential_for(&self, _account: &Account) -> Result<Credential, AuthError> {
-        let creds = credentials::load(&self.credentials_path)?;
+        let creds = self.load_credentials().await?;
         if creds.is_expired() {
             return Err(AuthError::Expired(
                 "Claude Code access token is past its expiry; run `claude` to refresh".into(),
@@ -210,6 +255,71 @@ impl ProviderAdapter for ClaudeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VALID: &str =
+        r#"{"claudeAiOauth":{"accessToken":"fake-token-for-test","expiresAt":99999999999999}}"#;
+
+    /// An adapter as `new()` builds it on macOS with no override, pointed at
+    /// `path`, so the fallback is exercised on every platform.
+    fn with_fallback(path: PathBuf) -> ClaudeAdapter {
+        ClaudeAdapter {
+            keychain_fallback: true,
+            ..ClaudeAdapter::with_config(path, String::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_existing_file_is_read_even_with_the_keychain_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(&path, VALID).unwrap();
+        let adapter = with_fallback(path);
+        assert_eq!(adapter.credential_source(), CredentialSource::File);
+        let creds = adapter.load_credentials().await;
+        assert!(
+            matches!(&creds, Ok(c) if c.access_token.expose_secret() == "fake-token-for-test"),
+            "the file's credentials are the ones loaded"
+        );
+    }
+
+    /// Falsifier for the test above: the fallback does select the Keychain
+    /// when the file is missing.
+    #[test]
+    fn a_missing_file_with_the_fallback_selects_the_keychain() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = with_fallback(dir.path().join("missing.json"));
+        assert_eq!(adapter.credential_source(), CredentialSource::Keychain);
+    }
+
+    /// The source is decided per call: a file that appears later wins.
+    #[test]
+    fn a_file_that_appears_later_replaces_the_keychain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        let adapter = with_fallback(path.clone());
+        assert_eq!(adapter.credential_source(), CredentialSource::Keychain);
+        std::fs::write(&path, VALID).unwrap();
+        assert_eq!(adapter.credential_source(), CredentialSource::File);
+    }
+
+    #[tokio::test]
+    async fn with_config_never_falls_back_to_the_keychain() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = ClaudeAdapter::with_config(dir.path().join("missing.json"), String::new());
+        assert_eq!(adapter.credential_source(), CredentialSource::File);
+        assert!(matches!(
+            adapter.load_credentials().await,
+            Err(AuthError::NotLoggedIn(_))
+        ));
+    }
+
+    #[test]
+    fn an_explicit_credentials_path_disables_the_keychain_fallback() {
+        assert!(!keychain_fallback_for(Some(std::path::Path::new(
+            "/explicit/.credentials.json"
+        ))));
+        assert_eq!(keychain_fallback_for(None), cfg!(target_os = "macos"));
+    }
 
     #[test]
     fn render_hint_flags_hard_block() {

@@ -44,6 +44,11 @@ pub async fn run(
             Ok(accounts) => accounts,
             Err(e) => {
                 tracing::warn!(provider, error = %e, "account discovery failed");
+                daemon
+                    .state
+                    .borrow_mut()
+                    .discovery_errors
+                    .insert(provider.clone(), e.to_string());
                 continue;
             }
         };

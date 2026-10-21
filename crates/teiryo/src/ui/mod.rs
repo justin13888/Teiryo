@@ -197,6 +197,7 @@ mod tests {
             }],
             consecutive_failures: 2,
             last_error: Some("token expired".into()),
+            discovery_error: None,
         }];
         app.last_update = Some(Utc::now() - Duration::seconds(4));
         app.config = Some(config_state(None));
@@ -796,6 +797,35 @@ mod tests {
         app.overlay = Some(Overlay::Settings);
         draw(&mut app, 30, 8);
         assert!(rendered(&mut app, 100, 40).contains("waiting for the daemon"));
+    }
+
+    /// Connected, no accounts, and the daemon has said why: the reason is
+    /// what the dashboard shows, not a wait for a daemon already answering.
+    #[test]
+    fn an_empty_dashboard_names_the_failed_discovery() {
+        let mut app = App::new();
+        app.health = vec![ProviderHealth {
+            provider: "claude".into(),
+            accounts: Vec::new(),
+            consecutive_failures: 0,
+            last_error: None,
+            discovery_error: Some("not logged in: no Claude Code login".into()),
+        }];
+        let screen = rendered(&mut app, 140, 30);
+        assert!(
+            screen.contains("claude: not logged in: no Claude Code login"),
+            "{screen}"
+        );
+        assert!(!screen.contains("waiting for the daemon"), "{screen}");
+    }
+
+    /// The falsifier for the test above: with nothing reported yet, the
+    /// dashboard still says it is waiting.
+    #[test]
+    fn an_empty_dashboard_without_a_reason_is_still_waiting() {
+        let mut app = App::new();
+        let screen = rendered(&mut app, 140, 30);
+        assert!(screen.contains("waiting for the daemon"), "{screen}");
     }
 
     /// A one- or two-point series cannot be charted; it must fall back to a
