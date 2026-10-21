@@ -7,7 +7,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
-use teiryo_core::paths::{lock_path, socket_path};
+use teiryo_core::paths::{data_dir, lock_path, log_file, socket_path};
 
 /// Resolved filesystem locations for one daemon run.
 #[derive(Debug, Clone)]
@@ -23,21 +23,33 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// Resolve the socket through [`teiryo_core::paths::socket_path`], which
-    /// the TUI shares, and `teiryo/{teiryo.db,teiryo.log}` and
-    /// `teiryo/config.toml` under the platform's data and config dirs.
-    /// Creates the data/config dirs.
+    /// [`Self::locate`], then create the data and config dirs.
     pub fn resolve() -> io::Result<Self> {
-        let dirs = ProjectDirs::from("", "", "teiryo")
-            .ok_or_else(|| io::Error::other("cannot resolve home directory"))?;
-        let data = dirs.data_dir().to_path_buf();
-        let config_dir = dirs.config_dir().to_path_buf();
-        std::fs::create_dir_all(&data)?;
-        std::fs::create_dir_all(&config_dir)?;
+        let paths = Self::locate()?;
+        for file in [&paths.db, &paths.config] {
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Resolve every path without touching the filesystem. The socket and the
+    /// log come from [`teiryo_core::paths`], which the TUI shares;
+    /// `teiryo.db` sits beside the log in
+    /// [`data_dir`] (`teiryo`, or `teiryo-dev` in a debug build), and
+    /// `teiryo/config.toml` in the config dir, which every build shares.
+    pub fn locate() -> io::Result<Self> {
+        let home = || io::Error::other("cannot resolve home directory");
+        let data = data_dir().ok_or_else(home)?;
+        let config_dir = ProjectDirs::from("", "", "teiryo")
+            .ok_or_else(home)?
+            .config_dir()
+            .to_path_buf();
         Ok(Self {
             socket: socket_path(),
             db: data.join("teiryo.db"),
-            log: data.join("teiryo.log"),
+            log: log_file(&data),
             config: config_dir.join("config.toml"),
         })
     }
@@ -161,6 +173,30 @@ mod tests {
     fn cleanup(path: &Path) {
         std::fs::remove_file(path).ok();
         std::fs::remove_file(lock_path(path)).ok();
+    }
+
+    /// The TUI finds the daemon's socket and log through
+    /// `teiryo_core::paths::{socket_path, log_path}`; the daemon's own
+    /// resolution must land on the same files, or a "never bound" error
+    /// points the user at a log nothing wrote.
+    #[test]
+    fn daemon_paths_agree_with_the_tui() {
+        let paths = Paths::locate().expect("a home directory");
+        assert_eq!(Some(paths.log.clone()), teiryo_core::paths::log_path());
+        assert_eq!(paths.socket, teiryo_core::paths::socket_path());
+        assert_eq!(
+            paths.db.parent(),
+            paths.log.parent(),
+            "the database sits beside the log"
+        );
+        assert!(
+            paths.log.ends_with(
+                Path::new(teiryo_core::paths::DATA_DIR_NAME)
+                    .join(teiryo_core::paths::LOG_FILE_NAME)
+            ),
+            "{}",
+            paths.log.display()
+        );
     }
 
     /// Deliberately a plain `#[test]`: nothing in `bind_socket` may need the

@@ -48,7 +48,7 @@ impl Scratch {
         let base = self.0.join("home/Library/Application Support");
         #[cfg(not(target_os = "macos"))]
         let base = self.0.join("data");
-        base.join("teiryo")
+        base.join(teiryo_core::paths::DATA_DIR_NAME)
     }
 
     /// `teiryod` with an environment holding only the scratch directories.

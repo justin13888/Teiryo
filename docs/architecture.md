@@ -60,6 +60,7 @@ teiryo/                    # workspace root
   - Elsewhere: `$XDG_RUNTIME_DIR/teiryo.sock` when the variable is absolute (a relative one is ignored, per the XDG spec).
   - Both fall back to `/tmp/teiryo-$UID.sock`, also when the candidate is longer than the 103 bytes `sun_path` can hold on macOS.
   - Socket file mode 0600; the lock is the same name with a `.lock` extension, also 0600, opened `O_NOFOLLOW`.
+- **Debug builds are kept apart.** Under `cfg(debug_assertions)` (what `cargo run` and `mise run tui` build) the socket is `teiryo-dev.sock` (fallback `/tmp/teiryo-dev-$UID.sock`, lock `teiryo-dev.lock`) and the database and log live in `teiryo-dev/` instead of `teiryo/`. A daemon spawned from a checkout therefore serves only debug TUIs and writes only its own database, so it can neither capture installed TUIs nor fail their handshake with a bumped protocol, and an installed daemon and a debug one run side by side. `config.toml` stays shared: both read and write `teiryo/config.toml`. The names and the resolvers built on them live in `teiryo_core::paths` (`SOCKET_NAME`, `DATA_DIR_NAME`, `socket_path`, `data_dir`, `log_path`), which both binaries use, so the TUI sends a spawned daemon's output to the log that daemon writes; the release names above are unchanged.
 
 ### Hot reload
 
