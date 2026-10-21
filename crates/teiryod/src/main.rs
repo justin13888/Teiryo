@@ -25,17 +25,31 @@ const PRINT_SOCKET_PATH: Flag = Flag {
     help: "Print the socket path the daemon binds and exit",
 };
 
+/// The log's counterpart to [`PRINT_SOCKET_PATH`]: where the daemon logs
+/// differs by platform, and a script that guesses it points the user at a
+/// file that does not exist.
+const PRINT_LOG_PATH: Flag = Flag {
+    long: "--print-log-path",
+    help: "Print the log file path the daemon writes and exit",
+};
+
 fn main() -> anyhow::Result<()> {
     // Before path resolution and the bind: `-V` must not start a daemon.
     match teiryo_core::version::handle_args_with(
         "teiryod",
         ABOUT,
         &teiryo_core::build_info!(),
-        &[PRINT_SOCKET_PATH],
+        &[PRINT_SOCKET_PATH, PRINT_LOG_PATH],
     ) {
         Action::Run => {}
         Action::Exit(code) => std::process::exit(code),
-        Action::Flag(_) => return print_socket_path(),
+        Action::Flag(long) if long == PRINT_LOG_PATH.long => {
+            // Resolving creates the data directory, so a caller may open the
+            // printed path for appending before the daemon has ever run.
+            let paths = Paths::resolve().context("resolving XDG paths")?;
+            return print_path(&paths.log);
+        }
+        Action::Flag(_) => return print_path(&teiryo_core::paths::socket_path()),
     }
     let paths = Paths::resolve().context("resolving XDG paths")?;
     init_logging(&paths)?;
@@ -101,10 +115,9 @@ fn main() -> anyhow::Result<()> {
     served
 }
 
-/// `--print-socket-path`: the path's raw bytes and a newline, so a script
-/// gets exactly what the daemon binds even where it is not UTF-8.
-fn print_socket_path() -> anyhow::Result<()> {
-    let path = teiryo_core::paths::socket_path();
+/// The `--print-*-path` flags: the path's raw bytes and a newline, so a
+/// script gets exactly what the daemon uses even where it is not UTF-8.
+fn print_path(path: &std::path::Path) -> anyhow::Result<()> {
     let mut out = std::io::stdout().lock();
     out.write_all(path.as_os_str().as_bytes())?;
     out.write_all(b"\n")?;
