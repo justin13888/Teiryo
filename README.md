@@ -33,6 +33,20 @@ Installing is not just copying binaries, because `teiryod` outlives the TUI and 
 
 If a `teiryo` TUI is open while you install, quit and relaunch it. While its daemon is down it keeps reconnecting — after 1 s, then doubling to every 30 s — and each attempt may spawn whichever `teiryod` sits next to it, racing the install. If the daemon it finds speaks another protocol version it stops reconnecting and says so in its header.
 
+To see which build is installed, ask either binary — neither starts a daemon or touches the terminal to answer:
+
+```console
+$ teiryo -V
+teiryo 0.1.0
+commit:   f78c2ce0f940 (2026-10-17T17:52:31+02:00)
+profile:  release
+rustc:    rustc 1.99.1 (58cf8f9c3 2026-10-13)
+built:    2026-10-18T19:55:42Z
+protocol: v6
+```
+
+`commit` carries a `-dirty` suffix when the tree had uncommitted changes, and any fact the build could not establish reads `unknown`. `protocol` is the wire version: a TUI and daemon whose `protocol` lines differ cannot talk to each other, so comparing `teiryo -V` with `teiryod -V` is the quickest check after an upgrade.
+
 To stop the daemon and remove both binaries:
 
 ```bash
