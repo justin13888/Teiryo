@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use directories::ProjectDirs;
-use teiryo_core::paths::socket_path;
+use teiryo_core::paths::{socket_path, DATA_DIR_NAME};
 use tokio::net::UnixStream;
 
 use crate::client::ClientError;
@@ -36,11 +36,12 @@ fn daemon_binary() -> PathBuf {
     }
 }
 
-/// The daemon's log file, `$XDG_DATA_HOME/teiryo/teiryo.log`. Must match
-/// `teiryod`'s own resolution.
+/// The daemon's log file, `teiryo.log` under [`DATA_DIR_NAME`] in the
+/// platform's data dir (`$XDG_DATA_HOME/teiryo`, or `teiryo-dev` in a debug
+/// build). Must match `teiryod`'s own resolution.
 fn log_path() -> Option<PathBuf> {
     Some(
-        ProjectDirs::from("", "", "teiryo")?
+        ProjectDirs::from("", "", DATA_DIR_NAME)?
             .data_dir()
             .join("teiryo.log"),
     )

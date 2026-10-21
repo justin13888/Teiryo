@@ -7,7 +7,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
-use teiryo_core::paths::{lock_path, socket_path};
+use teiryo_core::paths::{lock_path, socket_path, DATA_DIR_NAME};
 
 /// Resolved filesystem locations for one daemon run.
 #[derive(Debug, Clone)]
@@ -24,14 +24,20 @@ pub struct Paths {
 
 impl Paths {
     /// Resolve the socket through [`teiryo_core::paths::socket_path`], which
-    /// the TUI shares, and `teiryo/{teiryo.db,teiryo.log}` and
-    /// `teiryo/config.toml` under the platform's data and config dirs.
-    /// Creates the data/config dirs.
+    /// the TUI shares, `{teiryo.db,teiryo.log}` under
+    /// [`DATA_DIR_NAME`] in the platform's data dir (`teiryo`, or
+    /// `teiryo-dev` in a debug build), and `teiryo/config.toml` in its config
+    /// dir, which every build shares. Creates the data/config dirs.
     pub fn resolve() -> io::Result<Self> {
-        let dirs = ProjectDirs::from("", "", "teiryo")
-            .ok_or_else(|| io::Error::other("cannot resolve home directory"))?;
-        let data = dirs.data_dir().to_path_buf();
-        let config_dir = dirs.config_dir().to_path_buf();
+        let home = || io::Error::other("cannot resolve home directory");
+        let data = ProjectDirs::from("", "", DATA_DIR_NAME)
+            .ok_or_else(home)?
+            .data_dir()
+            .to_path_buf();
+        let config_dir = ProjectDirs::from("", "", "teiryo")
+            .ok_or_else(home)?
+            .config_dir()
+            .to_path_buf();
         std::fs::create_dir_all(&data)?;
         std::fs::create_dir_all(&config_dir)?;
         Ok(Self {
