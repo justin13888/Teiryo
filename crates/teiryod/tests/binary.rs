@@ -2,7 +2,8 @@
 //! directory pointed into a scratch directory, so nothing touches the user's
 //! data, config, or running daemon.
 //!
-//! Only `--print-socket-path` runs on macOS: there the socket lives in the
+//! Only `--print-socket-path` and `--print-log-path` run on macOS: there the
+//! socket lives in the
 //! per-user `confstr` temp dir, which no environment variable redirects, so a
 //! test that binds would share the real daemon's socket and lock. The tests
 //! that bind run where `$XDG_RUNTIME_DIR` isolates the socket.
@@ -40,9 +41,14 @@ impl Scratch {
         self.runtime_dir().join(teiryo_core::paths::SOCKET_NAME)
     }
 
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    /// Where `Paths::resolve` puts the database and log. macOS ignores the
+    /// XDG variables and uses `$HOME/Library/Application Support`.
     fn data_dir(&self) -> PathBuf {
-        self.0.join("data").join("teiryo")
+        #[cfg(target_os = "macos")]
+        let base = self.0.join("home/Library/Application Support");
+        #[cfg(not(target_os = "macos"))]
+        let base = self.0.join("data");
+        base.join("teiryo")
     }
 
     /// `teiryod` with an environment holding only the scratch directories.
@@ -93,6 +99,29 @@ fn print_socket_path_prints_the_resolved_path_and_starts_nothing() {
     for sub in ["home", "run", "data", "config"] {
         assert!(is_empty_dir(&scratch.0.join(sub)), "{sub} was written");
     }
+}
+
+#[test]
+fn print_log_path_prints_the_log_path_and_creates_its_directory() {
+    let scratch = Scratch::new();
+    let out = scratch
+        .command()
+        .arg("--print-log-path")
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "exit status {:?}", out.status);
+
+    let log = scratch.data_dir().join("teiryo.log");
+    let mut line = log.as_os_str().as_bytes().to_vec();
+    line.push(b'\n');
+    assert_eq!(out.stdout, line);
+
+    // The directory exists so a script can append to the log before the
+    // daemon has ever run, but nothing was logged, opened, or bound.
+    assert!(scratch.data_dir().is_dir(), "data dir not created");
+    assert!(is_empty_dir(&scratch.data_dir()), "data dir was written");
+    assert!(is_empty_dir(&scratch.runtime_dir()), "run was written");
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -31,7 +31,7 @@ Both binaries are always installed together, into the same directory. `teiryo` l
 
 Installing is not just copying binaries, because `teiryod` outlives the TUI and the two ship with no protocol compatibility: a daemon left running across an upgrade keeps the socket, and the newly installed TUI exits at the handshake. The task stops the running daemon, starts the newly installed one, and fails loudly if that binary is not the one serving the socket.
 
-If a `teiryo` TUI is open while you install, quit and relaunch it. While its daemon is down it keeps reconnecting — after 1 s, then doubling to every 30 s — and each attempt may spawn whichever `teiryod` sits next to it, racing the install. If the daemon it finds speaks another protocol version it stops reconnecting and says so in its header.
+Quit every `teiryo` TUI before installing or uninstalling: both tasks refuse while one runs. While its daemon is down a TUI keeps reconnecting — after 1 s, then doubling to every 30 s — and each attempt may spawn whichever `teiryod` sits next to it, racing the task. If the daemon it finds speaks another protocol version it stops reconnecting and says so in its header.
 
 To see which build is installed, ask either binary — neither starts a daemon or touches the terminal to answer:
 
