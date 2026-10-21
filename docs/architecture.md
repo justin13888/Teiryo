@@ -3,10 +3,11 @@
 ## Process model
 
 - Two processes: `teiryod` (daemon) and `teiryo` (TUI client). Providers are compiled in — no plugin or dylib loading.
-- **Startup**: `teiryo` spawns `teiryod` on first connect if the socket is unreachable (its own process group, stdout/stderr redirected to the log file, reaped in the background so it never lingers as a zombie) — tmux's client/server pattern. No manual double-fork.
-- **Single instance**: the UDS bind *is* the lock. `EADDRINUSE` → a daemon is already running → exit 0. No separate pidfile/lockfile.
-- **Stale socket**: on bind failure, try connecting as a client first; `ECONNREFUSED` means the socket is stale from a crash → unlink and rebind.
-- **Shutdown**: SIGTERM/SIGINT → flush DB, unlink socket. The TUI quitting never kills the daemon; daemon shutdown is only via the explicit `Shutdown` request or a signal. A shutdown does not stick while another TUI is open: the TUI that sent `Shutdown` quits, but every other one sees its connection drop and respawns the daemon on its next reconnect attempt.
+- **Startup**: `teiryo` spawns `teiryod` on first connect if the socket is unreachable — tmux's client/server pattern. The child calls `setsid()` before exec, so it leads a session of its own with no controlling terminal, and starts in `/`, so it never pins the directory (or the volume) the TUI was launched from. Its stdout/stderr go to the log file, and it is reaped in the background so it never lingers as a zombie. No manual double-fork.
+- **Single instance**: an exclusive, non-blocking `flock` on `teiryo.lock` beside the socket, taken before anything touches the socket and held for the process lifetime. Losing it means another daemon is starting or running → exit 0. The kernel releases it however the holder dies, `kill -9` included, so it can never go stale. The lock file is never unlinked: removing it while held would let a third process lock a fresh inode alongside the holder.
+- **Stale socket**: only the lock holder handles one. On `EADDRINUSE` it connects as a client first: `ECONNREFUSED` means the socket is stale from a crash → unlink and rebind; an answer means a daemon from a build without the lock still serves there → exit 0 and leave it alone.
+- **Signals**: SIGINT, SIGTERM and SIGHUP handlers are installed before the bind, so a signal at any point after it is a clean shutdown rather than a default-action death that leaves the socket behind.
+- **Shutdown**: a signal or the `Shutdown` request → flush DB, unlink socket. The unlink is a drop guard that removes the socket only while its `(dev, ino)` still match what this process bound, so an orphan cannot delete a newer daemon's socket, and the early error paths (opening the database, registering the listener) unlink through the same guard. The TUI quitting never kills the daemon; daemon shutdown is only via the explicit `Shutdown` request or a signal. A shutdown does not stick while another TUI is open: the TUI that sent `Shutdown` quits, but every other one sees its connection drop and respawns the daemon on its next reconnect attempt.
 - **Reconnect**: a TUI that loses the daemon reconnects in a background task, so it keeps drawing and handling keys meanwhile. Attempts back off from 1 s, doubling to a 30 s cap, and each may spawn the daemon once. The handshake is bounded at 15 s, so a daemon that accepts but never answers cannot hang the client. The bound sits above a fresh daemon's worst-case work before it accepts (opening the database, then account discovery, which on macOS may wait up to 5 s on a Keychain read), so a slow first launch waits rather than fails. A daemon that rejects the client's protocol version ends reconnecting for that TUI: retrying would only respawn a daemon that exits against the stale one, so the header says to stop it instead.
 
 ## Crate layout
@@ -52,7 +53,11 @@ teiryo/                    # workspace root
 - XDG resolution via the `directories` crate.
 - `$XDG_CONFIG_HOME/teiryo/config.toml` — per-provider enable/disable, poll interval overrides, and (deferred) `[[account]]` entries for providers that cannot be auto-discovered.
 - `$XDG_DATA_HOME/teiryo/teiryo.db` and `$XDG_DATA_HOME/teiryo/teiryo.log`.
-- `$XDG_RUNTIME_DIR/teiryo.sock`, fallback `/tmp/teiryo-$UID.sock`. Socket file mode 0600.
+- The socket, resolved by `teiryo_core::paths::socket_path()` — the one rule both binaries use, and what `teiryod --print-socket-path` prints:
+  - macOS: `teiryo.sock` in the per-user temporary directory, `confstr(_CS_DARWIN_USER_TEMP_DIR)` (falling back to `$TMPDIR`), which the system creates mode 0700. It does not follow a changed `$TMPDIR`, so every process of the user agrees on it.
+  - Elsewhere: `$XDG_RUNTIME_DIR/teiryo.sock` when the variable is absolute (a relative one is ignored, per the XDG spec).
+  - Both fall back to `/tmp/teiryo-$UID.sock`, also when the candidate is longer than the 103 bytes `sun_path` can hold on macOS.
+  - Socket file mode 0600; the lock is the same name with a `.lock` extension, also 0600, opened `O_NOFOLLOW`.
 
 ### Hot reload
 
@@ -71,6 +76,6 @@ The daemon watches `config.toml` (`notify`, on the containing **directory** — 
 
 ## Logging & errors
 
-- `tracing` → log file (the daemon has no useful stdout once detached).
+- `tracing` → log file, always without ANSI escapes. A second `tracing` layer writes to stderr only when stderr is a terminal (`mise run daemon`). The TUI redirects a spawned daemon's stderr into the same log file, so a stderr layer there would write every line twice, once in color; that redirect is still what catches a panic or anything printed before `tracing` starts.
 - `thiserror` for errors crossing the IPC boundary (`Response::Err(ErrorKind, String)`); `anyhow` for internal daemon glue.
 - Credentials use `secrecy::SecretString`: no `Debug`/`Display` leakage, zeroized on drop. Never derive or hand-write `Debug`/`Display` on anything holding a credential.

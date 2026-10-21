@@ -90,11 +90,9 @@ fi
 
 uid=$(id -u)
 daemon="$daemon_dir/teiryod"
-if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-  sock="$XDG_RUNTIME_DIR/teiryo.sock"
-else
-  sock="/tmp/teiryo-$uid.sock"
-fi
+# Asked of the binary just installed rather than recomputed here, so the task
+# can never disagree with the daemon about where it binds.
+sock=$("$daemon" --print-socket-path)
 
 # An open TUI respawns the daemon within a second of losing it, using whichever
 # build that TUI came from. It races the restart below, and being the older
@@ -160,8 +158,8 @@ fi
 # the old one left behind.
 rm -f "$sock"
 
-# teiryod does not detach itself — the TUI is what normally puts it in its own
-# process group — so the task has to.
+# teiryod does not detach itself — the TUI is what normally starts it in a
+# session of its own — so the task has to.
 if command -v setsid >/dev/null 2>&1; then
   setsid "$daemon" </dev/null >/dev/null 2>&1 &
 else
