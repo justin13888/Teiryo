@@ -7,6 +7,7 @@
 pub mod adapter;
 pub mod domain;
 pub mod error;
+pub mod paths;
 pub mod protocol;
 pub mod rollover;
 pub mod storage;
