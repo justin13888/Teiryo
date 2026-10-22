@@ -19,13 +19,23 @@ A hand-decoded, **never-changing** preamble runs before any bincode bytes:
 
 ```rust
 // First 6 bytes on every connection, raw — not bincode, so it can never itself go stale
-struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 8 */ }
+struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 9 */ }
 ```
 
-- Client sends the 6-byte Hello. Daemon replies with **one raw status byte**: `0x00` accepted, `0x01` version mismatch. After `0x01` the daemon (since v8) sends its own `PROTOCOL_VERSION` as a little-endian `u16`, then closes the connection without ever attempting to decode a `Request`.
+- Client sends the 6-byte Hello, followed (since v9) by its build commit. Daemon replies with **one raw status byte**: `0x00` accepted, `0x01` version mismatch. After `0x00` the daemon (since v9) sends its own build commit, then bincode frames may follow. After `0x01` the daemon (since v8) sends its own `PROTOCOL_VERSION` as a little-endian `u16`, then closes the connection without ever attempting to decode a `Request`.
+- A build commit is the sender's `TEIRYO_COMMIT_HASH` (what `-V` prints on its `commit:` line: a short hash, `-dirty` when the tree had uncommitted changes, or `unknown`), encoded as a little-endian `u16` byte length followed by that many bytes of UTF-8. A sender cuts it to 256 bytes at a character boundary; a receiver refuses a longer length (`HandshakeError::CommitTooLong`) and replaces bytes that are not UTF-8 rather than failing.
+- The daemon reads the client's commit only after the version matched, and the reject reply keeps its v8 layout: a v8 client, which sends no commit, still gets `0x01` and the daemon's version, and still names both versions.
+
+```text
+client → daemon   T E I R | 09 00 | len:u16le | commit (UTF-8)
+daemon → client   00 | len:u16le | commit (UTF-8)            accepted
+daemon → client   01 | version:u16le, then close             rejected (unchanged since v8)
+```
+
+**Build check.** Equal protocol versions are what the connection requires; equal builds are only reported. Two builds match only when their commits are equal and neither ends in `-dirty`; `unknown` never matches either (`teiryo_core::version::builds_match`). On an accepted connection the daemon logs both commits and both protocol versions, at `error!` on a mismatch and at `debug!` on a match, in every build profile. The TUI keeps the mismatch for the command connection it holds and shows it as a dim `· build ≠ daemon (client / daemon)` at the end of the header's connection line. It never refuses the connection over it, and the incompatible and unreachable states, which replace that line, take precedence.
 - On mismatch the TUI names both versions: at startup it prints "the running daemon speaks protocol vX; this client is vY" and exits, and on a reconnect its header shows "daemon speaks protocol vX, this client vY — stop it (`pkill teiryod`) and relaunch teiryo". A daemon older than v8 sends `0x01` alone and closes; the client reads the missing version as "older than v8" and still reports the mismatch. The trailing version is the one addition the never-changing preamble allows: a client that predates it reads only the first byte and closes, so it is unaffected. **No negotiation, no backward compat** in v1: daemon and TUI ship together; the handshake fails loudly on the unclean case (stale daemon left running across an upgrade), it does not support long-term protocol drift.
 - Any wire-protocol change (variant added/reordered/removed, field change) **must** bump `PROTOCOL_VERSION`; see [Versioning policy](#versioning-policy).
-- Two recorded fixtures enforce that pairing rather than trusting it: the six Hello bytes are pinned in `handshake.rs`, and one encoded `WindowView` frame is pinned byte for byte in `codec.rs`. A round-trip test cannot see a wire change — both sides move together — so without them a reorder or a forgotten bump passed silently. When either fails legitimately, bump the version, update this file, and re-record the bytes together. The fingerprint guard below covers the rest of the wire.
+- Two recorded fixtures enforce that pairing rather than trusting it: the six Hello bytes (and, since v9, a whole opening with its commit) are pinned in `handshake.rs`, and one encoded `WindowView` frame is pinned byte for byte in `codec.rs`. A round-trip test cannot see a wire change — both sides move together — so without them a reorder or a forgotten bump passed silently. When either fails legitimately, bump the version, update this file, and re-record the bytes together. The fingerprint guard below covers the rest of the wire.
 
 ## Versioning policy
 

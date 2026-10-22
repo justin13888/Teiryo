@@ -17,6 +17,9 @@ use teiryo_core::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
+/// The build commit these test clients announce.
+const CLIENT_COMMIT: &str = "0123456789ab";
+
 struct StubAdapter;
 
 fn stub_account() -> Account {
@@ -179,9 +182,13 @@ fn full_ipc_roundtrip() {
         let server =
             tokio::task::spawn_local(teiryod::run(listener, storage, adapters, config.clone()));
 
-        // Connect and handshake.
+        // Connect and handshake. The daemon answers with the commit it was
+        // built from, the one its `-V` prints.
         let mut stream = UnixStream::connect(&socket).await.unwrap();
-        client_handshake(&mut stream).await.expect("handshake");
+        let daemon_commit = client_handshake(&mut stream, CLIENT_COMMIT)
+            .await
+            .expect("handshake");
+        assert_eq!(daemon_commit, env!("TEIRYO_COMMIT_HASH"));
         let (mut sink, mut source) = framed(stream).split();
 
         // The startup poll arrives via AwaitUpdate from PollId::zero().
@@ -392,7 +399,9 @@ fn settings_round_trip_and_hot_reload() {
             tokio::task::spawn_local(teiryod::run(listener, storage, adapters, config.clone()));
 
         let mut stream = UnixStream::connect(&socket).await.unwrap();
-        client_handshake(&mut stream).await.expect("handshake");
+        client_handshake(&mut stream, CLIENT_COMMIT)
+            .await
+            .expect("handshake");
         let (mut sink, mut source) = framed(stream).split();
 
         // What the file says, plus the bounds a client needs to stay inside.
@@ -553,21 +562,42 @@ fn version_mismatch_is_rejected_with_0x01_and_the_daemon_version() {
         let _server =
             tokio::task::spawn_local(teiryod::run(listener, storage, adapters, test_config("")));
 
-        let mut stream = UnixStream::connect(&socket).await.unwrap();
-        // Hand-rolled hello with a future protocol version.
-        let mut hello = [0u8; 6];
-        hello[..4].copy_from_slice(&PROTOCOL_MAGIC);
-        hello[4..].copy_from_slice(&999u16.to_le_bytes());
-        stream.write_all(&hello).await.unwrap();
-        let mut reply = [0u8; 3];
-        stream.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply[0], 0x01);
-        // Since v8 the reject names the daemon's own version.
-        assert_eq!(u16::from_le_bytes([reply[1], reply[2]]), PROTOCOL_VERSION);
-        // Daemon closes the connection after rejecting.
-        let mut rest = Vec::new();
-        let n = stream.read_to_end(&mut rest).await.unwrap();
-        assert_eq!(n, 0);
+        // A future client sends a commit after its hello; a v8 client sends
+        // the six bytes alone. Both are rejected the same way, in the layout
+        // a v8 client reads, without the daemon waiting for a commit.
+        for (version, commit) in [(999u16, Some(CLIENT_COMMIT)), (8, None)] {
+            let mut stream = UnixStream::connect(&socket).await.unwrap();
+            let mut hello = Vec::with_capacity(6);
+            hello.extend_from_slice(&PROTOCOL_MAGIC);
+            hello.extend_from_slice(&version.to_le_bytes());
+            if let Some(commit) = commit {
+                hello.extend_from_slice(&teiryo_core::protocol::handshake::encode_commit(commit));
+            }
+            stream.write_all(&hello).await.unwrap();
+            let mut reply = [0u8; 3];
+            stream.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply[0], 0x01, "v{version}");
+            // Since v8 the reject names the daemon's own version.
+            assert_eq!(
+                u16::from_le_bytes([reply[1], reply[2]]),
+                PROTOCOL_VERSION,
+                "v{version}"
+            );
+            // Daemon closes the connection after rejecting, sending nothing
+            // more. Where it left the commit unread, Linux reports that close
+            // as a reset rather than an end of stream; the reply above was
+            // already delivered either way.
+            let mut rest = Vec::new();
+            match stream.read_to_end(&mut rest).await {
+                Ok(n) => assert_eq!(n, 0, "v{version}"),
+                Err(e) => assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset,
+                    "v{version}: {e}"
+                ),
+            }
+            assert!(rest.is_empty(), "v{version}: {rest:?}");
+        }
 
         std::fs::remove_file(&socket).ok();
     });
@@ -661,7 +691,9 @@ fn a_silent_restart_reaches_the_client_as_an_observed_start() {
             tokio::task::spawn_local(teiryod::run(listener, storage, adapters, config.clone()));
 
         let mut stream = UnixStream::connect(&socket).await.unwrap();
-        client_handshake(&mut stream).await.expect("handshake");
+        client_handshake(&mut stream, CLIENT_COMMIT)
+            .await
+            .expect("handshake");
         let (mut sink, mut source) = framed(stream).split();
 
         send_request(
@@ -827,7 +859,9 @@ fn an_early_rollover_reaches_the_client_with_its_history() {
             tokio::task::spawn_local(teiryod::run(listener, storage, adapters, config.clone()));
 
         let mut stream = UnixStream::connect(&socket).await.unwrap();
-        client_handshake(&mut stream).await.expect("handshake");
+        client_handshake(&mut stream, CLIENT_COMMIT)
+            .await
+            .expect("handshake");
         let (mut sink, mut source) = framed(stream).split();
 
         // Poll 1 — the startup poll, which has nothing to compare against.
@@ -1048,7 +1082,9 @@ fn an_unusable_credential_is_reported_with_no_countdown_to_offer() {
             tokio::task::spawn_local(teiryod::run(listener, storage, adapters, config.clone()));
 
         let mut stream = UnixStream::connect(&socket).await.unwrap();
-        client_handshake(&mut stream).await.expect("handshake");
+        client_handshake(&mut stream, CLIENT_COMMIT)
+            .await
+            .expect("handshake");
         let (mut sink, mut source) = framed(stream).split();
 
         send_request(
@@ -1189,7 +1225,9 @@ fn a_failed_discovery_is_reported_on_providers() {
             tokio::task::spawn_local(teiryod::run(listener, storage, adapters, config.clone()));
 
         let mut stream = UnixStream::connect(&socket).await.unwrap();
-        client_handshake(&mut stream).await.expect("handshake");
+        client_handshake(&mut stream, CLIENT_COMMIT)
+            .await
+            .expect("handshake");
         let (mut sink, mut source) = framed(stream).split();
 
         send_request(
@@ -1308,7 +1346,9 @@ fn a_login_after_startup_is_discovered_and_polled() {
             tokio::task::spawn_local(teiryod::run(listener, storage, adapters, config.clone()));
 
         let mut stream = UnixStream::connect(&socket).await.unwrap();
-        client_handshake(&mut stream).await.expect("handshake");
+        client_handshake(&mut stream, CLIENT_COMMIT)
+            .await
+            .expect("handshake");
         let (mut sink, mut source) = framed(stream).split();
 
         // Before the login: no account, and the reason is on the wire.

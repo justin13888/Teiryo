@@ -24,6 +24,10 @@ pub enum HandshakeError {
         /// sending one: it predates v8.
         daemon: Option<u16>,
     },
+    /// Peer announced a build commit longer than
+    /// [`MAX_COMMIT_LEN`](crate::protocol::handshake::MAX_COMMIT_LEN).
+    #[error("handshake build commit of {0} bytes exceeds the limit")]
+    CommitTooLong(u16),
     /// Daemon replied with an unknown code.
     #[error("unexpected handshake reply {0:#04x}")]
     UnexpectedReply(u8),
