@@ -24,8 +24,30 @@ struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-end
 
 - Client sends the 6-byte Hello. Daemon replies with **one raw status byte**: `0x00` accepted, `0x01` version mismatch. After `0x01` the daemon (since v8) sends its own `PROTOCOL_VERSION` as a little-endian `u16`, then closes the connection without ever attempting to decode a `Request`.
 - On mismatch the TUI names both versions: at startup it prints "the running daemon speaks protocol vX; this client is vY" and exits, and on a reconnect its header shows "daemon speaks protocol vX, this client vY — stop it (`pkill teiryod`) and relaunch teiryo". A daemon older than v8 sends `0x01` alone and closes; the client reads the missing version as "older than v8" and still reports the mismatch. The trailing version is the one addition the never-changing preamble allows: a client that predates it reads only the first byte and closes, so it is unaffected. **No negotiation, no backward compat** in v1: daemon and TUI ship together; the handshake fails loudly on the unclean case (stale daemon left running across an upgrade), it does not support long-term protocol drift.
-- Any wire-protocol change (variant added/reordered/removed, field change) **must** bump `PROTOCOL_VERSION`.
-- Two recorded fixtures enforce that pairing rather than trusting it: the six Hello bytes are pinned in `handshake.rs`, and one encoded `WindowView` frame is pinned byte for byte in `codec.rs`. A round-trip test cannot see a wire change — both sides move together — so without them a rename, a reorder, or a forgotten bump all passed silently. When either fails legitimately, bump the version, update this file, and re-record the bytes together.
+- Any wire-protocol change (variant added/reordered/removed, field change) **must** bump `PROTOCOL_VERSION`; see [Versioning policy](#versioning-policy).
+- Two recorded fixtures enforce that pairing rather than trusting it: the six Hello bytes are pinned in `handshake.rs`, and one encoded `WindowView` frame is pinned byte for byte in `codec.rs`. A round-trip test cannot see a wire change — both sides move together — so without them a rename, a reorder, or a forgotten bump all passed silently. When either fails legitimately, bump the version, update this file, and re-record the bytes together. The fingerprint guard below covers the rest of the wire.
+
+## Versioning policy
+
+`PROTOCOL_VERSION` is a single integer, and client and daemon must hold **exactly** the same one. There is no negotiation and no compatibility window: a daemon accepts its own version and rejects every other.
+
+**Any change to the bytes on the wire bumps `PROTOCOL_VERSION` by 1.** That covers:
+
+- the handshake: the Hello, the accept and reject replies, and anything added after them;
+- framing: the length prefix's width, byte order, and `MAX_FRAME_LEN`;
+- `wire.rs` and every type it carries (`teiryo-core`'s domain, adapter, error, and rollover types included): a variant added, removed, or reordered, and a field added, removed, reordered, or changed in type or representation.
+
+Renaming a field or variant changes nothing on the wire (bincode is positional) and needs no bump.
+
+**The bump guard.** `the_wire_format_is_pinned_to_the_protocol_version` in `crates/teiryo-core/src/protocol/mod.rs` encodes one canonical value of every variant of `Request`, `Response`, and every enum nested in them, plus the Hello, the accept and reject replies the real `server_handshake` sends, and one frame's length prefix. It hashes those encodings into a fingerprint and asserts that `(PROTOCOL_VERSION, fingerprint)` equals the pinned `WIRE_FINGERPRINT`. Each enum's canonical values are checked against the variants serde reports the enum declares, so an appended variant — which leaves every existing encoding unchanged but still breaks an older peer that receives it — fails the guard too.
+
+When it fails:
+
+1. Bump `PROTOCOL_VERSION` in `handshake.rs` by 1.
+2. Update this file, and re-record the golden Hello bytes in `handshake.rs` (and the `WindowView` frame in `codec.rs` if it moved).
+3. Rerun the test, and repin `WIRE_FINGERPRINT` to the pair its failure prints. Repinning the hash without bumping the version is never the fix; bumping the version without repinning fails as well, so the two only move together.
+
+What the guard cannot see: a change that leaves the canonical values' bytes identical. bincode's integers are variable-length, so widening a field's type (a `u32` to a `u64`) encodes the same small value the same way. Such a change still bumps the version under this policy; the guard only makes a forgotten bump unlikely, not impossible.
 
 ## Requests & responses
 
