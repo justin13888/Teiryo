@@ -114,6 +114,15 @@ fn connection_line(app: &App, now: DateTime<Utc>) -> Line<'static> {
             theme::dim(),
         ));
     }
+    // Last and dim: a diagnostic for whoever built the binaries, never a
+    // warning. It only exists on a live connection, so it can never sit in
+    // place of the incompatible or unreachable text above.
+    if let Some(builds) = &app.build_mismatch {
+        spans.push(Span::styled(
+            format!("  · build ≠ daemon ({builds})"),
+            theme::dim(),
+        ));
+    }
     Line::from(spans)
 }
 
@@ -682,5 +691,41 @@ mod tests {
                 assert!(drawn <= width, "drew {drawn} cells into {width}");
             }
         }
+    }
+
+    fn text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// A build mismatch is the last thing on a live line, and dim.
+    #[test]
+    fn a_build_mismatch_is_a_dim_marker_on_the_live_line() {
+        let mut app = App::new();
+        assert!(!text(&connection_line(&app, Utc::now())).contains("build"));
+
+        app.build_mismatch = Some("abc123-dirty / def456".into());
+        let line = connection_line(&app, Utc::now());
+        let last = line.spans.last().expect("a live line has spans");
+        assert_eq!(last.content, "  · build ≠ daemon (abc123-dirty / def456)");
+        assert_eq!(last.style, theme::dim());
+        assert!(text(&line).starts_with("● live"), "{}", text(&line));
+    }
+
+    /// The marker never takes the place of the incompatible or unreachable
+    /// text: those lines are the whole line, in their own colour.
+    #[test]
+    fn a_build_mismatch_never_overrides_the_warnings() {
+        let mut app = App::new();
+        app.build_mismatch = Some("abc123-dirty / def456".into());
+
+        app.disconnected = true;
+        let line = text(&connection_line(&app, Utc::now()));
+        assert!(line.contains("daemon unreachable"), "{line}");
+        assert!(!line.contains("build"), "{line}");
+
+        app.incompatible = Some("daemon speaks protocol v10".into());
+        let line = text(&connection_line(&app, Utc::now()));
+        assert!(line.contains("daemon speaks protocol v10"), "{line}");
+        assert!(!line.contains("build"), "{line}");
     }
 }
