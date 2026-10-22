@@ -115,18 +115,31 @@ fn start(mut cmd: Command) -> io::Result<SshStream> {
     })
 }
 
-/// Read `stderr` to its end, keeping only its last non-blank line. Draining
-/// it for the child's whole life also keeps ssh from blocking on a full pipe.
+/// Read `stderr` to its end, keeping only its last non-blank line that is not
+/// a usage error's closing hint. Draining it for the child's whole life also
+/// keeps ssh from blocking on a full pipe.
 async fn last_line(stderr: ChildStderr) -> Option<String> {
     let mut lines = BufReader::new(stderr).lines();
     let mut last = None;
     while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim();
-        if !line.is_empty() {
+        if !line.is_empty() && !is_usage_hint(line) {
             last = Some(line.to_owned());
         }
     }
     last
+}
+
+/// The line a usage error ends with (`For more information, try '--help'.`),
+/// which says nothing about what went wrong: the line before it does.
+fn is_usage_hint(line: &str) -> bool {
+    line.starts_with("For more information, try")
+}
+
+/// Whether ssh's last word is a remote `teiryod` refusing the `bridge`
+/// command: an install that predates it, which no retry can fix.
+pub fn lacks_bridge(why: &str) -> bool {
+    why.contains("unexpected argument 'bridge'")
 }
 
 /// A running ssh child, read and written through its stdout and stdin.
@@ -262,6 +275,22 @@ mod tests {
             stream.failure(Duration::from_secs(5)).await.as_deref(),
             Some("ssh: Could not resolve hostname box: Name or service not known")
         );
+    }
+
+    /// A remote teiryod without `bridge` ends its usage error with a hint;
+    /// the line kept is the one naming `bridge`, which marks the old install.
+    #[tokio::test]
+    async fn a_remote_usage_error_reports_the_line_naming_bridge() {
+        let mut stream = fake(
+            "printf \"teiryod: unexpected argument 'bridge'\\n\\n\
+             For more information, try '--help'.\\n\" >&2; exit 2",
+        );
+        let failure = stream.failure(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(failure, "teiryod: unexpected argument 'bridge'");
+        assert!(lacks_bridge(&failure));
+        assert!(!lacks_bridge(
+            "ssh: connect to host box port 22: Connection refused"
+        ));
     }
 
     #[tokio::test]

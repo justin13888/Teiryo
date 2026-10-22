@@ -19,7 +19,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use teiryo_core::protocol::codec::{decode_frame, encode_frame, framed};
 use teiryo_core::protocol::handshake::{client_handshake, PROTOCOL_VERSION};
-use teiryo_core::protocol::ssh::SshTarget;
+use teiryo_core::protocol::ssh::{lacks_bridge, SshTarget};
 use teiryo_core::protocol::transport::{BoxedTransport, Transport};
 use teiryo_core::{
     AccountStatus, ConfigState, HandshakeError, PollEvent, PollId, Request, Response, WireError,
@@ -89,6 +89,21 @@ pub enum ClientError {
     Wire(WireError),
     /// The daemon accepted the connection but never answered the handshake.
     HandshakeTimeout(Duration),
+    /// ssh was still running when the handshake ran out of time, so nothing
+    /// shows the remote daemon was ever reached: the network, ssh, the
+    /// bridge, or the remote daemon may be the one not answering.
+    SshTimeout {
+        /// The `--ssh` host.
+        host: String,
+        /// The handshake's limit.
+        limit: Duration,
+    },
+    /// The remote `teiryod` has no `bridge` command: it predates `--ssh`,
+    /// and only installing a matching one there fixes it.
+    NoBridge {
+        /// The `--ssh` host.
+        host: String,
+    },
     /// ssh could not be run, or ended before the handshake completed: the
     /// host, and ssh's (or the remote bridge's) last word on why.
     Ssh {
@@ -116,6 +131,17 @@ impl std::fmt::Display for ClientError {
             ClientError::Ssh { host, why } => {
                 write!(f, "cannot reach the daemon on {host} over ssh: {why}")
             }
+            ClientError::SshTimeout { host, limit } => write!(
+                f,
+                "no handshake reply from {host} over ssh within {}s: ssh is still running, \
+                 so the network, ssh, the remote bridge, or the remote daemon is not answering",
+                limit.as_secs()
+            ),
+            ClientError::NoBridge { host } => write!(
+                f,
+                "the teiryod on {host} has no `bridge` command, so it is older than this \
+                 client — install the matching teiryod there and relaunch teiryo"
+            ),
             ClientError::Closed => f.write_str("daemon closed the connection"),
         }
     }
@@ -177,6 +203,16 @@ pub fn version_mismatch_message(daemon: Option<u16>, target: &Target) -> String 
     }
 }
 
+/// What the user is told when `err` is one no reconnect can fix: a daemon
+/// of another protocol version, or a remote install too old to bridge.
+/// `None` for a failure worth retrying.
+fn incompatible_message(err: &ClientError, target: &Target) -> Option<String> {
+    match err {
+        ClientError::NoBridge { .. } => Some(err.to_string()),
+        _ => version_mismatch(err).map(|daemon| version_mismatch_message(daemon, target)),
+    }
+}
+
 /// The commit this client was built from, as `-V` prints it.
 pub const CLIENT_COMMIT: &str = env!("TEIRYO_COMMIT_HASH");
 
@@ -226,8 +262,17 @@ impl Client {
             }),
             Err(e) if version_mismatch(&e).is_some() => Err(e),
             Err(e) => match stream.failure(SSH_EXIT_WAIT).await {
+                Some(why) if lacks_bridge(&why) => Err(ClientError::NoBridge {
+                    host: ssh.host.clone(),
+                }),
                 Some(why) => Err(failed(why)),
-                None => Err(e),
+                None => match e {
+                    ClientError::HandshakeTimeout(limit) => Err(ClientError::SshTimeout {
+                        host: ssh.host.clone(),
+                        limit,
+                    }),
+                    e => Err(e),
+                },
             },
         }
     }
@@ -283,8 +328,9 @@ pub enum NetEvent {
     Reconnected(Box<Client>),
     /// A background reconnect attempt failed; another follows after backoff.
     ReconnectFailed(String),
-    /// The daemon now on the socket speaks another protocol version.
-    /// Reconnecting has stopped: only the user can replace that daemon.
+    /// The daemon now on the socket speaks another protocol version, or the
+    /// remote install has no `bridge`. Reconnecting has stopped: only the
+    /// user can replace that daemon.
     Incompatible(String),
 }
 
@@ -301,7 +347,8 @@ pub fn reconnect_delay(attempt: u32) -> Duration {
 
 /// Reconnect in the background, so the event loop keeps drawing and handling
 /// keys while the daemon is down. Reports through `tx` and ends on success,
-/// on a version mismatch, or when the TUI is gone. A fresh task starts the
+/// on a version mismatch or a remote install without `bridge`, or when the
+/// TUI is gone. A fresh task starts the
 /// backoff over, so a success resets it. A remote target reruns ssh on each
 /// attempt.
 pub fn spawn_reconnect(target: Target, tx: mpsc::UnboundedSender<NetEvent>) -> JoinHandle<()> {
@@ -333,10 +380,8 @@ async fn reconnect_loop<F, Fut>(
                 return;
             }
             Err(e) => {
-                if let Some(daemon) = version_mismatch(&e) {
-                    let _ = tx.send(NetEvent::Incompatible(version_mismatch_message(
-                        daemon, &target,
-                    )));
+                if let Some(message) = incompatible_message(&e, &target) {
+                    let _ = tx.send(NetEvent::Incompatible(message));
                     return;
                 }
                 if tx.send(NetEvent::ReconnectFailed(e.to_string())).is_err() {
@@ -632,6 +677,47 @@ mod tests {
              ssh: connect to host box port 22: Connection refused"
         );
         assert_eq!(version_mismatch(&err), None, "an ssh failure is retried");
+    }
+
+    /// A remote teiryod too old to have `bridge` is named as such, and the
+    /// reconnect loop stops on it as it does on a mismatch: no retry fixes it.
+    #[tokio::test]
+    async fn a_remote_install_without_bridge_is_named_and_not_retried() {
+        let target = fake_ssh_target(
+            "printf \"teiryod: unexpected argument 'bridge'\\n\\n\
+             For more information, try '--help'.\\n\" >&2; exit 2",
+        );
+        let err = Client::connect(&target).await.unwrap_err();
+        assert!(
+            matches!(&err, ClientError::NoBridge { host } if host == "box"),
+            "{err:?}"
+        );
+        let message = incompatible_message(&err, &target).expect("not retried");
+        assert!(message.contains("has no `bridge` command"), "{message}");
+        assert!(
+            message.contains("install the matching teiryod"),
+            "{message}"
+        );
+    }
+
+    /// ssh still running when the handshake times out says nothing about
+    /// the remote daemon, so the error does not claim it was reached.
+    #[tokio::test]
+    async fn a_running_ssh_that_never_answers_is_not_blamed_on_the_daemon() {
+        let Target::Ssh(ssh) = fake_ssh_target("exec sleep 30") else {
+            unreachable!()
+        };
+        let err = Client::connect_ssh(&ssh, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ClientError::SshTimeout { host, .. } if host == "box"),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(!message.contains("accepted the connection"), "{message}");
+        assert!(message.contains("ssh is still running"), "{message}");
+        assert_eq!(incompatible_message(&err, &Target::Ssh(ssh)), None);
     }
 
     /// The falsifier for the test above: a remote daemon's reject is a
