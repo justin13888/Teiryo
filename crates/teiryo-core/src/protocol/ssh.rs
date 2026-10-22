@@ -116,24 +116,25 @@ fn start(mut cmd: Command) -> io::Result<SshStream> {
 }
 
 /// Read `stderr` to its end, keeping only its last non-blank line that is not
-/// a usage error's closing hint. Draining it for the child's whole life also
+/// a usage error's boilerplate. Draining it for the child's whole life also
 /// keeps ssh from blocking on a full pipe.
 async fn last_line(stderr: ChildStderr) -> Option<String> {
     let mut lines = BufReader::new(stderr).lines();
     let mut last = None;
     while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim();
-        if !line.is_empty() && !is_usage_hint(line) {
+        if !line.is_empty() && !is_usage_boilerplate(line) {
             last = Some(line.to_owned());
         }
     }
     last
 }
 
-/// The line a usage error ends with (`For more information, try '--help'.`),
-/// which says nothing about what went wrong: the line before it does.
-fn is_usage_hint(line: &str) -> bool {
-    line.starts_with("For more information, try")
+/// The lines a usage error ([`crate::version::usage_error`]) closes with -
+/// `Usage: NAME [OPTIONS]` and `For more information, try '--help'.` - which
+/// say nothing about what went wrong: the line before them does.
+fn is_usage_boilerplate(line: &str) -> bool {
+    line.starts_with("Usage: ") || line.starts_with("For more information, try")
 }
 
 /// Whether ssh's last word is a remote `teiryod` refusing the `bridge`
@@ -245,6 +246,11 @@ mod tests {
         assert!(SshTarget::new("box".into(), None, Some(String::new())).is_err());
     }
 
+    /// `text` as one single-quoted shell word.
+    fn sh_quote(text: &str) -> String {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+
     /// A fake ssh: a shell running `script`, with stdio piped as ssh's is.
     fn fake(script: &str) -> SshStream {
         let mut cmd = Command::new("/bin/sh");
@@ -277,14 +283,15 @@ mod tests {
         );
     }
 
-    /// A remote teiryod without `bridge` ends its usage error with a hint;
-    /// the line kept is the one naming `bridge`, which marks the old install.
+    /// A remote teiryod without `bridge` ends its usage error with a usage
+    /// line and a hint; the line kept is the one naming `bridge`, which marks
+    /// the old install.
     #[tokio::test]
     async fn a_remote_usage_error_reports_the_line_naming_bridge() {
-        let mut stream = fake(
-            "printf \"teiryod: unexpected argument 'bridge'\\n\\n\
-             For more information, try '--help'.\\n\" >&2; exit 2",
-        );
+        let mut stream = fake(&format!(
+            "printf '%s\\n' {} >&2; exit 2",
+            sh_quote(&crate::version::usage_error("teiryod", "bridge"))
+        ));
         let failure = stream.failure(Duration::from_secs(5)).await.unwrap();
         assert_eq!(failure, "teiryod: unexpected argument 'bridge'");
         assert!(lacks_bridge(&failure));
