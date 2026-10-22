@@ -1,6 +1,7 @@
 //! Daemon internals, exposed as a library so integration tests can drive the
 //! server without exec'ing the binary. `main.rs` is a thin wrapper.
 
+pub mod bridge;
 pub mod config;
 pub mod paths;
 pub mod scheduler;

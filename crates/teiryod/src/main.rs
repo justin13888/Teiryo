@@ -22,6 +22,7 @@ const ABOUT: &str = "Teiryo daemon: polls LLM subscription quotas and serves the
 /// the resolution rule.
 const PRINT_SOCKET_PATH: Flag = Flag {
     long: "--print-socket-path",
+    value: None,
     help: "Print the socket path the daemon binds and exit",
 };
 
@@ -30,7 +31,16 @@ const PRINT_SOCKET_PATH: Flag = Flag {
 /// file that does not exist.
 const PRINT_LOG_PATH: Flag = Flag {
     long: "--print-log-path",
+    value: None,
     help: "Print the log file path the daemon writes and exit",
+};
+
+/// What `teiryo --ssh HOST` runs on HOST (see [`teiryod::bridge`]).
+const BRIDGE: Flag = Flag {
+    long: "bridge",
+    value: None,
+    help: "Relay stdin/stdout to the daemon's socket, starting the daemon if \
+           needed (what `teiryo --ssh` runs on the remote host)",
 };
 
 fn main() -> anyhow::Result<()> {
@@ -39,17 +49,22 @@ fn main() -> anyhow::Result<()> {
         "teiryod",
         ABOUT,
         &teiryo_core::build_info!(),
-        &[PRINT_SOCKET_PATH, PRINT_LOG_PATH],
+        &[BRIDGE, PRINT_SOCKET_PATH, PRINT_LOG_PATH],
     ) {
         Action::Run => {}
         Action::Exit(code) => std::process::exit(code),
-        Action::Flag(long) if long == PRINT_LOG_PATH.long => {
-            // Resolving creates the data directory, so a caller may open the
-            // printed path for appending before the daemon has ever run.
-            let paths = Paths::resolve().context("resolving XDG paths")?;
-            return print_path(&paths.log);
-        }
-        Action::Flag(_) => return print_path(&teiryo_core::paths::socket_path()),
+        // The first one given wins.
+        Action::Flags(given) => match given[0].long {
+            long if long == BRIDGE.long => bridge(),
+            long if long == PRINT_LOG_PATH.long => {
+                // Resolving creates the data directory, so a caller may open
+                // the printed path for appending before the daemon has ever
+                // run.
+                let paths = Paths::resolve().context("resolving XDG paths")?;
+                return print_path(&paths.log);
+            }
+            _ => return print_path(&teiryo_core::paths::socket_path()),
+        },
     }
     let paths = Paths::resolve().context("resolving XDG paths")?;
     init_logging(&paths)?;
@@ -113,6 +128,47 @@ fn main() -> anyhow::Result<()> {
         Err(e) => tracing::error!(error = %e, "teiryod stopped on error"),
     }
     served
+}
+
+/// `teiryod bridge`: connect to this host's daemon (spawning this very binary
+/// as the daemon when nothing listens) and relay stdio to it. Stdout is the
+/// client's stream, so nothing but relayed bytes may reach it; errors go to
+/// stderr, which ssh carries back for the client to show.
+fn bridge() -> ! {
+    use teiryo_core::protocol::transport::{connect_or_spawn, SpawnError};
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("teiryod bridge: building the runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    let result = runtime.block_on(async {
+        let binary = std::env::current_exe()
+            .map_err(|e| format!("cannot locate this executable to start the daemon: {e}"))?;
+        let socket = connect_or_spawn(&binary).await.map_err(|e| match e {
+            SpawnError::Launch(e) => format!("cannot start {}: {e}", binary.display()),
+            SpawnError::NeverBound(message) => message,
+        })?;
+        teiryod::bridge::relay(tokio::io::stdin(), tokio::io::stdout(), socket)
+            .await
+            .map_err(|e| format!("relay failed: {e}"))
+    });
+    // tokio reads stdin on a blocking thread that cannot be cancelled, and an
+    // orderly shutdown would wait for it: the bridge would outlive the daemon's
+    // side until the client wrote again.
+    runtime.shutdown_background();
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(message) => {
+            eprintln!("teiryod bridge: {message}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// The `--print-*-path` flags: the path's raw bytes and a newline, so a

@@ -13,7 +13,6 @@ bytes.workspace = true
 chrono.workspace = true
 crossterm = { workspace = true, features = ["event-stream"] }
 futures.workspace = true
-libc = "0.2"
 ratatui.workspace = true
 # Column budgets are in terminal cells, and a cell is not a `char`: CJK and
 # emoji are two cells wide, combining marks are zero. ratatui charges each span
