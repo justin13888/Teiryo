@@ -300,8 +300,6 @@ mod binding {
         /// host, and runs the remote command through a shell as sshd would,
         /// in the scratch environment.
         fn fake_ssh(scratch: &Scratch) -> PathBuf {
-            use std::os::unix::fs::PermissionsExt;
-
             let path = scratch.0.join("fake-ssh");
             let script = format!(
                 "#!/bin/sh\n\
@@ -314,9 +312,32 @@ mod binding {
                 data = scratch.0.join("data").display(),
                 config = scratch.0.join("config").display(),
             );
-            std::fs::write(&path, script).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_executable(&path, &script);
             path
+        }
+
+        /// Write `contents` to a new executable at `path` through a child
+        /// shell, so this process never holds the file open for writing. A
+        /// parallel test that forks while it did would carry that descriptor
+        /// into its child until the child execs, and running the file
+        /// meanwhile fails with `ETXTBSY` ("Text file busy").
+        fn write_executable(path: &Path, contents: &str) {
+            use std::io::Write;
+
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+                .arg(path)
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(contents.as_bytes())
+                .unwrap();
+            let status = child.wait().unwrap();
+            assert!(status.success(), "writing {}: {status:?}", path.display());
         }
 
         /// The client's ssh transport, over a fake ssh that runs `teiryod
