@@ -744,7 +744,10 @@ mod tests {
     fn incompatible_daemon_replaces_the_reconnecting_notice() {
         let mut app = populated();
         app.disconnected = true;
-        app.incompatible = Some(crate::client::version_mismatch_message(Some(9)));
+        app.incompatible = Some(crate::client::version_mismatch_message(
+            Some(9),
+            &crate::client::Target::Local,
+        ));
         let screen = rendered(&mut app, 200, 40);
         assert!(screen.contains("pkill teiryod"), "{screen}");
         assert!(!screen.contains("reconnecting"), "{screen}");

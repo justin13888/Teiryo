@@ -4,23 +4,53 @@
 //! The TUI uses two connections: one for interactive requests (never blocked
 //! longer than a normal round-trip) and one dedicated to the long-poll loop,
 //! which may legitimately sit idle for `AWAIT_TIMEOUT_MS` at a time.
+//!
+//! Each connection reaches the daemon one of two ways ([`Target`]): this
+//! host's socket, or an ssh child running `teiryod bridge` on another host.
+//! The handshake and the frames are the same over both.
 
 use std::future::Future;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use teiryo_core::protocol::codec::{decode_frame, encode_frame, framed};
 use teiryo_core::protocol::handshake::{client_handshake, PROTOCOL_VERSION};
+use teiryo_core::protocol::ssh::SshTarget;
+use teiryo_core::protocol::transport::{BoxedTransport, Transport};
 use teiryo_core::{
     AccountStatus, ConfigState, HandshakeError, PollEvent, PollId, Request, Response, WireError,
 };
 
 use crate::spawn::connect_or_spawn;
+
+/// Where the daemon is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// This host's daemon, spawned on demand.
+    Local,
+    /// A daemon on another host, reached by running `teiryod bridge` there
+    /// over ssh, once per connection.
+    Ssh(SshTarget),
+}
+
+impl Target {
+    /// The remote host, for the header; `None` for the local daemon.
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            Target::Local => None,
+            Target::Ssh(ssh) => Some(&ssh.host),
+        }
+    }
+}
+
+/// How long an ssh that ended the stream before the handshake completed has
+/// to exit and close its stderr, before its failure is reported as the
+/// handshake's own error instead of ssh's last word.
+const SSH_EXIT_WAIT: Duration = Duration::from_secs(2);
 
 /// How long the daemon may hold one `AwaitUpdate` open.
 pub const AWAIT_TIMEOUT_MS: u32 = 25_000;
@@ -59,6 +89,14 @@ pub enum ClientError {
     Wire(WireError),
     /// The daemon accepted the connection but never answered the handshake.
     HandshakeTimeout(Duration),
+    /// ssh could not be run, or ended before the handshake completed: the
+    /// host, and ssh's (or the remote bridge's) last word on why.
+    Ssh {
+        /// The `--ssh` host.
+        host: String,
+        /// The reason, usually ssh's last stderr line.
+        why: String,
+    },
     /// The daemon closed the connection.
     Closed,
 }
@@ -75,6 +113,9 @@ impl std::fmt::Display for ClientError {
                 "the daemon accepted the connection but did not answer the handshake within {}s",
                 limit.as_secs()
             ),
+            ClientError::Ssh { host, why } => {
+                write!(f, "cannot reach the daemon on {host} over ssh: {why}")
+            }
             ClientError::Closed => f.write_str("daemon closed the connection"),
         }
     }
@@ -119,13 +160,21 @@ pub fn daemon_version_label(daemon: Option<u16>) -> String {
 
 /// What the user is told once a reconnect finds a daemon of another protocol
 /// version. Retrying cannot fix it — the stale daemon keeps the socket — so it
-/// stays on screen until the user acts.
-pub fn version_mismatch_message(daemon: Option<u16>) -> String {
-    format!(
-        "daemon speaks protocol {}, this client v{PROTOCOL_VERSION} — \
-         stop it (`pkill teiryod`) and relaunch teiryo",
-        daemon_version_label(daemon)
-    )
+/// stays on screen until the user acts. A remote one may also be a remote
+/// install of another version, which only reinstalling there fixes.
+pub fn version_mismatch_message(daemon: Option<u16>, target: &Target) -> String {
+    let daemon = daemon_version_label(daemon);
+    match target.host() {
+        None => format!(
+            "daemon speaks protocol {daemon}, this client v{PROTOCOL_VERSION} — \
+             stop it (`pkill teiryod`) and relaunch teiryo"
+        ),
+        Some(host) => format!(
+            "daemon on {host} speaks protocol {daemon}, this client v{PROTOCOL_VERSION} — \
+             install the matching teiryod there, or stop its stale daemon \
+             (`ssh {host} pkill teiryod`), and relaunch teiryo"
+        ),
+    }
 }
 
 /// The commit this client was built from, as `-V` prints it.
@@ -133,7 +182,7 @@ pub const CLIENT_COMMIT: &str = env!("TEIRYO_COMMIT_HASH");
 
 /// One handshaken, framed connection to the daemon.
 pub struct Client {
-    framed: Framed<UnixStream, LengthDelimitedCodec>,
+    framed: Framed<BoxedTransport, LengthDelimitedCodec>,
     /// The commit the daemon said it was built from.
     daemon_commit: String,
 }
@@ -145,21 +194,52 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    /// Connect (spawning the daemon if needed) and complete the handshake.
-    pub async fn connect() -> Result<Self, ClientError> {
-        let stream = connect_or_spawn().await?;
-        Self::handshake(stream, HANDSHAKE_TIMEOUT).await
+    /// Connect to `target` (spawning a local daemon if needed, or running ssh
+    /// for a remote one) and complete the handshake.
+    pub async fn connect(target: &Target) -> Result<Self, ClientError> {
+        match target {
+            Target::Local => {
+                let stream = connect_or_spawn().await?;
+                Self::handshake(stream, HANDSHAKE_TIMEOUT).await
+            }
+            Target::Ssh(ssh) => Self::connect_ssh(ssh, HANDSHAKE_TIMEOUT).await,
+        }
+    }
+
+    /// Run ssh to `ssh`'s host and complete the handshake over its stdio,
+    /// giving up after `limit`. The remote daemon judges the protocol version
+    /// as it would a local client's, so its reject comes back as is. Any other
+    /// failure while ssh has exited is reported in ssh's own words: a refused
+    /// key or an unknown host reaches the user as more than "end of stream".
+    async fn connect_ssh(ssh: &SshTarget, limit: Duration) -> Result<Self, ClientError> {
+        let failed = |why: String| ClientError::Ssh {
+            host: ssh.host.clone(),
+            why,
+        };
+        let mut stream = ssh
+            .connect()
+            .map_err(|e| failed(format!("cannot run {}: {e}", ssh.program.to_string_lossy())))?;
+        match exchange(&mut stream, limit).await {
+            Ok(daemon_commit) => Ok(Self {
+                framed: framed(Box::new(stream)),
+                daemon_commit,
+            }),
+            Err(e) if version_mismatch(&e).is_some() => Err(e),
+            Err(e) => match stream.failure(SSH_EXIT_WAIT).await {
+                Some(why) => Err(failed(why)),
+                None => Err(e),
+            },
+        }
     }
 
     /// Complete the handshake on a connected stream, giving up after `limit`.
-    async fn handshake(mut stream: UnixStream, limit: Duration) -> Result<Self, ClientError> {
-        let daemon_commit =
-            match tokio::time::timeout(limit, client_handshake(&mut stream, CLIENT_COMMIT)).await {
-                Ok(result) => result.map_err(ClientError::Handshake)?,
-                Err(_elapsed) => return Err(ClientError::HandshakeTimeout(limit)),
-            };
+    async fn handshake<S: Transport + 'static>(
+        mut stream: S,
+        limit: Duration,
+    ) -> Result<Self, ClientError> {
+        let daemon_commit = exchange(&mut stream, limit).await?;
         Ok(Self {
-            framed: framed(stream),
+            framed: framed(Box::new(stream)),
             daemon_commit,
         })
     }
@@ -176,6 +256,15 @@ impl Client {
         self.framed.send(encode_frame(req)?).await?;
         let frame = self.framed.next().await.ok_or(ClientError::Closed)??;
         Ok(decode_frame(&frame)?)
+    }
+}
+
+/// Send our hello on `stream` and read the daemon's verdict within `limit`:
+/// the daemon's build commit on accept.
+async fn exchange<S: Transport>(stream: &mut S, limit: Duration) -> Result<String, ClientError> {
+    match tokio::time::timeout(limit, client_handshake(stream, CLIENT_COMMIT)).await {
+        Ok(result) => result.map_err(ClientError::Handshake),
+        Err(_elapsed) => Err(ClientError::HandshakeTimeout(limit)),
     }
 }
 
@@ -213,14 +302,23 @@ pub fn reconnect_delay(attempt: u32) -> Duration {
 /// Reconnect in the background, so the event loop keeps drawing and handling
 /// keys while the daemon is down. Reports through `tx` and ends on success,
 /// on a version mismatch, or when the TUI is gone. A fresh task starts the
-/// backoff over, so a success resets it.
-pub fn spawn_reconnect(tx: mpsc::UnboundedSender<NetEvent>) -> JoinHandle<()> {
-    tokio::spawn(reconnect_loop(Client::connect, reconnect_delay, tx))
+/// backoff over, so a success resets it. A remote target reruns ssh on each
+/// attempt.
+pub fn spawn_reconnect(target: Target, tx: mpsc::UnboundedSender<NetEvent>) -> JoinHandle<()> {
+    let connect = {
+        let target = target.clone();
+        move || {
+            let target = target.clone();
+            async move { Client::connect(&target).await }
+        }
+    };
+    tokio::spawn(reconnect_loop(connect, reconnect_delay, target, tx))
 }
 
 async fn reconnect_loop<F, Fut>(
     mut connect: F,
     delay: impl Fn(u32) -> Duration,
+    target: Target,
     tx: mpsc::UnboundedSender<NetEvent>,
 ) where
     F: FnMut() -> Fut,
@@ -236,7 +334,9 @@ async fn reconnect_loop<F, Fut>(
             }
             Err(e) => {
                 if let Some(daemon) = version_mismatch(&e) {
-                    let _ = tx.send(NetEvent::Incompatible(version_mismatch_message(daemon)));
+                    let _ = tx.send(NetEvent::Incompatible(version_mismatch_message(
+                        daemon, &target,
+                    )));
                     return;
                 }
                 if tx.send(NetEvent::ReconnectFailed(e.to_string())).is_err() {
@@ -312,6 +412,7 @@ mod tests {
     use super::*;
     use teiryo_core::domain::{AccountId, ClientKind, PollOutcome, PollTrigger};
     use teiryo_core::Account;
+    use tokio::net::UnixStream;
 
     fn status_with_poll(id: Option<PollId>) -> AccountStatus {
         AccountStatus {
@@ -464,19 +565,102 @@ mod tests {
         });
         assert_eq!(version_mismatch(&ahead), Some(Some(PROTOCOL_VERSION + 1)));
         assert!(
-            version_mismatch_message(Some(PROTOCOL_VERSION + 1)).contains(&format!(
-                "daemon speaks protocol v{}, this client v{PROTOCOL_VERSION}",
-                PROTOCOL_VERSION + 1
-            ))
+            version_mismatch_message(Some(PROTOCOL_VERSION + 1), &Target::Local).contains(
+                &format!(
+                    "daemon speaks protocol v{}, this client v{PROTOCOL_VERSION}",
+                    PROTOCOL_VERSION + 1
+                )
+            )
         );
 
         let old = ClientError::Handshake(HandshakeError::Rejected { daemon: None });
         assert_eq!(version_mismatch(&old), Some(None));
-        assert!(version_mismatch_message(None).contains(&format!(
-            "daemon speaks protocol older than v8, this client v{PROTOCOL_VERSION}"
-        )));
+        assert!(
+            version_mismatch_message(None, &Target::Local).contains(&format!(
+                "daemon speaks protocol older than v8, this client v{PROTOCOL_VERSION}"
+            ))
+        );
 
         assert_eq!(version_mismatch(&ClientError::Closed), None);
+    }
+
+    /// A remote daemon's mismatch names the host, and the remedies that
+    /// work from here: reinstalling there, or stopping it over ssh.
+    #[test]
+    fn a_remote_mismatch_names_the_host() {
+        let target = Target::Ssh(SshTarget::new("box".into(), Some("ssh".into()), None).unwrap());
+        let message = version_mismatch_message(Some(PROTOCOL_VERSION + 1), &target);
+        assert!(
+            message.starts_with(&format!(
+                "daemon on box speaks protocol v{}, this client v{PROTOCOL_VERSION}",
+                PROTOCOL_VERSION + 1
+            )),
+            "{message}"
+        );
+        assert!(message.contains("`ssh box pkill teiryod`"), "{message}");
+    }
+
+    /// An executable stand-in for ssh that runs `script`, ignoring the
+    /// arguments ssh would get. It deletes itself once started, so it must
+    /// be run exactly once.
+    fn fake_ssh_target(script: &str) -> Target {
+        use std::os::unix::fs::PermissionsExt;
+
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("teiryo-fake-ssh-{}-{n}", std::process::id()));
+        std::fs::write(&path, format!("#!/bin/sh\nrm -f \"$0\"\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Target::Ssh(SshTarget::new("box".into(), Some(path.into_os_string()), None).unwrap())
+    }
+
+    /// ssh refusing to connect reaches the user in ssh's own words, naming
+    /// the host, rather than as a bare end of stream.
+    #[tokio::test]
+    async fn a_failed_ssh_is_reported_in_its_own_words() {
+        let target = fake_ssh_target(
+            "echo 'ssh: connect to host box port 22: Connection refused' >&2; exit 255",
+        );
+        let err = Client::connect(&target).await.unwrap_err();
+        assert!(
+            matches!(&err, ClientError::Ssh { host, .. } if host == "box"),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "cannot reach the daemon on box over ssh: \
+             ssh: connect to host box port 22: Connection refused"
+        );
+        assert_eq!(version_mismatch(&err), None, "an ssh failure is retried");
+    }
+
+    /// The falsifier for the test above: a remote daemon's reject is a
+    /// version mismatch, not an ssh failure, even though ssh exits right
+    /// after it — so reconnecting stops, as it does locally.
+    #[tokio::test]
+    async fn a_remote_reject_stays_a_version_mismatch() {
+        let [lo, hi] = (PROTOCOL_VERSION + 1).to_le_bytes();
+        let target = fake_ssh_target(&format!(
+            "printf '\\001\\{lo:03o}\\{hi:03o}'; echo 'bridge done' >&2"
+        ));
+        let err = Client::connect(&target).await.unwrap_err();
+        assert_eq!(
+            version_mismatch(&err),
+            Some(Some(PROTOCOL_VERSION + 1)),
+            "{err:?}"
+        );
+    }
+
+    /// A remote daemon that accepts is a working connection, and its build
+    /// is the one the header compares against.
+    #[tokio::test]
+    async fn a_remote_accept_connects_and_reports_the_remote_build() {
+        let target = fake_ssh_target("printf '\\000\\006\\000def456'; exec cat >/dev/null");
+        let client = Client::connect(&target).await.unwrap();
+        assert_eq!(
+            client.build_mismatch(),
+            Some(format!("{CLIENT_COMMIT} / def456"))
+        );
     }
 
     /// Ordinary failures retry; a version mismatch ends the loop, because
@@ -503,6 +687,7 @@ mod tests {
                 }
             },
             |_| Duration::ZERO,
+            Target::Local,
             tx,
         )
         .await;
@@ -548,6 +733,7 @@ mod tests {
                 asked.borrow_mut().push(attempt);
                 Duration::ZERO
             },
+            Target::Local,
             tx,
         )
         .await;
@@ -596,6 +782,7 @@ mod tests {
                 async move { next }
             },
             |_| Duration::ZERO,
+            Target::Local,
             tx,
         )
         .await;
@@ -620,6 +807,7 @@ mod tests {
                 async { Err(ClientError::Closed) }
             },
             |_| Duration::ZERO,
+            Target::Local,
             tx,
         )
         .await;
