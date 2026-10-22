@@ -68,6 +68,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut app = App::new();
+    app.build_mismatch = command.build_mismatch();
     refresh_status(&mut command, &mut app).await;
     refresh_recent(&mut command, &mut app).await;
     reload_detail(&mut command, &mut app).await;
@@ -236,6 +237,8 @@ async fn drive(
                     // Replaces both connections: this one for requests, and a
                     // fresh long-poll below.
                     *command = *client;
+                    // The daemon may have been replaced by another build.
+                    app.build_mismatch = command.build_mismatch();
                     app.disconnected = false;
                     app.error = None;
                     refresh_status(command, app).await;

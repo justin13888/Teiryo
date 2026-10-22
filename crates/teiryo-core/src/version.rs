@@ -45,6 +45,20 @@ macro_rules! build_info {
     };
 }
 
+/// Whether two builds, named by their `TEIRYO_COMMIT_HASH`, are the same
+/// build. Only an exact, clean, known commit can vouch for that: a `-dirty`
+/// tree may differ from its commit in anything, and `unknown` says nothing, so
+/// neither matches even itself.
+pub fn builds_match(client: &str, daemon: &str) -> bool {
+    client == daemon && !client.ends_with("-dirty") && client != "unknown"
+}
+
+/// The client and daemon commits, as `client / daemon`, when
+/// [`builds_match`] cannot vouch for them; `None` when it can.
+pub fn build_mismatch(client: &str, daemon: &str) -> Option<String> {
+    (!builds_match(client, daemon)).then(|| format!("{client} / {daemon}"))
+}
+
 /// The version text for both `-V` and `--version`, without a trailing newline.
 pub fn long_version(name: &str, info: &BuildInfo) -> String {
     format!(
@@ -285,6 +299,41 @@ mod tests {
         assert_eq!(lines[0], "teiryod 0.1.0");
         assert_eq!(lines[1], "commit:   unknown (unknown)");
         assert_eq!(lines[4], "built:    unknown");
+    }
+
+    #[test]
+    fn identical_clean_commits_match() {
+        assert!(builds_match("f78c2ce1a2b3", "f78c2ce1a2b3"));
+        assert_eq!(build_mismatch("f78c2ce1a2b3", "f78c2ce1a2b3"), None);
+    }
+
+    #[test]
+    fn different_commits_do_not_match() {
+        assert!(!builds_match("f78c2ce1a2b3", "0123456789ab"));
+        assert_eq!(
+            build_mismatch("f78c2ce1a2b3", "0123456789ab").as_deref(),
+            Some("f78c2ce1a2b3 / 0123456789ab")
+        );
+    }
+
+    /// A dirty tree never vouches for itself, on either side, even against
+    /// the very same dirty commit.
+    #[test]
+    fn a_dirty_commit_never_matches() {
+        assert!(!builds_match("abc123-dirty", "abc123-dirty"));
+        assert!(!builds_match("abc123-dirty", "abc123"));
+        assert!(!builds_match("abc123", "abc123-dirty"));
+        assert_eq!(
+            build_mismatch("abc123-dirty", "def456").as_deref(),
+            Some("abc123-dirty / def456")
+        );
+    }
+
+    #[test]
+    fn an_unknown_commit_never_matches() {
+        assert!(!builds_match("unknown", "unknown"));
+        assert!(!builds_match("unknown", "abc123"));
+        assert!(!builds_match("abc123", "unknown"));
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! Wire protocol: versioned handshake, bincode-encoded request/response
 //! enums, and length-delimited framing.
 //!
-//! Connection lifecycle: raw 6-byte [`handshake`] first (never bincode, so it
-//! can never itself go stale), then [`codec`]-framed bincode frames carrying
+//! Connection lifecycle: raw [`handshake`] first (the 6-byte version preamble,
+//! then each side's build commit; never bincode, so the version check can
+//! never itself go stale), then [`codec`]-framed bincode frames carrying
 //! [`wire::Request`] / [`wire::Response`].
 
 pub mod codec;
@@ -34,7 +35,9 @@ mod wire_fingerprint {
     use ulid::Ulid;
 
     use super::codec::{encode_frame, length_delimited_codec, MAX_FRAME_LEN};
-    use super::handshake::{server_handshake, Hello, PROTOCOL_MAGIC, PROTOCOL_VERSION};
+    use super::handshake::{
+        encode_commit, hello_message, server_handshake, Hello, PROTOCOL_MAGIC, PROTOCOL_VERSION,
+    };
     use super::wire::{
         AccountHealth, AccountStatus, ConfigEdit, ConfigState, ConfigView, HistoryPage,
         ProviderHealth, ProviderSettings, Request, Response, WindowView,
@@ -53,7 +56,7 @@ mod wire_fingerprint {
     /// not repin the hash on its own: bump `PROTOCOL_VERSION` by 1, update
     /// `docs/protocol.md` and the golden hello bytes in `handshake.rs`, and
     /// then repin both halves of this pair to what the failure prints.
-    const WIRE_FINGERPRINT: (u16, u64) = (8, 0xd272_1ea7_01fb_3028);
+    const WIRE_FINGERPRINT: (u16, u64) = (9, 0x45f8_706f_f871_faa5);
 
     /// 64-bit FNV-1a. Inline rather than a dependency: it only has to be
     /// deterministic across builds and platforms, not collision resistant.
@@ -319,14 +322,23 @@ mod wire_fingerprint {
         ]
     }
 
-    /// The bytes a daemon at this version replies with to `hello`, read off
-    /// the real [`server_handshake`] rather than restated.
+    /// The canonical build commits the handshake carries. Fixed rather than
+    /// this build's own, which changes with every commit and would move the
+    /// fingerprint with it.
+    const CLIENT_COMMIT: &str = "0123456789ab-dirty";
+    const DAEMON_COMMIT: &str = "ba9876543210";
+
+    /// The bytes a daemon at this version replies with to `hello` followed by
+    /// [`CLIENT_COMMIT`], read off the real [`server_handshake`] rather than
+    /// restated.
     async fn daemon_reply(hello: Hello, len: usize) -> Vec<u8> {
         let (mut client, mut daemon) = tokio::io::duplex(64);
         let daemon_task = tokio::spawn(async move {
-            let _ = server_handshake(&mut daemon).await;
+            let _ = server_handshake(&mut daemon, DAEMON_COMMIT).await;
         });
-        client.write_all(&hello.to_bytes()).await.unwrap();
+        let mut opening = hello.to_bytes().to_vec();
+        opening.extend_from_slice(&encode_commit(CLIENT_COMMIT));
+        client.write_all(&opening).await.unwrap();
         let mut reply = vec![0u8; len];
         client.read_exact(&mut reply).await.unwrap();
         daemon_task.await.unwrap();
@@ -335,8 +347,8 @@ mod wire_fingerprint {
 
     /// Everything that reaches the wire, encoded, in a fixed order.
     async fn wire_encodings() -> Vec<Vec<u8>> {
-        let mut encodings = vec![Hello::current().to_bytes().to_vec()];
-        encodings.push(daemon_reply(Hello::current(), 1).await);
+        let mut encodings = vec![hello_message(CLIENT_COMMIT)];
+        encodings.push(daemon_reply(Hello::current(), 3 + DAEMON_COMMIT.len()).await);
         let stale = Hello {
             magic: PROTOCOL_MAGIC,
             protocol_version: PROTOCOL_VERSION.wrapping_add(1),

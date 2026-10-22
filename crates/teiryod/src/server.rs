@@ -4,7 +4,7 @@ use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use teiryo_core::{
     decode_frame, encode_frame, framed, server_handshake, AccountId, ClientKind, ConfigEdit,
-    ErrorKind, HistoryPage, PollEvent, PollId, PollTrigger, Request, Response,
+    ErrorKind, HistoryPage, PollEvent, PollId, PollTrigger, Request, Response, PROTOCOL_VERSION,
 };
 use tokio::net::{UnixListener, UnixStream};
 
@@ -32,12 +32,48 @@ pub async fn serve(listener: UnixListener, daemon: Daemon) {
     }
 }
 
+/// The commit this daemon was built from, as `-V` prints it.
+const DAEMON_COMMIT: &str = env!("TEIRYO_COMMIT_HASH");
+
+/// Record which client build reached this daemon. The protocol versions are
+/// already equal, or the handshake would have rejected the client; the builds
+/// may still differ, and a mismatched pair is what to look for first when the
+/// two disagree about anything. Logged in every build profile, not only debug
+/// ones: an installed TUI against a daemon left over from another build is the
+/// case this exists for. Returns whether the builds matched.
+fn log_build_check(client_commit: &str, daemon_commit: &str) -> bool {
+    let matched = teiryo_core::version::builds_match(client_commit, daemon_commit);
+    if matched {
+        tracing::debug!(
+            client_commit,
+            daemon_commit,
+            client_protocol = PROTOCOL_VERSION,
+            daemon_protocol = PROTOCOL_VERSION,
+            "client build matches the daemon"
+        );
+    } else {
+        tracing::error!(
+            client_commit,
+            daemon_commit,
+            client_protocol = PROTOCOL_VERSION,
+            daemon_protocol = PROTOCOL_VERSION,
+            "client build does not match the daemon (a -dirty or unknown commit never matches)"
+        );
+    }
+    matched
+}
+
 /// One client connection: handshake first, then a request/response loop.
 /// A failed handshake or a malformed frame ends only this connection.
 async fn handle_conn(mut stream: UnixStream, daemon: Daemon) -> anyhow::Result<()> {
-    if let Err(e) = server_handshake(&mut stream).await {
-        tracing::info!(error = %e, "handshake rejected");
-        return Ok(());
+    match server_handshake(&mut stream, DAEMON_COMMIT).await {
+        Ok(client_commit) => {
+            log_build_check(&client_commit, DAEMON_COMMIT);
+        }
+        Err(e) => {
+            tracing::info!(error = %e, "handshake rejected");
+            return Ok(());
+        }
     }
     let mut framed = framed(stream);
     let mut shutdown_rx = daemon.shutdown_tx.subscribe();
@@ -246,6 +282,80 @@ async fn await_update(
         match woken {
             Ok(Ok(())) => continue,
             _ => return Response::NoUpdate, // timeout or daemon dropped
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    /// A log sink the test can read back.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What `log_build_check` writes for this pair, at every level, and
+    /// whether it called them a match.
+    fn logged(client: &str, daemon: &str) -> (bool, String) {
+        let sink = Captured::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let matched =
+            tracing::subscriber::with_default(subscriber, || log_build_check(client, daemon));
+        let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        (matched, text)
+    }
+
+    #[test]
+    fn a_matching_build_is_logged_at_debug() {
+        let (matched, text) = logged("abc123", "abc123");
+        assert!(matched);
+        assert!(text.contains("DEBUG"), "{text}");
+        assert!(!text.contains("ERROR"), "{text}");
+        assert!(text.contains("client_commit=\"abc123\""), "{text}");
+    }
+
+    /// The error names both commits and both protocol versions.
+    #[test]
+    fn a_mismatched_build_is_logged_at_error_with_both_sides() {
+        let (matched, text) = logged("abc123", "def456");
+        assert!(!matched);
+        assert!(text.contains("ERROR"), "{text}");
+        assert!(text.contains("client_commit=\"abc123\""), "{text}");
+        assert!(text.contains("daemon_commit=\"def456\""), "{text}");
+        assert!(
+            text.contains(&format!("client_protocol={PROTOCOL_VERSION}")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("daemon_protocol={PROTOCOL_VERSION}")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_dirty_or_unknown_build_is_logged_at_error() {
+        for commit in ["abc123-dirty", "unknown"] {
+            let (matched, text) = logged(commit, commit);
+            assert!(!matched, "{commit}");
+            assert!(text.contains("ERROR"), "{commit}: {text}");
         }
     }
 }

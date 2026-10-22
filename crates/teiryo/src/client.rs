@@ -128,9 +128,14 @@ pub fn version_mismatch_message(daemon: Option<u16>) -> String {
     )
 }
 
+/// The commit this client was built from, as `-V` prints it.
+pub const CLIENT_COMMIT: &str = env!("TEIRYO_COMMIT_HASH");
+
 /// One handshaken, framed connection to the daemon.
 pub struct Client {
     framed: Framed<UnixStream, LengthDelimitedCodec>,
+    /// The commit the daemon said it was built from.
+    daemon_commit: String,
 }
 
 impl std::fmt::Debug for Client {
@@ -148,13 +153,22 @@ impl Client {
 
     /// Complete the handshake on a connected stream, giving up after `limit`.
     async fn handshake(mut stream: UnixStream, limit: Duration) -> Result<Self, ClientError> {
-        match tokio::time::timeout(limit, client_handshake(&mut stream)).await {
-            Ok(result) => result.map_err(ClientError::Handshake)?,
-            Err(_elapsed) => return Err(ClientError::HandshakeTimeout(limit)),
-        }
+        let daemon_commit =
+            match tokio::time::timeout(limit, client_handshake(&mut stream, CLIENT_COMMIT)).await {
+                Ok(result) => result.map_err(ClientError::Handshake)?,
+                Err(_elapsed) => return Err(ClientError::HandshakeTimeout(limit)),
+            };
         Ok(Self {
             framed: framed(stream),
+            daemon_commit,
         })
+    }
+
+    /// `client / daemon` commits when this connection's daemon is not
+    /// provably the same build as this client; `None` when it is. Never a
+    /// reason to refuse the connection: the protocol versions already match.
+    pub fn build_mismatch(&self) -> Option<String> {
+        teiryo_core::version::build_mismatch(CLIENT_COMMIT, &self.daemon_commit)
     }
 
     /// Send one request and await its response.
@@ -383,26 +397,58 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The falsifier for the timeout: a daemon that does answer is not cut
-    /// off by it.
-    #[tokio::test]
-    async fn answering_daemon_completes_the_handshake() {
-        let path = temp_socket("answer");
+    /// A daemon on `tag`'s socket that answers the handshake as built from
+    /// `daemon_commit`, and what the client made of it.
+    async fn client_against(tag: &str, daemon_commit: &'static str) -> Result<Client, ClientError> {
+        let path = temp_socket(tag);
         let _ = std::fs::remove_file(&path);
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            teiryo_core::protocol::handshake::server_handshake(&mut stream)
-                .await
-                .unwrap();
-            stream
+            let client_commit =
+                teiryo_core::protocol::handshake::server_handshake(&mut stream, daemon_commit)
+                    .await
+                    .unwrap();
+            (stream, client_commit)
         });
 
         let stream = UnixStream::connect(&path).await.unwrap();
         let result = Client::handshake(stream, Duration::from_secs(2)).await;
-        assert!(result.is_ok(), "{result:?}");
-        let _ = server.await;
+        let (_stream, client_commit) = server.await.unwrap();
+        assert_eq!(
+            client_commit, CLIENT_COMMIT,
+            "the client sends its own commit"
+        );
         let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    /// The falsifier for the timeout: a daemon that does answer is not cut
+    /// off by it.
+    #[tokio::test]
+    async fn answering_daemon_completes_the_handshake() {
+        let result = client_against("answer", "def456").await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// A daemon built from another commit is accepted all the same, and the
+    /// client keeps both commits for the header.
+    #[tokio::test]
+    async fn another_build_connects_and_is_reported() {
+        let client = client_against("other-build", "def456").await.unwrap();
+        assert_eq!(
+            client.build_mismatch(),
+            Some(format!("{CLIENT_COMMIT} / def456"))
+        );
+    }
+
+    /// The same build reports nothing, unless this build is one that can
+    /// never vouch for itself.
+    #[tokio::test]
+    async fn the_same_build_is_reported_only_when_it_cannot_vouch_for_itself() {
+        let client = client_against("same-build", CLIENT_COMMIT).await.unwrap();
+        let unprovable = CLIENT_COMMIT.ends_with("-dirty") || CLIENT_COMMIT == "unknown";
+        assert_eq!(client.build_mismatch().is_some(), unprovable);
     }
 
     fn drain(rx: &mut mpsc::UnboundedReceiver<NetEvent>) -> Vec<NetEvent> {
@@ -517,7 +563,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            teiryo_core::protocol::handshake::server_handshake(&mut stream)
+            teiryo_core::protocol::handshake::server_handshake(&mut stream, "def456")
                 .await
                 .unwrap();
             stream

@@ -576,6 +576,10 @@ pub struct App {
     /// Final for this TUI: reconnecting stops, and the message stays up
     /// because only the user can replace that daemon.
     pub incompatible: Option<String>,
+    /// `client / daemon` build commits when the connected daemon is not
+    /// provably this client's build (see `teiryo_core::version::builds_match`).
+    /// Informational only: shown dim in the header, never a reason to refuse.
+    pub build_mismatch: Option<String>,
     /// Time of the most recent update, for the header.
     pub last_update: Option<DateTime<Utc>>,
 }
@@ -625,6 +629,7 @@ impl App {
             error: None,
             disconnected: false,
             incompatible: None,
+            build_mismatch: None,
             last_update: None,
         }
     }
