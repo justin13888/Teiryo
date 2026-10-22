@@ -47,6 +47,23 @@ protocol: v6
 
 `commit` carries a `-dirty` suffix when the tree had uncommitted changes, and any fact the build could not establish reads `unknown`. `protocol` is the wire version: a TUI and daemon whose `protocol` lines differ cannot talk to each other, so comparing `teiryo -V` with `teiryod -V` is the quickest check after an upgrade.
 
+### Remote daemon over SSH
+
+To watch the quotas of a daemon on another machine, install Teiryo there too, then:
+
+```bash
+teiryo --ssh user@host
+```
+
+Each connection runs `ssh -T -o BatchMode=yes user@host teiryod bridge`, which relays the protocol to that host's daemon and starts it if it is not running; it keeps running after you disconnect. Port, user and keys come from your ssh config, and since no prompt can be answered behind the TUI, the host must accept a key or agent login. The remote daemon still requires the exact same `protocol` version as this client, so install the same Teiryo version on both ends.
+
+| Option | Default | Use |
+| --- | --- | --- |
+| `--ssh-command CMD` | `$TEIRYO_SSH`, else `ssh` | Another ssh client (one program, not split into words) |
+| `--remote-daemon PATH` | `teiryod` on the remote `$PATH` | Where `teiryod` is when a non-interactive ssh shell's `$PATH` lacks it, e.g. `~/.cargo/bin/teiryod` |
+
+The header shows the host after the name. If ssh fails, its last error line is what `teiryo` prints.
+
 To stop the daemon and remove both binaries:
 
 ```bash
