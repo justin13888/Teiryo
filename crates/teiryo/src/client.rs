@@ -704,10 +704,11 @@ mod tests {
     /// reconnect loop stops on it as it does on a mismatch: no retry fixes it.
     #[tokio::test]
     async fn a_remote_install_without_bridge_is_named_and_not_retried() {
-        let target = fake_ssh_target(
-            "printf \"teiryod: unexpected argument 'bridge'\\n\\n\
-             For more information, try '--help'.\\n\" >&2; exit 2",
-        );
+        let usage = teiryo_core::version::usage_error("teiryod", "bridge");
+        let target = fake_ssh_target(&format!(
+            "printf '%s\\n' '{}' >&2; exit 2",
+            usage.replace('\'', r"'\''")
+        ));
         let err = Client::connect(&target).await.unwrap_err();
         assert!(
             matches!(&err, ClientError::NoBridge { host } if host == "box"),
