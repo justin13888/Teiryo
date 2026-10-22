@@ -649,14 +649,35 @@ mod tests {
     /// arguments ssh would get. It deletes itself once started, so it must
     /// be run exactly once.
     fn fake_ssh_target(script: &str) -> Target {
-        use std::os::unix::fs::PermissionsExt;
-
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("teiryo-fake-ssh-{}-{n}", std::process::id()));
-        std::fs::write(&path, format!("#!/bin/sh\nrm -f \"$0\"\n{script}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&path, &format!("#!/bin/sh\nrm -f \"$0\"\n{script}\n"));
         Target::Ssh(SshTarget::new("box".into(), Some(path.into_os_string()), None).unwrap())
+    }
+
+    /// Write `contents` to a new executable at `path` through a child shell,
+    /// so this process never holds the file open for writing. A parallel test
+    /// that forks while it did would carry that descriptor into its child
+    /// until the child execs, and running the file meanwhile fails with
+    /// `ETXTBSY` ("Text file busy").
+    fn write_executable(path: &std::path::Path, contents: &str) {
+        use std::io::Write;
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(contents.as_bytes())
+            .unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "writing {}: {status:?}", path.display());
     }
 
     /// ssh refusing to connect reaches the user in ssh's own words, naming
