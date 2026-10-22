@@ -5,9 +5,15 @@
 //! then each side's build commit; never bincode, so the version check can
 //! never itself go stale), then [`codec`]-framed bincode frames carrying
 //! [`wire::Request`] / [`wire::Response`].
+//!
+//! All of it runs over any byte stream ([`transport::Transport`]): the daemon's
+//! Unix socket, or an ssh child's stdio whose far end is `teiryod bridge`
+//! ([`ssh`]).
 
 pub mod codec;
 pub mod handshake;
+pub mod ssh;
+pub mod transport;
 pub mod wire;
 
 /// The bump guard: the whole wire format, hashed and pinned to the

@@ -1762,7 +1762,6 @@ dependencies = [
  "chrono",
  "crossterm",
  "futures",
- "libc",
  "proptest",
  "ratatui",
  "teiryo-core",

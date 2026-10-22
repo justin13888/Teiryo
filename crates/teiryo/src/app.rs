@@ -580,6 +580,9 @@ pub struct App {
     /// provably this client's build (see `teiryo_core::version::builds_match`).
     /// Informational only: shown dim in the header, never a reason to refuse.
     pub build_mismatch: Option<String>,
+    /// The `--ssh` host whose daemon this TUI shows, for the header; `None`
+    /// for this host's own daemon.
+    pub remote_host: Option<String>,
     /// Time of the most recent update, for the header.
     pub last_update: Option<DateTime<Utc>>,
 }
@@ -630,6 +633,7 @@ impl App {
             disconnected: false,
             incompatible: None,
             build_mismatch: None,
+            remote_host: None,
             last_update: None,
         }
     }

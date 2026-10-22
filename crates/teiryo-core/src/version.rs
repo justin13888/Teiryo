@@ -90,9 +90,10 @@ fn built(epoch: &str) -> String {
         )
 }
 
-/// What the command line asks a binary to do. Neither binary takes operands,
-/// so anything but a recognised flag is a usage error — rather than being
-/// ignored, which would start a daemon or take over the terminal for a typo.
+/// What the command line asks a binary to do. Neither binary takes free
+/// operands, so anything but a recognised flag (or a recognised flag's value)
+/// is a usage error — rather than being ignored, which would start a daemon or
+/// take over the terminal for a typo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
     /// No arguments: the binary's normal job.
@@ -101,31 +102,46 @@ pub enum Invocation {
     Help,
     /// `-V` / `--version`.
     Version,
-    /// One of the binary's own [`Flag`]s, by its long form.
-    Flag(&'static str),
+    /// The binary's own [`Flag`]s, in the order given.
+    Flags(Vec<Given>),
+    /// A [`Flag`] that takes a value was given last, with none after it.
+    MissingValue(&'static str),
     /// The first argument nothing recognises, lossily decoded for display.
     Unexpected(String),
 }
 
-/// A long-only flag one binary accepts beyond `-h` and `-V`, listed in its
-/// `--help`.
+/// A long-only flag, or a bare command word such as `bridge`, that one binary
+/// accepts beyond `-h` and `-V`, listed in its `--help`. A `long` that does
+/// not start with `-` is listed as a command rather than an option.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Flag {
     /// The flag as typed, e.g. `--print-socket-path`.
     pub long: &'static str,
+    /// The placeholder of the value it takes, e.g. `HOST`, given as the next
+    /// argument or after `=`; `None` for a flag that takes none.
+    pub value: Option<&'static str>,
     /// Its line in `--help`.
     pub help: &'static str,
 }
 
+/// One of the binary's own [`Flag`]s as given on the command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Given {
+    /// The flag's long form.
+    pub long: &'static str,
+    /// Its value, for a flag that takes one.
+    pub value: Option<OsString>,
+}
+
 /// What `main` does once [`handle_args_with`] has read the command line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// No arguments: the binary's normal job.
     Run,
     /// Leave with this status; the output is already printed.
     Exit(i32),
-    /// Act on this [`Flag`], by its long form.
-    Flag(&'static str),
+    /// Act on these [`Flag`]s, in the order given.
+    Flags(Vec<Given>),
 }
 
 /// Classify `args`, excluding the program name. Help wins over version, as it
@@ -138,35 +154,72 @@ where
 }
 
 /// [`parse_args`] for a binary that also accepts `flags`. Help and version
-/// both win over a binary's own flag, and the first of those given wins.
+/// both win over a binary's own flags, which come back in the order given. A
+/// flag that takes a value consumes the next argument whatever it is, or the
+/// text after `=` in `--flag=value`.
 pub fn parse_args_with<I>(args: I, flags: &[Flag]) -> Invocation
 where
     I: IntoIterator<Item = OsString>,
 {
     let mut help = false;
     let mut version = false;
-    let mut own = None;
-    for arg in args {
-        let flag = arg
-            .to_str()
-            .and_then(|s| flags.iter().find(|f| f.long == s));
-        match (arg.to_str(), flag) {
-            (Some("-h" | "--help"), _) => help = true,
-            (Some("-V" | "--version"), _) => version = true,
-            (_, Some(flag)) => {
-                own.get_or_insert(flag.long);
+    let mut missing = None;
+    let mut own = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let text = arg.to_str();
+        match text {
+            Some("-h" | "--help") => {
+                help = true;
+                continue;
             }
-            _ => return Invocation::Unexpected(arg.to_string_lossy().into_owned()),
+            Some("-V" | "--version") => {
+                version = true;
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(flag) = text.and_then(|s| flags.iter().find(|f| f.long == s)) {
+            let value = match flag.value {
+                None => None,
+                Some(_) => match args.next() {
+                    Some(value) => Some(value),
+                    None => {
+                        missing = Some(flag.long);
+                        break;
+                    }
+                },
+            };
+            own.push(Given {
+                long: flag.long,
+                value,
+            });
+            continue;
+        }
+        let inline = text
+            .and_then(|s| s.split_once('='))
+            .and_then(|(name, value)| {
+                let flag = flags.iter().find(|f| f.long == name && f.value.is_some())?;
+                Some((flag, value))
+            });
+        match inline {
+            Some((flag, value)) => own.push(Given {
+                long: flag.long,
+                value: Some(OsString::from(value)),
+            }),
+            None => return Invocation::Unexpected(arg.to_string_lossy().into_owned()),
         }
     }
     if help {
         Invocation::Help
     } else if version {
         Invocation::Version
-    } else if let Some(long) = own {
-        Invocation::Flag(long)
-    } else {
+    } else if let Some(long) = missing {
+        Invocation::MissingValue(long)
+    } else if own.is_empty() {
         Invocation::Run
+    } else {
+        Invocation::Flags(own)
     }
 }
 
@@ -180,16 +233,20 @@ pub fn handle_args(name: &str, about: &str, info: &BuildInfo) -> Option<i32> {
     match handle_args_with(name, about, info, &[]) {
         Action::Exit(code) => Some(code),
         // No flags were offered, so none can come back.
-        Action::Run | Action::Flag(_) => None,
+        Action::Run | Action::Flags(_) => None,
     }
 }
 
 /// [`handle_args`] for a binary that also accepts `flags`, which `--help`
-/// lists. A flag given is returned for the binary to act on.
+/// lists. The flags given are returned for the binary to act on.
 pub fn handle_args_with(name: &str, about: &str, info: &BuildInfo, flags: &[Flag]) -> Action {
     match parse_args_with(std::env::args_os().skip(1), flags) {
         Invocation::Run => Action::Run,
-        Invocation::Flag(long) => Action::Flag(long),
+        Invocation::Flags(given) => Action::Flags(given),
+        Invocation::MissingValue(long) => {
+            eprintln!("{}", missing_value_error(name, long));
+            Action::Exit(2)
+        }
         Invocation::Help => {
             println!("{}", help_with(name, about, info, flags));
             Action::Exit(0)
@@ -211,11 +268,22 @@ pub fn help(name: &str, about: &str, info: &BuildInfo) -> String {
 }
 
 /// [`help`] listing `flags` after `-h` and `-V`, every description aligned
-/// two columns past the widest flag.
+/// two columns past the widest flag. Command words (a `long` without a leading
+/// `-`) get a `Commands:` section of their own, before the options.
 pub fn help_with(name: &str, about: &str, info: &BuildInfo, flags: &[Flag]) -> String {
+    let is_command = |f: &&Flag| !f.long.starts_with('-');
+    let commands: Vec<(String, &str)> = flags
+        .iter()
+        .filter(is_command)
+        .map(|f| (f.long.to_owned(), f.help))
+        .collect();
     let own: Vec<(String, &str)> = flags
         .iter()
-        .map(|f| (format!("    {}", f.long), f.help))
+        .filter(|f| !is_command(f))
+        .map(|f| match f.value {
+            Some(value) => (format!("    {} <{value}>", f.long), f.help),
+            None => (format!("    {}", f.long), f.help),
+        })
         .collect();
     let rows: Vec<(&str, &str)> = [
         ("-h, --help", "Print help"),
@@ -224,18 +292,46 @@ pub fn help_with(name: &str, about: &str, info: &BuildInfo, flags: &[Flag]) -> S
     .into_iter()
     .chain(own.iter().map(|(flag, text)| (flag.as_str(), *text)))
     .collect();
-    let width = rows.iter().map(|(flag, _)| flag.len()).max().unwrap_or(0) + 2;
-    let options: Vec<String> = rows
+    let width = rows
         .iter()
-        .map(|(flag, text)| format!("  {flag:<width$}{text}"))
-        .collect();
+        .map(|(flag, _)| flag.len())
+        .chain(commands.iter().map(|(command, _)| command.len()))
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let section = |rows: &mut dyn Iterator<Item = (&str, &str)>| -> String {
+        rows.map(|(flag, text)| format!("  {flag:<width$}{text}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let (usage, commands) = if commands.is_empty() {
+        ("[OPTIONS]", String::new())
+    } else {
+        (
+            "[OPTIONS] [COMMAND]",
+            format!(
+                "Commands:\n{}\n\n",
+                section(&mut commands.iter().map(|(c, t)| (c.as_str(), *t)))
+            ),
+        )
+    };
     format!(
         "{name} {}\n\
          {about}\n\n\
-         Usage: {name} [OPTIONS]\n\n\
+         Usage: {name} {usage}\n\n\
+         {commands}\
          Options:\n{}",
         info.version,
-        options.join("\n")
+        section(&mut rows.into_iter())
+    )
+}
+
+/// The usage error for a flag given without the value it takes, without a
+/// trailing newline. Printed to stderr, with exit status 2.
+pub fn missing_value_error(name: &str, long: &str) -> String {
+    format!(
+        "{name}: '{long}' needs a value\n\n\
+         For more information, try '--help'."
     )
 }
 
@@ -393,14 +489,34 @@ mod tests {
 
     const PRINT: Flag = Flag {
         long: "--print-socket-path",
+        value: None,
         help: "Print the socket path and exit",
     };
+
+    const SSH: Flag = Flag {
+        long: "--ssh",
+        value: Some("HOST"),
+        help: "Connect over ssh",
+    };
+
+    const BRIDGE: Flag = Flag {
+        long: "bridge",
+        value: None,
+        help: "Relay stdio to the socket",
+    };
+
+    fn given(long: &'static str, value: Option<&str>) -> Given {
+        Given {
+            long,
+            value: value.map(OsString::from),
+        }
+    }
 
     #[test]
     fn own_flags_parse_only_where_offered() {
         assert_eq!(
             parse_args_with(args(&["--print-socket-path"]), &[PRINT]),
-            Invocation::Flag("--print-socket-path")
+            Invocation::Flags(vec![given("--print-socket-path", None)])
         );
         assert_eq!(
             parse_args(args(&["--print-socket-path"])),
@@ -418,6 +534,65 @@ mod tests {
         assert_eq!(
             parse_args_with(args(&["--print-socket-path", "x"]), &[PRINT]),
             Invocation::Unexpected("x".into())
+        );
+    }
+
+    /// A value flag takes the next argument verbatim, or the text after `=`,
+    /// and repeated or mixed flags come back in the order given.
+    #[test]
+    fn value_flags_take_the_next_argument_or_an_inline_value() {
+        assert_eq!(
+            parse_args_with(args(&["--ssh", "user@box"]), &[SSH, PRINT]),
+            Invocation::Flags(vec![given("--ssh", Some("user@box"))])
+        );
+        assert_eq!(
+            parse_args_with(args(&["--ssh=box", "--print-socket-path"]), &[SSH, PRINT]),
+            Invocation::Flags(vec![
+                given("--ssh", Some("box")),
+                given("--print-socket-path", None)
+            ])
+        );
+        // The next argument is the value even when it looks like a flag.
+        assert_eq!(
+            parse_args_with(args(&["--ssh", "--print-socket-path"]), &[SSH, PRINT]),
+            Invocation::Flags(vec![given("--ssh", Some("--print-socket-path"))])
+        );
+    }
+
+    /// The falsifiers for the test above: a value flag with nothing after it
+    /// is a usage error, `=` only splits a flag that takes a value, and help
+    /// still wins.
+    #[test]
+    fn a_value_flag_without_its_value_is_an_error() {
+        assert_eq!(
+            parse_args_with(args(&["--ssh"]), &[SSH]),
+            Invocation::MissingValue("--ssh")
+        );
+        assert_eq!(
+            parse_args_with(args(&["--print-socket-path=x"]), &[PRINT]),
+            Invocation::Unexpected("--print-socket-path=x".into())
+        );
+        assert_eq!(
+            parse_args_with(args(&["--ssh", "box", "-h"]), &[SSH]),
+            Invocation::Help
+        );
+        assert!(missing_value_error("teiryo", "--ssh").starts_with("teiryo: '--ssh' needs a value"));
+    }
+
+    #[test]
+    fn help_lists_commands_and_value_placeholders() {
+        let text = help_with("teiryod", "Teiryo daemon.", &SAMPLE, &[BRIDGE, SSH]);
+        assert_eq!(
+            text,
+            "teiryod 0.1.0\n\
+             Teiryo daemon.\n\n\
+             Usage: teiryod [OPTIONS] [COMMAND]\n\n\
+             Commands:\n  \
+               bridge            Relay stdio to the socket\n\n\
+             Options:\n  \
+               -h, --help        Print help\n  \
+               -V, --version     Print version and build information\n  \
+               \x20   --ssh <HOST>  Connect over ssh"
         );
     }
 

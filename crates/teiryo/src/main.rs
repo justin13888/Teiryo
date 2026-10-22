@@ -17,28 +17,63 @@ use tokio::task::JoinHandle;
 
 use teiryo_core::domain::AccountId;
 use teiryo_core::protocol::handshake::PROTOCOL_VERSION;
+use teiryo_core::protocol::ssh::SshTarget;
+use teiryo_core::version::{Action as Args, Flag, Given};
 use teiryo_core::{ErrorKind, Request, Response};
 
 use app::{Action, App, DetailQuery, Trend};
 use client::{
     daemon_version_label, newest_poll_id, spawn_reconnect, spawn_update_loop, version_mismatch,
-    Client, NetEvent,
+    Client, NetEvent, Target,
 };
 
 /// The one-line description `--help` prints under the version.
 const ABOUT: &str = "Live dashboard for LLM subscription quotas. \
                      Starts teiryod on demand when it is not running.";
 
+/// Use the daemon on another host instead of this one's.
+const SSH: Flag = Flag {
+    long: "--ssh",
+    value: Some("[USER@]HOST"),
+    help: "Use the daemon on HOST, through `ssh HOST teiryod bridge` (ssh config \
+           supplies port, user and keys)",
+};
+
+/// The ssh client `--ssh` runs.
+const SSH_COMMAND: Flag = Flag {
+    long: "--ssh-command",
+    value: Some("CMD"),
+    help: "The ssh client to run with --ssh [default: $TEIRYO_SSH, else ssh]",
+};
+
+/// The daemon binary `--ssh` runs on the remote host.
+const REMOTE_DAEMON: Flag = Flag {
+    long: "--remote-daemon",
+    value: Some("PATH"),
+    help: "The teiryod to run on the --ssh host [default: teiryod on its $PATH]",
+};
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // Before anything touches the socket or the terminal: `-V` must not spawn
     // a daemon or open the dashboard.
-    if let Some(code) =
-        teiryo_core::version::handle_args("teiryo", ABOUT, &teiryo_core::build_info!())
-    {
-        std::process::exit(code);
-    }
-    match run().await {
+    let target = match teiryo_core::version::handle_args_with(
+        "teiryo",
+        ABOUT,
+        &teiryo_core::build_info!(),
+        &[SSH, SSH_COMMAND, REMOTE_DAEMON],
+    ) {
+        Args::Run => Target::Local,
+        Args::Exit(code) => std::process::exit(code),
+        Args::Flags(given) => match target(given) {
+            Ok(target) => target,
+            Err(message) => {
+                eprintln!("teiryo: {message}\n\nFor more information, try '--help'.");
+                std::process::exit(2);
+            }
+        },
+    };
+    match run(target).await {
         Ok(()) => {}
         Err(err) => {
             eprintln!("teiryo: {err}");
@@ -47,20 +82,61 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// The daemon the flags `given` name. A flag given twice takes its last
+/// value; the ssh settings mean nothing without `--ssh`, so they are refused
+/// alone rather than silently ignored.
+fn target(given: Vec<Given>) -> Result<Target, String> {
+    let mut host = None;
+    let mut command = None;
+    let mut remote_daemon = None;
+    for Given { long, value } in given {
+        let Some(value) = value else { continue };
+        match long {
+            l if l == SSH.long => host = Some(value),
+            l if l == SSH_COMMAND.long => command = Some(value),
+            _ => remote_daemon = Some(value),
+        }
+    }
+    let Some(host) = host else {
+        return Err(format!(
+            "{} and {} need --ssh",
+            SSH_COMMAND.long, REMOTE_DAEMON.long
+        ));
+    };
+    let text = |flag: &Flag, value: std::ffi::OsString| {
+        value
+            .into_string()
+            .map_err(|_| format!("the {} value is not valid UTF-8", flag.long))
+    };
+    let host = text(&SSH, host)?;
+    let remote_daemon = remote_daemon.map(|v| text(&REMOTE_DAEMON, v)).transpose()?;
+    SshTarget::new(host, command, remote_daemon).map(Target::Ssh)
+}
+
+async fn run(target: Target) -> Result<(), Box<dyn std::error::Error>> {
     // Connect (spawning the daemon if needed) before touching the terminal,
     // so connection errors print normally.
-    let mut command = match Client::connect().await {
+    let mut command = match Client::connect(&target).await {
         Ok(c) => c,
         Err(e) => match version_mismatch(&e) {
             Some(daemon) => {
-                eprintln!(
-                    "teiryo: the running daemon speaks protocol {}; this client is \
-                     v{PROTOCOL_VERSION}.\n\
-                     Stop the stale daemon (e.g. `pkill teiryod`) and relaunch — \
-                     teiryo will respawn the matching daemon automatically.",
-                    daemon_version_label(daemon)
-                );
+                match target.host() {
+                    None => eprintln!(
+                        "teiryo: the running daemon speaks protocol {}; this client is \
+                         v{PROTOCOL_VERSION}.\n\
+                         Stop the stale daemon (e.g. `pkill teiryod`) and relaunch — \
+                         teiryo will respawn the matching daemon automatically.",
+                        daemon_version_label(daemon)
+                    ),
+                    Some(host) => eprintln!(
+                        "teiryo: the daemon on {host} speaks protocol {}; this client is \
+                         v{PROTOCOL_VERSION}.\n\
+                         Install the matching teiryod on {host}, or stop its stale daemon \
+                         (e.g. `ssh {host} pkill teiryod`), and relaunch — the bridge \
+                         respawns the daemon there automatically.",
+                        daemon_version_label(daemon)
+                    ),
+                }
                 std::process::exit(2);
             }
             None => return Err(e.into()),
@@ -68,6 +144,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut app = App::new();
+    app.remote_host = target.host().map(str::to_owned);
     app.build_mismatch = command.build_mismatch();
     refresh_status(&mut command, &mut app).await;
     refresh_recent(&mut command, &mut app).await;
@@ -77,14 +154,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     load_config(&mut command, &mut app).await;
 
     let (net_tx, mut net_rx) = mpsc::unbounded_channel();
-    let mut update_task = start_update_loop(&app, net_tx.clone()).await;
+    let mut update_task = start_update_loop(&target, &app, net_tx.clone()).await;
 
     let terminal = ratatui::init();
     // The wheel scrolls the pane the pointer is over, which the terminal only
     // reports while the mouse is captured. The cost is the terminal's own
     // click-to-select, which most emulators still offer under Shift.
     let mouse = crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let result = event_loop(terminal, &mut app, &mut command, &mut net_rx, &net_tx).await;
+    let result = event_loop(
+        terminal,
+        &target,
+        &mut app,
+        &mut command,
+        &mut net_rx,
+        &net_tx,
+    )
+    .await;
     if mouse {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -97,10 +182,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Open the dedicated update connection and start the long-poll loop.
 async fn start_update_loop(
+    target: &Target,
     app: &App,
     tx: mpsc::UnboundedSender<NetEvent>,
 ) -> Option<JoinHandle<()>> {
-    match Client::connect().await {
+    match Client::connect(target).await {
         Ok(client) => Some(spawn_update_loop(
             client,
             newest_poll_id(&app.statuses),
@@ -116,6 +202,7 @@ async fn start_update_loop(
 
 async fn event_loop(
     mut terminal: ratatui::DefaultTerminal,
+    target: &Target,
     app: &mut App,
     command: &mut Client,
     net_rx: &mut mpsc::UnboundedReceiver<NetEvent>,
@@ -130,6 +217,7 @@ async fn event_loop(
     // task it re-created may outlive this function.
     let result = drive(
         &mut terminal,
+        target,
         app,
         command,
         net_rx,
@@ -152,6 +240,7 @@ async fn event_loop(
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     terminal: &mut ratatui::DefaultTerminal,
+    target: &Target,
     app: &mut App,
     command: &mut Client,
     net_rx: &mut mpsc::UnboundedReceiver<NetEvent>,
@@ -251,7 +340,7 @@ async fn drive(
                     if let Some(task) = update_task.take() {
                         task.abort();
                     }
-                    *update_task = start_update_loop(app, net_tx.clone()).await;
+                    *update_task = start_update_loop(target, app, net_tx.clone()).await;
                 }
             },
             _ = tick.tick() => {
@@ -263,7 +352,7 @@ async fn drive(
                 // exits at once against the stale one.
                 let idle = reconnect_task.as_ref().is_none_or(JoinHandle::is_finished);
                 if app.disconnected && app.incompatible.is_none() && idle {
-                    *reconnect_task = Some(spawn_reconnect(net_tx.clone()));
+                    *reconnect_task = Some(spawn_reconnect(target.clone(), net_tx.clone()));
                 }
                 // Otherwise the tick just redraws countdowns and the spinner.
             }
@@ -466,5 +555,54 @@ fn error_kind_text(kind: ErrorKind) -> &'static str {
         ErrorKind::BadRequest => "bad request",
         ErrorKind::Storage => "storage error",
         ErrorKind::Internal => "daemon error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use teiryo_core::version::{parse_args_with, Invocation};
+
+    /// What the command line `args` resolves to.
+    fn target_of(args: &[&str]) -> Result<Target, String> {
+        let flags = [SSH, SSH_COMMAND, REMOTE_DAEMON];
+        match parse_args_with(args.iter().map(std::ffi::OsString::from), &flags) {
+            Invocation::Flags(given) => target(given),
+            other => panic!("{args:?} parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ssh_flags_build_a_remote_target() {
+        let Target::Ssh(ssh) = target_of(&[
+            "--ssh",
+            "me@box",
+            "--ssh-command=/opt/ssh",
+            "--remote-daemon",
+            "~/.cargo/bin/teiryod",
+        ])
+        .unwrap() else {
+            panic!("--ssh is remote");
+        };
+        assert_eq!(ssh.host, "me@box");
+        assert_eq!(ssh.program, "/opt/ssh");
+        assert_eq!(ssh.remote_daemon, "~/.cargo/bin/teiryod");
+
+        // The last of a repeated flag wins, and the defaults fill the rest.
+        let Target::Ssh(ssh) = target_of(&["--ssh", "a", "--ssh", "b"]).unwrap() else {
+            panic!("--ssh is remote");
+        };
+        assert_eq!(ssh.host, "b");
+        assert_eq!(ssh.remote_daemon, "teiryod");
+    }
+
+    /// The ssh settings alone, without a host to use them on, are refused
+    /// rather than ignored; so is a host ssh would read as an option.
+    #[test]
+    fn ssh_settings_without_a_host_are_refused() {
+        let err = target_of(&["--ssh-command", "/opt/ssh"]).unwrap_err();
+        assert!(err.contains("need --ssh"), "{err}");
+        assert!(target_of(&["--remote-daemon", "x"]).is_err());
+        assert!(target_of(&["--ssh", "-oProxyCommand=x"]).is_err());
     }
 }

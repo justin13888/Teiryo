@@ -18,7 +18,8 @@ libc = "0.2"
 notify.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+# `io-std`: `teiryod bridge` relays its own stdin and stdout.
+tokio = { workspace = true, features = ["io-std"] }
 tokio-util.workspace = true
 toml.workspace = true
 toml_edit.workspace = true

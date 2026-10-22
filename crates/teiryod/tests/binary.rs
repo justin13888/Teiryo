@@ -168,6 +168,173 @@ mod binding {
         assert!(log.contains("teiryod stopped"), "{log}");
     }
 
+    mod bridge {
+        use super::*;
+        use futures::{SinkExt, StreamExt};
+        use teiryo_core::protocol::handshake::encode_commit;
+        use teiryo_core::protocol::ssh::SshTarget;
+        use teiryo_core::{
+            client_handshake, decode_frame, encode_frame, framed, Request, Response,
+            PROTOCOL_MAGIC, PROTOCOL_VERSION,
+        };
+        use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+        /// The commit these test clients announce.
+        const CLIENT_COMMIT: &str = "0123456789ab";
+
+        /// Bounded: a hung bridge or daemon fails the test rather than
+        /// hanging it.
+        async fn bounded<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+            tokio::time::timeout(Duration::from_secs(20), fut)
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+        }
+
+        /// `teiryod bridge` in the scratch environment, its stdio piped.
+        fn bridge(scratch: &Scratch) -> tokio::process::Child {
+            let mut cmd = tokio::process::Command::from(scratch.command());
+            cmd.arg("bridge")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            cmd.spawn().unwrap()
+        }
+
+        /// The bridge child's stdout and stdin as one stream.
+        fn stdio(
+            child: &mut tokio::process::Child,
+        ) -> tokio::io::Join<tokio::process::ChildStdout, tokio::process::ChildStdin> {
+            tokio::io::join(child.stdout.take().unwrap(), child.stdin.take().unwrap())
+        }
+
+        /// A whole session over `stream`: the handshake, a request, and the
+        /// `Shutdown` that stops the daemon the bridge spawned.
+        async fn session<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, scratch: &Scratch) {
+            let daemon_commit = bounded(
+                "the handshake",
+                client_handshake(&mut stream, CLIENT_COMMIT),
+            )
+            .await
+            .expect("the daemon accepts a client of its own version");
+            assert!(!daemon_commit.is_empty());
+            let mut framed = framed(stream);
+            framed
+                .send(
+                    encode_frame(&Request::Status {
+                        provider: None,
+                        account: None,
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let frame = bounded("Status", framed.next()).await.unwrap().unwrap();
+            assert!(
+                matches!(decode_frame(&frame).unwrap(), Response::Status(_)),
+                "Status answers with the daemon's statuses"
+            );
+            framed
+                .send(encode_frame(&Request::Shutdown).unwrap())
+                .await
+                .unwrap();
+            let socket = scratch.socket();
+            wait_for("the daemon to stop", || !socket.exists());
+        }
+
+        /// Stop the daemon a bridge spawned, over a direct connection.
+        async fn stop_daemon(scratch: &Scratch) {
+            let stream = tokio::net::UnixStream::connect(scratch.socket())
+                .await
+                .unwrap();
+            session(stream, scratch).await;
+        }
+
+        /// Piped stdio in, the daemon's socket out: the bridge spawns the
+        /// daemon nothing was running, relays a session to it, and exits
+        /// cleanly once the daemon closes.
+        #[tokio::test]
+        async fn bridge_relays_a_session_to_the_daemon_it_spawns() {
+            let scratch = Scratch::new();
+            assert!(!scratch.socket().exists());
+            let mut child = bridge(&scratch);
+            session(stdio(&mut child), &scratch).await;
+
+            let status = bounded("the bridge to exit", child.wait()).await.unwrap();
+            assert!(status.success(), "exit status {status:?}");
+        }
+
+        /// The bridge never reads the stream, so the daemon behind it is
+        /// what refuses a client of another version, in the reject layout
+        /// that names its own version, and the bridge ends cleanly with it.
+        #[tokio::test]
+        async fn a_version_mismatch_passes_through_the_bridge() {
+            let scratch = Scratch::new();
+            let mut child = bridge(&scratch);
+            let mut stream = stdio(&mut child);
+
+            let mut hello = PROTOCOL_MAGIC.to_vec();
+            hello.extend_from_slice(&(PROTOCOL_VERSION + 1).to_le_bytes());
+            hello.extend_from_slice(&encode_commit(CLIENT_COMMIT));
+            stream.write_all(&hello).await.unwrap();
+            let mut reply = [0u8; 3];
+            bounded("the reject", stream.read_exact(&mut reply))
+                .await
+                .unwrap();
+            assert_eq!(reply[0], 0x01, "rejected");
+            assert_eq!(u16::from_le_bytes([reply[1], reply[2]]), PROTOCOL_VERSION);
+            // The daemon left our commit unread, which its socket reports as
+            // a reset; the bridge turns that into a plain end of stream.
+            let mut rest = Vec::new();
+            bounded("the end of stream", stream.read_to_end(&mut rest))
+                .await
+                .unwrap();
+            assert!(rest.is_empty(), "{rest:?}");
+            let status = bounded("the bridge to exit", child.wait()).await.unwrap();
+            assert!(status.success(), "exit status {status:?}");
+
+            stop_daemon(&scratch).await;
+        }
+
+        /// A stand-in for ssh: checks ssh's own options, drops them and the
+        /// host, and runs the remote command through a shell as sshd would,
+        /// in the scratch environment.
+        fn fake_ssh(scratch: &Scratch) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = scratch.0.join("fake-ssh");
+            let script = format!(
+                "#!/bin/sh\n\
+                 [ \"$1 $2 $3 $4\" = '-T -o BatchMode=yes box' ] || {{ echo \"fake-ssh: $*\" >&2; exit 64; }}\n\
+                 shift 4\n\
+                 exec env -i HOME={home} XDG_RUNTIME_DIR={run} XDG_DATA_HOME={data} \
+                 XDG_CONFIG_HOME={config} /bin/sh -c \"$*\"\n",
+                home = scratch.0.join("home").display(),
+                run = scratch.runtime_dir().display(),
+                data = scratch.0.join("data").display(),
+                config = scratch.0.join("config").display(),
+            );
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+
+        /// The client's ssh transport, over a fake ssh that runs `teiryod
+        /// bridge` locally: what `teiryo --ssh box` does end to end.
+        #[tokio::test]
+        async fn a_client_over_ssh_reaches_the_remote_daemon() {
+            let scratch = Scratch::new();
+            let target = SshTarget::new(
+                "box".into(),
+                Some(fake_ssh(&scratch).into_os_string()),
+                Some(TEIRYOD.into()),
+            )
+            .unwrap();
+            let stream = target.connect().unwrap();
+            session(stream, &scratch).await;
+        }
+    }
+
     #[test]
     fn an_early_error_after_the_bind_still_unlinks_the_socket() {
         let scratch = Scratch::new();

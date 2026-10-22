@@ -40,9 +40,17 @@ pub fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App, now: DateTime
     );
 }
 
-/// "Teiryō · claude/default · 4 windows"
+/// "Teiryō · claude/default · 4 windows", with "@ host" after the name when
+/// the daemon is a remote one. On this line rather than the connection line
+/// so it stays up while that line says the daemon is unreachable.
 fn identity_line(app: &App) -> Line<'static> {
     let mut spans = vec![Span::styled("Teiryō", theme::heading())];
+    if let Some(host) = &app.remote_host {
+        spans.push(Span::styled(
+            format!(" @ {}", truncate(host, 24)),
+            Style::default().fg(theme::ACCENT),
+        ));
+    }
     let accounts = app.statuses.len();
     let windows: usize = app.statuses.iter().map(|s| s.windows.len()).sum();
     if accounts == 0 {
@@ -727,5 +735,21 @@ mod tests {
         let line = text(&connection_line(&app, Utc::now()));
         assert!(line.contains("daemon speaks protocol v10"), "{line}");
         assert!(!line.contains("build"), "{line}");
+    }
+
+    /// A remote daemon's host follows the name, and stays there while the
+    /// connection line says the daemon is unreachable; a local daemon shows
+    /// no host at all.
+    #[test]
+    fn a_remote_daemon_names_its_host_in_the_header() {
+        let mut app = App::new();
+        assert_eq!(text(&identity_line(&app)), "Teiryō  waiting for the daemon");
+
+        app.remote_host = Some("me@box".into());
+        app.disconnected = true;
+        let line = identity_line(&app);
+        assert_eq!(line.spans[1].content, " @ me@box");
+        assert_eq!(line.spans[1].style, Style::default().fg(theme::ACCENT));
+        assert!(text(&connection_line(&app, Utc::now())).contains("daemon unreachable"));
     }
 }
