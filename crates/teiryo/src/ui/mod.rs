@@ -631,7 +631,7 @@ mod tests {
 
         assert!(out.contains("1.03× pace"), "expected the average:\n{out}");
         assert!(
-            out.contains("3.00× now ("),
+            out.contains("3.00× now·20m ("),
             "expected the recent rate with its interval:\n{out}"
         );
         // The runway is the recent rate's, not the average's: the 38% left
@@ -1518,7 +1518,7 @@ mod tests {
             recent_ramp("session_5h", 20, 62.0, 62.0),
         );
         let out = rendered(&mut app, 140, 40);
-        assert!(out.contains("0.00× now ("), "{out}");
+        assert!(out.contains("0.00× now·20m ("), "{out}");
         assert!(out.contains("cap in ∞ ("), "{out}");
     }
 
@@ -1531,7 +1531,7 @@ mod tests {
         );
         let out = rendered(&mut app, 36, 40);
         assert!(out.contains("3.00× now"), "{out}");
-        assert!(!out.contains("3.00× now ("), "{out}");
+        assert!(!out.contains("3.00× now·"), "{out}");
     }
 
     #[test]

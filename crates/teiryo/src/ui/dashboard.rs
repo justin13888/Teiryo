@@ -418,6 +418,11 @@ const MIN_BAR: usize = 8;
 /// numerically the pace itself (`u + (u/E)(1-E) = u/E`); projected from the
 /// recent rate it is not, which is why it now earns its place.
 ///
+/// `now` names how far back it reaches — `now·12h` — because "recent" on a
+/// weekly window can be half a day or two, and a projection from it means
+/// "if the last 12 hours repeat". The intervals are the rate's measurement
+/// noise under that assumption, not odds on how the window ends.
+///
 /// `None` when the window publishes no `reset_at`: every one of these is
 /// derived from the window's own start or end, so there is nothing to say.
 fn derived_line(
@@ -461,7 +466,11 @@ fn derived_line(
         let (glyph, color) = pace_style(rate.pace);
         let value = format!("{glyph} {:.2}× now", rate.pace);
         fields.push((
-            format!("{value} {}", rate_interval(&rate)),
+            format!(
+                "{value}·{} {}",
+                format_lookback(rate.to - rate.from),
+                rate_interval(&rate)
+            ),
             Some(value),
             Style::default().fg(color),
         ));
@@ -582,6 +591,18 @@ pub fn rate_interval(rate: &metrics::RateEstimate) -> String {
     format!("({:.1}–{:.1})", rate.low, rate.high)
 }
 
+/// How far back a recent rate reaches, as `now·27h` prints it: whole hours,
+/// or whole minutes under one. Coarse on purpose — it says which stretch of
+/// the day "now" means, and seconds would only crowd the row.
+fn format_lookback(span: chrono::Duration) -> String {
+    let minutes = span.num_minutes().max(0);
+    if minutes >= 60 {
+        format!("{}h", (minutes + 30) / 60)
+    } else {
+        format!("{minutes}m")
+    }
+}
+
 /// Glyph and colour for a burn rate, whether it is the average since the
 /// window opened or a rate measured over a shorter stretch.
 fn pace_style(pace: f64) -> (&'static str, ratatui::style::Color) {
@@ -653,6 +674,18 @@ mod tests {
             }),
             ..view(label)
         }
+    }
+
+    #[test]
+    fn a_lookback_prints_in_whole_minutes_then_whole_hours() {
+        let minutes = chrono::Duration::minutes;
+        assert_eq!(format_lookback(minutes(0)), "0m");
+        assert_eq!(format_lookback(minutes(59)), "59m");
+        assert_eq!(format_lookback(minutes(60)), "1h");
+        assert_eq!(format_lookback(minutes(89)), "1h");
+        assert_eq!(format_lookback(minutes(90)), "2h");
+        assert_eq!(format_lookback(chrono::Duration::hours(48)), "48h");
+        assert_eq!(format_lookback(minutes(-5)), "0m");
     }
 
     /// The label column is exactly its budget whatever the label is made of.
