@@ -1,0 +1,142 @@
+name: Release
+
+# A release is a signed annotated tag named by its commit's version,
+# `YYYY.MM.DD-<sha12>` (see `mise run release` and
+# `teiryo_core::version::release_version`). Nothing is published until the
+# tag is proven to be that: signed and verified by GitHub, on master, named by
+# the rule, and matching what the built binaries report for `-V`.
+
+on:
+  push:
+    tags: ["[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  verify:
+    name: Verify the tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Signed, annotated, verified by GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG")
+          if [ "$(jq -r .object.type <<<"$ref")" != tag ]; then
+            echo "::error::$TAG is a lightweight tag; a release needs a signed annotated tag"
+            exit 1
+          fi
+          tag=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$(jq -r .object.sha <<<"$ref")")
+          if [ "$(jq -r .verification.verified <<<"$tag")" != true ]; then
+            echo "::error::$TAG's signature is not verified by GitHub ($(jq -r .verification.reason <<<"$tag"))"
+            exit 1
+          fi
+          if [ "$(jq -r .object.type <<<"$tag")" != commit ]; then
+            echo "::error::$TAG does not tag a commit"
+            exit 1
+          fi
+          commit=$(jq -r .object.sha <<<"$tag")
+          # The build jobs check out the event's commit, so the commit verified
+          # here must be that one: a tag moved since the push is refused.
+          if [ "$commit" != "$GITHUB_SHA" ]; then
+            echo "::error::$TAG now tags $commit, not the pushed $GITHUB_SHA"
+            exit 1
+          fi
+          echo "COMMIT=$commit" >>"$GITHUB_ENV"
+      - name: On master
+        run: |
+          if ! git merge-base --is-ancestor "$COMMIT" origin/master; then
+            echo "::error::$TAG tags $COMMIT, which is not on master"
+            exit 1
+          fi
+      - name: Named by its commit's version
+        run: |
+          set -eu
+          want="$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y.%m.%d "$COMMIT")-$(printf %s "$COMMIT" | cut -c1-12)"
+          if [ "$TAG" != "$want" ]; then
+            echo "::error::$TAG tags a commit whose version is $want"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      # The build script reads the commit and its date from git, so the
+      # checkout must be a repository, not an export.
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # No cache: a release builds from nothing but the tagged tree.
+      - name: Build
+        run: cargo build --release --locked -p teiryo -p teiryod
+      - name: Binaries report the tag as their version
+        run: |
+          set -eu
+          for bin in teiryo teiryod; do
+            got=$("target/release/$bin" -V | sed -n 1p)
+            if [ "$got" != "$bin $TAG" ]; then
+              echo "::error::$bin -V reports '$got', not '$bin $TAG'"
+              exit 1
+            fi
+          done
+      # Both binaries in one directory: the TUI starts the teiryod beside it.
+      - name: Package
+        run: |
+          set -eu
+          name="teiryo-$TAG-${{ matrix.target }}"
+          mkdir "$name"
+          cp target/release/teiryo target/release/teiryod README.md LICENSE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: teiryo-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum teiryo-*.tar.gz >SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/teiryo-*.tar.gz
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" dist/teiryo-*.tar.gz dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Teiryo $TAG" \
+            --generate-notes
