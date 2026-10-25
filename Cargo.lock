@@ -1755,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "teiryo"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1773,7 +1773,7 @@ dependencies = [
 
 [[package]]
 name = "teiryo-core"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1795,7 +1795,7 @@ dependencies = [
 
 [[package]]
 name = "teiryo-providers"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1813,7 +1813,7 @@ dependencies = [
 
 [[package]]
 name = "teiryod"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",

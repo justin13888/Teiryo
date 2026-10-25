@@ -8,10 +8,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/justin13888/Teiryo"
+# Never published to crates.io, so no package carries a version: a build is
+# identified by its commit (see `teiryo_core::version`). Omitting `version`
+# already implies this; it is spelled out so the intent does not rest on it.
+publish = false
 
 [workspace.dependencies]
 teiryo-core = { path = "crates/teiryo-core" }

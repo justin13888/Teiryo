@@ -1,9 +1,9 @@
 [package]
 name = "teiryo-core"
-version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "Domain types, wire protocol, adapter traits, and storage for Teiryo"
 
 [dependencies]
