@@ -322,7 +322,9 @@ impl RateEstimate {
     }
 
     /// Whether the interval is narrow enough that widening the lookback would
-    /// trade recency for nothing a reader could see.
+    /// trade recency for nothing a reader could see. Not the only reason to
+    /// stop widening: [`estimate_rate`] also stops where the older readings
+    /// were burnt at a different rate.
     ///
     /// Never with two readings: their interval is the rounding bound alone,
     /// with no step scatter to say how bursty the use was, so it can look
@@ -451,6 +453,21 @@ fn fit(run: &[(DateTime<Utc>, f64)], quantum: f64, span_secs: f64) -> Option<Rat
 /// rate, until it is narrow enough or the stretch runs out. `from` says where
 /// it ended up, so a caller can say how recent "now" really is.
 ///
+/// Widening buys precision only while the older readings were burnt at the
+/// rate the newer ones were, so it also stops where they were not: when the
+/// readings a doubling would add, fitted on their own, have an interval
+/// disjoint from the one already measured. Without that stop a weekly window
+/// in whole percent never stopped at all — a quarter-of-the-rate interval
+/// needs some hundred one-point steps, more than a week's whole budget — so
+/// "now" was in practice everything since the last gap, and a push after an
+/// idle stretch read as the average of the two. Disjoint intervals rather
+/// than one centre outside the other's interval, because the rounding end of
+/// each is exact: a steady rate lies inside both, so it never trips this,
+/// where a centre test stops on step scatter alone. The stop acts only at
+/// the doublings, so a change between two is still partly blended, and
+/// bursty use now and then stops it short — on a shorter stretch with a
+/// wider interval, which `from` reports.
+///
 /// The cut on a fall in `used` is deliberately almost *any* fall rather than
 /// one large enough to be a reset. Inside a single window instance usage only
 /// climbs, so a fall is always either a restart or a revision, and neither
@@ -511,18 +528,30 @@ pub fn estimate_rate(
     let quantum = reading_quantum(&matching[first..]);
     let span_secs = span.num_seconds() as f64;
 
-    // Widen from a tenth of the window until the interval is readable or the
-    // stretch is exhausted. Each pass is a suffix of the stretch, so the
-    // newest reading always anchors it.
+    // Widen from a tenth of the window until the interval is readable, the
+    // stretch is exhausted, or the readings a widening would add were burnt
+    // at a rate the newer ones rule out. Each pass is a suffix of the
+    // stretch, so the newest reading always anchors it.
     let mut lookback = recent_lookback(span);
+    let mut narrower: Option<RateEstimate> = None;
     loop {
         let floor = newest_ts - lookback;
         let start = stretch.partition_point(|(ts, _)| *ts < floor);
         let exhausted = start == 0;
+        if let Some(newer) = narrower {
+            let added = stretch[start..].partition_point(|(ts, _)| *ts <= newer.from);
+            let older = fit(&stretch[start..start + added], quantum, span_secs);
+            if older.is_some_and(|older| older.high < newer.low || older.low > newer.high) {
+                return Some(newer);
+            }
+        }
         match fit(&stretch[start..], quantum, span_secs) {
             Some(estimate) if exhausted || estimate.is_precise() => return Some(estimate),
             None if exhausted => return None,
-            _ => lookback = lookback * 2,
+            estimate => {
+                narrower = estimate;
+                lookback = lookback * 2;
+            }
         }
     }
 }
@@ -1301,6 +1330,114 @@ mod tests {
         assert!(got.low <= 0.84 && 0.84 <= got.high, "{got:?}");
         // One step over 12 hours of a week is 0.14× each side, at least.
         assert!(got.width() >= 0.28 - 1e-9, "{got:?}");
+    }
+
+    /// A weekly window in whole percent, read every ten minutes for 48
+    /// hours, two days from its reset; `used(hours_ago)` is the reading.
+    fn weekly_series(used: impl Fn(i64) -> f64) -> (EffectiveWindow, Vec<QuotaSnapshot>) {
+        let mut weekly = effective(10.0, 4);
+        weekly.reset_at = now() + Duration::days(2);
+        weekly.start = weekly.reset_at - Duration::days(7);
+        let series = (0..=48 * 6)
+            .map(|k| {
+                let mut p = point(k * 10, used(k * 10));
+                p.reset_at = Some(weekly.reset_at);
+                p
+            })
+            .collect();
+        (weekly, series)
+    }
+
+    #[test]
+    fn a_push_after_an_idle_stretch_is_measured_from_the_push() {
+        // 36 idle hours, then 12 at two points an hour. Widening could never
+        // make this interval precise — whole percent on a week needs some
+        // hundred steps for that — so before the regime stop the lookback ran
+        // to all 48 hours and read the push at a quarter of its rate.
+        let (weekly, series) = weekly_series(|minutes| {
+            let hours_into_push = (720 - minutes).max(0) as f64 / 60.0;
+            20.0 + (2.0 * hours_into_push).floor()
+        });
+        let got = estimate_rate(&weekly, &series, max_gap(), now()).expect("a rate");
+        assert_eq!(got.from, now() - Duration::hours(12));
+        // 24 points over 12 hours of a 168-hour window.
+        assert_eq!(as_shown(Some(got.pace)), Some(3.36));
+    }
+
+    #[test]
+    fn a_steady_burn_still_widens_across_the_whole_stretch() {
+        // The same 48 hours at a steady half point an hour: every doubling
+        // adds readings at the rate already measured, so nothing stops it
+        // short of the stretch running out.
+        let (weekly, series) = weekly_series(|minutes| {
+            let hours_in = (2880 - minutes) as f64 / 60.0;
+            20.0 + (0.5 * hours_in).floor()
+        });
+        let got = estimate_rate(&weekly, &series, max_gap(), now()).expect("a rate");
+        assert_eq!(got.from, now() - Duration::hours(48));
+        // 24 points over 48 hours of a 168-hour window.
+        assert_eq!(as_shown(Some(got.pace)), Some(0.84));
+    }
+
+    #[test]
+    fn a_doubling_of_the_rate_is_told_apart_from_the_blend_it_would_make() {
+        // A point an hour, then two an hour for the last 12. The 24-hour
+        // blend sits close enough to the newer rate that its interval still
+        // overlaps it; the older 12 hours on their own do not, and they are
+        // what says the rate changed.
+        let (weekly, series) = weekly_series(|minutes| {
+            let hours_in = (2880 - minutes) as f64 / 60.0;
+            let push = (hours_in - 36.0).max(0.0);
+            20.0 + hours_in.min(36.0).floor() + (2.0 * push).floor()
+        });
+        let got = estimate_rate(&weekly, &series, max_gap(), now()).expect("a rate");
+        assert_eq!(got.from, now() - Duration::hours(12));
+        assert_eq!(as_shown(Some(got.pace)), Some(3.36));
+    }
+
+    #[test]
+    fn the_stretch_running_out_does_not_skip_the_change_of_rate() {
+        // Only 20 hours of history, so the second pass reaches all of it —
+        // and must still stop at the 12 hours the push occupies.
+        let (weekly, mut series) = weekly_series(|minutes| {
+            let hours_into_push = (720 - minutes).max(0) as f64 / 60.0;
+            20.0 + (2.0 * hours_into_push).floor()
+        });
+        series.retain(|p| p.ts >= now() - Duration::hours(20));
+        let got = estimate_rate(&weekly, &series, max_gap(), now()).expect("a rate");
+        assert_eq!(got.from, now() - Duration::hours(12));
+    }
+
+    #[test]
+    fn a_shift_the_intervals_cannot_resolve_does_not_stop_the_widening() {
+        // A point and a half an hour, then one an hour for the last 12. The
+        // older stretch's centre, 2.52×, lies above the newer interval — but
+        // the two intervals overlap, so the readings do not say the rate
+        // changed, and stopping on a centre alone would throw away three
+        // quarters of the history over step scatter.
+        let (weekly, series) = weekly_series(|minutes| {
+            let hours_in = (2880 - minutes) as f64 / 60.0;
+            let recent = (hours_in - 36.0).max(0.0);
+            20.0 + (1.5 * hours_in.min(36.0)).floor() + recent.floor()
+        });
+        let got = estimate_rate(&weekly, &series, max_gap(), now()).expect("a rate");
+        assert!(got.from < now() - Duration::hours(12), "{got:?}");
+    }
+
+    #[test]
+    fn going_idle_after_a_push_reads_as_idle() {
+        // The mirror of the push: 36 hours at two points an hour, then 12
+        // idle. The rate the user is burning now is none, and blending the
+        // push back in would project a cap that is not coming. A flat 12
+        // hours is precise enough on its own, so this pins the reading
+        // rather than the regime stop.
+        let (weekly, series) = weekly_series(|minutes| {
+            let hours_in = (2880 - minutes).min(2160) as f64 / 60.0;
+            20.0 + (2.0 * hours_in).floor()
+        });
+        let got = estimate_rate(&weekly, &series, max_gap(), now()).expect("a rate");
+        assert_eq!(got.from, now() - Duration::hours(12));
+        assert_eq!(as_shown(Some(got.pace)), Some(0.0));
     }
 
     /// The shrunk case that retired the least-squares fit: a slow weekly
