@@ -1,11 +1,13 @@
 //! What `teiryo -V` and `teiryod -V` print, and how both read their argv.
 //!
-//! Both binaries are installed from source, and the daemon outlives the TUI
-//! across upgrades, so the crate version alone cannot say which build is
-//! running: every build of a checkout is `0.1.0`. The version text also carries
-//! the commit, the profile, the compiler, the build time and the wire protocol
-//! version, captured by `build_info.rs` beside this crate (each binary's build
-//! script) and read with [`build_info!`].
+//! Teiryo is never published to crates.io, so no crate carries a version: a
+//! build is named by the commit it came from. The version is that commit's
+//! committer date in UTC and its hash, `YYYY.MM.DD-<sha12>`
+//! ([`release_version`]), so every build of one commit reports the same one,
+//! and a release is a signed tag of exactly that name. The version text also
+//! carries the commit date, the profile, the compiler, the build time and the
+//! wire protocol version, captured by `build_info.rs` beside this crate (each
+//! binary's build script) and read with [`build_info!`].
 
 use std::ffi::OsString;
 
@@ -15,8 +17,6 @@ use crate::protocol::handshake::PROTOCOL_VERSION;
 /// not establish it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuildInfo {
-    /// The crate version, `CARGO_PKG_VERSION`.
-    pub version: &'static str,
     /// The commit built from, `-dirty` when the tree had uncommitted changes.
     pub commit: &'static str,
     /// The committer date of that commit, ISO 8601.
@@ -35,7 +35,6 @@ pub struct BuildInfo {
 macro_rules! build_info {
     () => {
         $crate::version::BuildInfo {
-            version: env!("CARGO_PKG_VERSION"),
             commit: env!("TEIRYO_COMMIT_HASH"),
             commit_date: env!("TEIRYO_COMMIT_DATE"),
             profile: env!("TEIRYO_BUILD_PROFILE"),
@@ -43,6 +42,31 @@ macro_rules! build_info {
             build_epoch: env!("TEIRYO_BUILD_EPOCH"),
         }
     };
+}
+
+impl BuildInfo {
+    /// This build's version; see [`release_version`].
+    pub fn version(&self) -> String {
+        release_version(self.commit, self.commit_date)
+    }
+}
+
+/// The version of a build of `commit`, committed at `commit_date` (ISO 8601):
+/// the commit date in UTC, then the commit, as `2026.10.25-91a0a7a1b2c3`. A
+/// `-dirty` commit keeps its suffix. An `unknown` commit is version `unknown`,
+/// and a commit whose date is not known is its own version.
+///
+/// A release tag is named by the same rule (`mise run release`), and the
+/// release workflow checks each binary's `-V` against the tag, so the two
+/// cannot drift apart unnoticed.
+pub fn release_version(commit: &str, commit_date: &str) -> String {
+    if commit == "unknown" {
+        return commit.to_owned();
+    }
+    match chrono::DateTime::parse_from_rfc3339(commit_date) {
+        Ok(at) => format!("{}-{commit}", at.to_utc().format("%Y.%m.%d")),
+        Err(_) => commit.to_owned(),
+    }
 }
 
 /// Whether two builds, named by their `TEIRYO_COMMIT_HASH`, are the same
@@ -68,7 +92,7 @@ pub fn long_version(name: &str, info: &BuildInfo) -> String {
          rustc:    {}\n\
          built:    {}\n\
          protocol: v{PROTOCOL_VERSION}",
-        info.version,
+        info.version(),
         info.commit,
         info.commit_date,
         info.profile,
@@ -321,7 +345,7 @@ pub fn help_with(name: &str, about: &str, info: &BuildInfo, flags: &[Flag]) -> S
          Usage: {name} {usage}\n\n\
          {commands}\
          Options:\n{}",
-        info.version,
+        info.version(),
         section(&mut rows.into_iter())
     )
 }
@@ -350,7 +374,6 @@ mod tests {
     use super::*;
 
     const SAMPLE: BuildInfo = BuildInfo {
-        version: "0.1.0",
         commit: "f78c2ce1a2b3",
         commit_date: "2026-10-07T15:51:43-04:00",
         profile: "release",
@@ -367,7 +390,7 @@ mod tests {
         assert_eq!(
             long_version("teiryo", &SAMPLE),
             format!(
-                "teiryo 0.1.0\n\
+                "teiryo 2026.10.07-f78c2ce1a2b3\n\
                  commit:   f78c2ce1a2b3 (2026-10-07T15:51:43-04:00)\n\
                  profile:  release\n\
                  rustc:    rustc 1.99.1 (58cf8f9c3 2026-10-13)\n\
@@ -382,7 +405,6 @@ mod tests {
     #[test]
     fn unknown_facts_keep_the_layout() {
         let unknown = BuildInfo {
-            version: "0.1.0",
             commit: "unknown",
             commit_date: "unknown",
             profile: "unknown",
@@ -392,9 +414,50 @@ mod tests {
         let text = long_version("teiryod", &unknown);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 6, "{text}");
-        assert_eq!(lines[0], "teiryod 0.1.0");
+        assert_eq!(lines[0], "teiryod unknown");
         assert_eq!(lines[1], "commit:   unknown (unknown)");
         assert_eq!(lines[4], "built:    unknown");
+    }
+
+    #[test]
+    fn release_version_is_the_utc_commit_date_and_the_commit() {
+        assert_eq!(
+            release_version("91a0a7a1b2c3", "2026-10-25T12:00:00Z"),
+            "2026.10.25-91a0a7a1b2c3"
+        );
+        assert_eq!(
+            release_version("91a0a7a1b2c3-dirty", "2026-10-25T12:00:00Z"),
+            "2026.10.25-91a0a7a1b2c3-dirty"
+        );
+    }
+
+    /// The falsifier for the test above: the date is the UTC one, not the
+    /// committer's local one, on either side of midnight. Otherwise the same
+    /// commit would be versioned by wherever it was committed.
+    #[test]
+    fn release_version_dates_in_utc() {
+        assert_eq!(
+            release_version("91a0a7a1b2c3", "2026-10-25T22:00:00-04:00"),
+            "2026.10.26-91a0a7a1b2c3"
+        );
+        assert_eq!(
+            release_version("91a0a7a1b2c3", "2026-10-25T01:00:00+02:00"),
+            "2026.10.24-91a0a7a1b2c3"
+        );
+    }
+
+    #[test]
+    fn release_version_without_a_commit_or_a_date() {
+        assert_eq!(
+            release_version("unknown", "2026-10-25T12:00:00Z"),
+            "unknown"
+        );
+        assert_eq!(release_version("unknown", "unknown"), "unknown");
+        assert_eq!(release_version("91a0a7a1b2c3", "unknown"), "91a0a7a1b2c3");
+        assert_eq!(
+            release_version("91a0a7a1b2c3", "2026-10-25"),
+            "91a0a7a1b2c3"
+        );
     }
 
     #[test]
@@ -478,7 +541,7 @@ mod tests {
         let text = help("teiryod", "Teiryo daemon.", &SAMPLE);
         assert_eq!(
             text,
-            "teiryod 0.1.0\n\
+            "teiryod 2026.10.07-f78c2ce1a2b3\n\
              Teiryo daemon.\n\n\
              Usage: teiryod [OPTIONS]\n\n\
              Options:\n  \
@@ -584,7 +647,7 @@ mod tests {
         let text = help_with("teiryod", "Teiryo daemon.", &SAMPLE, &[BRIDGE, SSH]);
         assert_eq!(
             text,
-            "teiryod 0.1.0\n\
+            "teiryod 2026.10.07-f78c2ce1a2b3\n\
              Teiryo daemon.\n\n\
              Usage: teiryod [OPTIONS] [COMMAND]\n\n\
              Commands:\n  \
@@ -601,7 +664,7 @@ mod tests {
         let text = help_with("teiryod", "Teiryo daemon.", &SAMPLE, &[PRINT]);
         assert_eq!(
             text,
-            "teiryod 0.1.0\n\
+            "teiryod 2026.10.07-f78c2ce1a2b3\n\
              Teiryo daemon.\n\n\
              Usage: teiryod [OPTIONS]\n\n\
              Options:\n  \

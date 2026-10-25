@@ -17,8 +17,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 fn main() {
     // An explicit hash wins over the local probe, for builds from an exported
     // tree that has no git metadata to ask.
+    // Exactly 12 characters, not `--short=12`: that grows where the clone holds
+    // an ambiguous prefix, and the hash is part of the version a release tag
+    // must equal (`teiryo_core::version::release_version`). The override is
+    // used verbatim, so it must be those same 12 characters to match a build
+    // from git.
     let commit = env_override("TEIRYO_BUILD_SHA").or_else(|| {
-        git(&["rev-parse", "--short=12", "HEAD"]).map(|sha| {
+        git(&["rev-parse", "HEAD"]).map(|sha| {
+            let sha: String = sha.chars().take(12).collect();
             if is_dirty() {
                 format!("{sha}-dirty")
             } else {
