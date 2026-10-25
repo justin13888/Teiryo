@@ -27,9 +27,9 @@ selection only drives which series the chart emphasizes.
 Teiryō  claude/max-20x · a1b2  4 windows         ● live
 
  Session — 5 hour   ██████░░░░  62%  ▁▂▄▆█  ⟳ 1h 47m
-   ▲ 1.40× pace · ▲ 2.10× now (1.6–2.6) · cap in 48m (37m–1h05m) · afford 0.62× · →140% (120–165%) at reset
+   ▲ 1.40× pace · ▲ 2.10× now·30m (1.6–2.6) · cap in 48m (37m–1h05m) · afford 0.62× · →140% (120–165%) at reset
  Weekly — all       ███░░░░░░░  38%  ▁▁▂▃▄  ⟳ 3d 04h
-   ▼ 0.79× pace · = 0.90× now (0.7–1.1) · cap in 6d 2h (…) · afford 1.27× · →79% (71–88%) at reset
+   ▼ 0.79× pace · = 0.90× now·12h (0.7–1.1) · cap in 6d 2h (…) · afford 1.27× · →79% (71–88%) at reset
 ```
 
 Per row: bar, utilization, inline sparkline and the reset countdown, then a
@@ -99,10 +99,14 @@ The five derived fields, and why each is not the others:
   this rule promises it returns. `now` is unaffected and carries the signal
   over that stretch, which is where a burst right after a reset shows.
 - **`now`** — `estimate_rate`, the same scale over the recent end of the
-  series, with its 80% interval: `2.10× now (1.6–2.6)`. This is the one that
-  moves when the user does, and the one everything below projects from. It is
-  the only field needing history, and it stays blank until enough of it
-  exists. See below for what it is measured over and how sure it is.
+  series, with how far back it reaches and its 80% interval:
+  `2.10× now·30m (1.6–2.6)`. This is the one that moves when the user does,
+  and the one everything below projects from. It is the only field needing
+  history, and it stays blank until enough of it exists. The lookback is
+  printed because "recent" on a weekly window can be half a day or two, and
+  whether that stretch includes a night's sleep changes what the number
+  means. It is shed with the interval when the row narrows. See below for
+  what it is measured over and how sure it is.
 - **`cap in`** — `project(…).runway`, how long the remaining headroom lasts at
   the recent rate, with the runway at each end of its interval:
   `cap in 48m (37m–1h05m)`, `∞` where the slow end is zero — and
@@ -122,6 +126,13 @@ The five derived fields, and why each is not the others:
   Projected from the average instead — the `avg →…%` fallback — it is
   numerically `pace` itself (`u + (u/E)(1-E) = u/E`), which is why it is the
   first field shed when the row narrows.
+
+  Every interval on this line is the *rate's* measurement noise, under the
+  assumption that the stretch `now` names repeats until the reset. It is not
+  the odds of finishing under the cap: a user who is still accelerating will
+  outrun any constant-rate projection, and one who stops will undershoot it.
+  The question "will I make it if I keep this up" is `now` read against
+  `afford` — above it, the cap arrives first.
 
 Fields are appended only while they fit, so a narrow terminal sheds them from
 the right, `pace` last; a field with an interval first drops the interval and
@@ -185,7 +196,27 @@ one, and which wins depends on the series: a 5-hour window in whole percent
 resolves a half-hour slope to a tenth of the scale, a weekly window over the
 same half hour to nearly three. So the lookback starts at a tenth of the window
 (15 minutes to 12 hours) and doubles while the interval is wider than `0.25×`
-or a quarter of the rate, until it is narrow enough or the stretch runs out.
+or a quarter of the rate, until it is narrow enough or the stretch runs out
+— or until the readings a doubling would add, fitted on their own, have an
+interval **disjoint** from the one already measured. Widening trades recency
+for precision only while the older readings were burnt at the same rate; past
+a change of rate it trades it for a blend of two regimes. The stop matters
+because the precision target is out of reach on the series it most affects:
+in whole percent, an interval a quarter of the rate wide needs some hundred
+one-point steps, more than a weekly window's whole budget, so without the stop
+a weekly `now` always ran back to the last gap — up to the 48 hours fetched —
+and a push after an idle stretch read as the average of the two. Replayed
+against a real week that capped 12 hours early, `→…% at reset` read `78%` with
+60 hours left; stopped at the push it read `98%`. Disjoint rather than one
+centre outside the other's interval, because the rounding end of each interval
+is exact: a perfectly steady rate lies inside both, so it never trips the stop,
+and a centre test stopped on the step scatter of bursty use about half the
+time. Two limits remain. The stop acts only at the doublings, so a change of rate
+between them is still blended with the stretch before it, just less — a push
+eight hours old reads over 12 hours, at two-thirds of its rate rather than a
+sixth. And two 80% intervals are disjoint by chance now and then, so bursty
+use at a steady average sometimes stops short: the rate is still honest, on a
+shorter stretch with a wider interval, and `now·Nh` says so.
 Where it ends up is recorded, and a wide interval on a short stretch is the
 honest output when that is all the data allows — the alternative was a
 two-decimal figure from two readings, printed as if it were measured.
