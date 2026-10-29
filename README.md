@@ -49,13 +49,27 @@ The version on the first line is the commit's date in UTC and its hash, `YYYY.MM
 
 ### From a release
 
-Each [GitHub release](https://github.com/justin13888/Teiryo/releases) is a signed tag named by its version, with prebuilt archives for x86_64 and aarch64 Linux (glibc 2.35 or newer) and Apple-silicon macOS. Quit every `teiryo` TUI and stop any running `teiryod` (see above for why). Then extract both binaries into the same directory on your `PATH`, and check that the archive was built by this repository's release workflow:
+Each [GitHub release](https://github.com/justin13888/Teiryo/releases) is a signed tag named by its version, with prebuilt archives for x86_64 and aarch64 Linux (glibc 2.35 or newer) and Apple-silicon macOS. Quit every `teiryo` TUI, then:
 
 ```bash
-gh attestation verify teiryo-<version>-<target>.tar.gz --repo justin13888/Teiryo
+curl -fsSL https://raw.githubusercontent.com/justin13888/Teiryo/master/scripts/install.sh | sh
+# or a given release, into another directory:
+curl -fsSL https://raw.githubusercontent.com/justin13888/Teiryo/master/scripts/install.sh | sh -s -- --version <version> --dir ~/bin
 ```
 
-The macOS binaries are not notarized, so a browser download is quarantined. Clear the quarantine with `xattr -d com.apple.quarantine teiryo teiryod`, or download with `gh release download`, which doesn't set it.
+The script runs the same steps as `mise run install`, but installs the release archive instead of building. It downloads the archive for this machine and checks it against the release's `SHA256SUMS`. If `gh` is installed and logged in, it also checks the archive's build-provenance attestation from the release workflow. It installs both binaries into `--dir`, `$TEIRYO_INSTALL_DIR`, or `~/.local/bin` by default (`mise run install` uses cargo's bin directory instead), then restarts the daemon. It fails loudly if that directory is not on `PATH` (add it and re-run) or if another `teiryo` earlier on `PATH` shadows the new one, such as an older `~/.cargo/bin` or mise install. It also warns when a non-interactive shell, which is what `teiryo --ssh` gets on this host, would not find `teiryod` there.
+
+To install by hand instead, stop any running `teiryod` (see above for why), extract both binaries into the same directory on your `PATH`, and check that the archive was built by this repository's release workflow:
+
+```bash
+gh attestation verify teiryo-<version>-<target>.tar.gz --repo justin13888/Teiryo \
+  --signer-workflow justin13888/Teiryo/.github/workflows/release.yml
+```
+
+The macOS binaries are not notarized, so a browser download is quarantined. Clear the quarantine with `xattr -d com.apple.quarantine teiryo teiryod`, or download with `gh release download` or the script above, which don't set it.
+
+> [!WARNING]
+> Don't install through mise's github backend (`mise use -g github:justin13888/Teiryo`) on a host you reach with `teiryo --ssh`. mise puts the binaries in a per-version directory that is on `PATH` only in shells that ran `mise activate`. The non-interactive shell ssh runs `teiryod bridge` in doesn't run it, so the connection fails with `teiryod: not found`. mise also never restarts the daemon on an upgrade, so the old one keeps the socket and the new TUI fails its handshake. Use the script above. To keep mise anyway, connect with `--remote-daemon ~/.local/share/mise/shims/teiryod`, or put mise's shims directory on `PATH` in your shell's non-interactive startup file (`~/.zshenv`, or `~/.bashrc` above any line that returns early for a non-interactive shell), and stop `teiryod` yourself after every upgrade.
 
 ### Remote daemon over SSH
 
@@ -70,7 +84,7 @@ Each connection runs `ssh -T -o BatchMode=yes user@host teiryod bridge`, which r
 | Option | Default | Use |
 | --- | --- | --- |
 | `--ssh-command CMD` | `$TEIRYO_SSH`, else `ssh` | Another ssh client (one program, not split into words) |
-| `--remote-daemon PATH` | `teiryod` on the remote `$PATH` | Where `teiryod` is when a non-interactive ssh shell's `$PATH` lacks it, e.g. `~/.cargo/bin/teiryod` |
+| `--remote-daemon PATH` | `teiryod` on the remote `$PATH` | Where `teiryod` is when a non-interactive ssh shell's `$PATH` lacks it, e.g. `~/.cargo/bin/teiryod` or, for a mise install, `~/.local/share/mise/shims/teiryod` (see the warning above) |
 
 The header shows the host after the name. If ssh fails, its last error line is what `teiryo` prints.
 
@@ -79,6 +93,8 @@ To stop the daemon and remove both binaries:
 ```bash
 mise run uninstall
 ```
+
+That removes what `mise run install` put in cargo's bin directory. For a release install, quit every `teiryo` TUI, run `pkill -x teiryod`, and delete `teiryo` and `teiryod` from the install directory.
 
 ## Development
 
@@ -91,7 +107,7 @@ mise run uninstall
 | `mise run check` | Full gate: format check + lint + tests |
 | `mise run daemon` | Run `teiryod` in the foreground |
 | `mise run tui` | Run the `teiryo` TUI |
-| `mise run install` | Install both binaries and restart the daemon |
+| `mise run install` | Build and install both binaries and restart the daemon (`scripts/install.sh --from-source`) |
 | `mise run uninstall` | Stop the daemon and remove both binaries |
 | `mise run release` | Tag `origin/master`'s head as a signed release and push it |
 | `mise run release:dry` | Run every release check and print the version, without tagging |
