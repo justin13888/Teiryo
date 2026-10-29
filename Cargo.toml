@@ -47,3 +47,15 @@ toml_edit = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = { version = "1", features = ["serde"] }
+
+# Full DWARF debug info bloats target/ under fast dev/test iteration. Line
+# tables keep file:line in the workspace crates' backtraces; dependency frames
+# keep their symbol names but lose file:line. For full debug info (locals and
+# types in a debugger), override per build: `CARGO_PROFILE_DEV_DEBUG=2`
+# (workspace crates) or
+# `cargo --config 'profile.dev.package."*".debug=2' ...` (dependencies).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
