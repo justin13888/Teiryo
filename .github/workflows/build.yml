@@ -1,0 +1,84 @@
+name: Build
+
+# The release build, shared by release.yml, which publishes what it packages,
+# and ci.yml, which runs it on every pull request and push to master so a
+# failure on any release target surfaces there rather than at release time.
+# Both callers check out the event's commit; `version` must be that commit's
+# version (scripts/release-version.sh), and every binary's `-V` is held to it.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The version every built binary must report for `-V`
+        required: true
+        type: string
+      cache:
+        description: Reuse a cargo cache; a release builds from nothing but the tagged tree
+        required: false
+        type: boolean
+        default: false
+      retention-days:
+        description: How long the packaged archives are kept as workflow artifacts
+        required: false
+        type: number
+        default: 90
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  VERSION: ${{ inputs.version }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      # The build script reads the commit and its date from git, so the
+      # checkout must be a repository, not an export.
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - if: inputs.cache
+        uses: Swatinem/rust-cache@v2
+      # Tests first, so the binaries checked and packaged below are the ones
+      # the build step made, not whatever the test build left behind.
+      - name: Test
+        run: cargo test --release --workspace --locked
+      - name: Build
+        run: cargo build --release --locked -p teiryo -p teiryod
+      - name: Binaries report the version
+        run: |
+          set -eu
+          for bin in teiryo teiryod; do
+            got=$("target/release/$bin" -V | sed -n 1p)
+            if [ "$got" != "$bin $VERSION" ]; then
+              echo "::error::$bin -V reports '$got', not '$bin $VERSION'"
+              exit 1
+            fi
+          done
+      # Both binaries in one directory: the TUI starts the teiryod beside it.
+      - name: Package
+        run: |
+          set -eu
+          name="teiryo-$VERSION-${{ matrix.target }}"
+          mkdir "$name"
+          cp target/release/teiryo target/release/teiryod README.md LICENSE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: teiryo-*.tar.gz
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}

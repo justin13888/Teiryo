@@ -94,6 +94,7 @@ mise run uninstall
 | `mise run install` | Install both binaries and restart the daemon |
 | `mise run uninstall` | Stop the daemon and remove both binaries |
 | `mise run release` | Tag `origin/master`'s head as a signed release and push it |
+| `mise run release:dry` | Run every release check and print the version, without tagging |
 
 ## Tech Stack
 
@@ -108,9 +109,9 @@ This project uses [hk](https://hk.jdx.dev). Pre-commit auto-fixes formatting and
 
 ## CI/CD
 
-GitHub Actions runs format checks, clippy, and tests on pushes to `master` and pull requests, plus conventional-commit checks on pull requests.
+GitHub Actions runs format checks, clippy, and tests on pushes to `master` and pull requests, plus conventional-commit checks on pull requests. It also lints the workflows (actionlint) and `scripts/` (shellcheck), and runs the release build itself on every release target (x86_64 and aarch64 Linux, Apple-silicon macOS): build, test, check `-V` against the commit's version, package. A release is never the first time any of that runs.
 
-Releases are cut with `mise run release` on a clean `master` level with `origin`. It creates a signed annotated tag named by the head commit's version and pushes it. The release workflow then publishes nothing until GitHub verifies the tag's signature, the tagged commit is on `master`, the tag's name matches that commit's version, and both built binaries report that version for `-V`. After that it attaches the archives, `SHA256SUMS`, and build-provenance attestations to the release. The signing key must be registered on GitHub as a signing key. The crates are never published to crates.io: none has a version, and all are `publish = false`.
+Releases are cut with `mise run release` on a clean `master` level with `origin`, and only once CI has passed on that commit (`mise run release:dry` runs the same checks and prints the version without tagging). It creates a signed annotated tag named by the head commit's version and pushes it. The release workflow then publishes nothing until GitHub verifies the tag's signature, the tagged commit is on `master`, the tag's name matches that commit's version, and both built binaries report that version for `-V`. After that it attaches the archives, `SHA256SUMS`, and build-provenance attestations to the release. The signing key must be registered on GitHub as a signing key. The crates are never published to crates.io: none has a version, and all are `publish = false`.
 
 ## License
 

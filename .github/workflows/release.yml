@@ -80,56 +80,20 @@ jobs:
       - name: Named by its commit's version
         run: |
           set -eu
-          want="$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y.%m.%d "$COMMIT")-$(printf %s "$COMMIT" | cut -c1-12)"
+          want=$(scripts/release-version.sh "$COMMIT")
           if [ "$TAG" != "$want" ]; then
             echo "::error::$TAG tags a commit whose version is $want"
             exit 1
           fi
 
+  # The same build CI runs on every pull request, here held to the tag: every
+  # binary must report it for `-V`. No cache: a release builds from nothing
+  # but the tagged tree.
   build:
-    name: Build ${{ matrix.target }}
     needs: verify
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04-arm
-          - target: aarch64-apple-darwin
-            os: macos-latest
-    runs-on: ${{ matrix.os }}
-    steps:
-      # The build script reads the commit and its date from git, so the
-      # checkout must be a repository, not an export.
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      # No cache: a release builds from nothing but the tagged tree.
-      - name: Build
-        run: cargo build --release --locked -p teiryo -p teiryod
-      - name: Binaries report the tag as their version
-        run: |
-          set -eu
-          for bin in teiryo teiryod; do
-            got=$("target/release/$bin" -V | sed -n 1p)
-            if [ "$got" != "$bin $TAG" ]; then
-              echo "::error::$bin -V reports '$got', not '$bin $TAG'"
-              exit 1
-            fi
-          done
-      # Both binaries in one directory: the TUI starts the teiryod beside it.
-      - name: Package
-        run: |
-          set -eu
-          name="teiryo-$TAG-${{ matrix.target }}"
-          mkdir "$name"
-          cp target/release/teiryo target/release/teiryod README.md LICENSE "$name/"
-          tar -czf "$name.tar.gz" "$name"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.target }}
-          path: teiryo-*.tar.gz
-          if-no-files-found: error
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ github.ref_name }}
 
   publish:
     name: Publish the release
@@ -167,13 +131,20 @@ jobs:
           # A draft first, published only once every asset is attached, so a
           # failure part-way leaves nothing public. A rerun finds that draft
           # and finishes it; a release already published is never touched.
-          if draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+          # Only "release not found" means there is none yet: any other error
+          # (a flaky API, a rate limit) could hide a draft and must not lead
+          # to creating a second one.
+          if draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>view.err); then
             if [ "$draft" != true ]; then
               echo "::error::$TAG is already released"
               exit 1
             fi
             gh release upload "$TAG" dist/teiryo-*.tar.gz dist/SHA256SUMS \
               --repo "$GITHUB_REPOSITORY" --clobber
+          elif ! grep -qx 'release not found' view.err; then
+            cat view.err >&2
+            echo "::error::could not tell whether $TAG already has a release"
+            exit 1
           else
             gh release create "$TAG" dist/teiryo-*.tar.gz dist/SHA256SUMS \
               --repo "$GITHUB_REPOSITORY" \

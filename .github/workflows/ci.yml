@@ -5,6 +5,9 @@ on:
     branches: [master]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -21,9 +24,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   commits:
     name: Conventional commits
@@ -37,3 +40,43 @@ jobs:
         run: cargo install convco --locked
       - name: Check commits
         run: convco check ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+
+  workflows:
+    name: Lint workflows and scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The official image bundles shellcheck, which actionlint runs over every
+      # `run:` block.
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+
+  # The version the release build below must report: the checked-out commit's,
+  # by the same rule `mise run release` names tags with. On a pull request that
+  # is the merge commit, which is also what the build checks out.
+  version:
+    name: Release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: |
+          set -eu
+          version=$(scripts/release-version.sh)
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+  # A release dry run: every release target, built, tested, held to the version
+  # rule and packaged exactly as release.yml does, so a release is never the
+  # first time any of that runs. Nothing is published.
+  release-build:
+    name: Release build
+    needs: version
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      cache: true
+      retention-days: 3
