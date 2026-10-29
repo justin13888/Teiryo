@@ -357,62 +357,9 @@ fi
 
 [tasks.release]
 description = "Tag origin/master's head as a signed release and push the tag"
-# A release is a signed annotated tag named by the commit's own version,
-# `YYYY.MM.DD-<sha12>`: its committer date in UTC and the first 12 characters
-# of its hash, the rule `teiryo_core::version::release_version` applies to `-V`.
-# Pushing the tag is the whole release: .github/workflows/release.yml checks
-# the signature, builds, and checks every binary's `-V` against the tag before
-# it publishes anything, so a drift between this rule and the Rust one fails
-# there rather than shipping a misnamed release.
-#
-# Only a commit already on origin/master is released, from a clean tree, so the
-# tag names exactly what everyone else can fetch. Signing uses git's own
-# configuration (`user.signingkey`, `gpg.format`); the key must be registered
-# on GitHub as a signing key, or the workflow refuses the tag as unverified.
-run = '''
-set -eu
-if [ -n "$(git status --porcelain)" ]; then
-  echo "release: the working tree has uncommitted changes" >&2
-  exit 1
-fi
-branch=$(git symbolic-ref -q --short HEAD || true)
-if [ "$branch" != master ]; then
-  echo "release: releases are cut from master, not ${branch:-a detached HEAD}" >&2
-  exit 1
-fi
-git fetch --quiet origin master
-head=$(git rev-parse HEAD)
-if [ "$head" != "$(git rev-parse origin/master)" ]; then
-  echo "release: master is not level with origin/master; push or pull first" >&2
-  exit 1
-fi
+# The checks and their reasons are in the script, where shellcheck reads them.
+run = "scripts/release.sh"
 
-version="$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y.%m.%d "$head")-$(printf %s "$head" | cut -c1-12)"
-if git rev-parse -q --verify "refs/tags/$version" >/dev/null; then
-  echo "release: tag $version already exists" >&2
-  exit 1
-fi
-if [ -n "$(git ls-remote --tags origin "refs/tags/$version")" ]; then
-  echo "release: tag $version already exists on origin" >&2
-  exit 1
-fi
-
-# Whether the signature is good is GitHub's call, made by the workflow against
-# the keys registered there; `git tag -v` would need an allowed-signers file
-# for SSH keys. What is checked here is that signing happened at all, so an
-# unsigned tag is never pushed.
-git tag -s "$version" -m "Teiryo $version" "$head"
-if ! git cat-file tag "$version" | grep -q "^-----BEGIN "; then
-  git tag -d "$version" >/dev/null
-  echo "release: the new tag carries no signature; it was deleted" >&2
-  exit 1
-fi
-# A tag left behind by a failed push would make every rerun refuse it as
-# existing, so it goes: the rerun tags again.
-if ! git push origin "refs/tags/$version"; then
-  git tag -d "$version" >/dev/null
-  echo "release: pushing $version failed; the local tag was deleted" >&2
-  exit 1
-fi
-echo "release: pushed $version; the release workflow publishes it"
-'''
+[tasks."release:dry"]
+description = "Run every release check and print the version, without tagging"
+run = "scripts/release.sh --dry-run"
