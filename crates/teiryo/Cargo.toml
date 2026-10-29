@@ -1,9 +1,9 @@
 [package]
 name = "teiryo"
-version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "Teiryo TUI: live dashboard for LLM subscription quotas"
 
 [dependencies]

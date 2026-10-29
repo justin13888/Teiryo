@@ -1,0 +1,185 @@
+name: Release
+
+# A release is a signed annotated tag named by its commit's version,
+# `YYYY.MM.DD-<sha12>` (see `mise run release` and
+# `teiryo_core::version::release_version`). Nothing is published until the
+# tag is proven to be that: signed and verified by GitHub, on master, named by
+# the rule, and matching what the built binaries report for `-V`.
+
+on:
+  push:
+    tags: ["[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  verify:
+    name: Verify the tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag-object: ${{ steps.signed.outputs.tag-object }}
+      latest: ${{ steps.master.outputs.latest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Signed, annotated, verified by GitHub
+        id: signed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG")
+          if [ "$(jq -r .object.type <<<"$ref")" != tag ]; then
+            echo "::error::$TAG is a lightweight tag; a release needs a signed annotated tag"
+            exit 1
+          fi
+          tag=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$(jq -r .object.sha <<<"$ref")")
+          if [ "$(jq -r .verification.verified <<<"$tag")" != true ]; then
+            echo "::error::$TAG's signature is not verified by GitHub ($(jq -r .verification.reason <<<"$tag"))"
+            exit 1
+          fi
+          # The signature covers the name inside the tag object, not the ref:
+          # a signed tag pushed under another name is not the release it signed.
+          if [ "$(jq -r .tag <<<"$tag")" != "$TAG" ]; then
+            echo "::error::the ref $TAG holds a tag object named $(jq -r .tag <<<"$tag")"
+            exit 1
+          fi
+          if [ "$(jq -r .object.type <<<"$tag")" != commit ]; then
+            echo "::error::$TAG does not tag a commit"
+            exit 1
+          fi
+          commit=$(jq -r .object.sha <<<"$tag")
+          # The build jobs check out the event's commit, so the commit verified
+          # here must be that one: a tag moved since the push is refused.
+          if [ "$commit" != "$GITHUB_SHA" ]; then
+            echo "::error::$TAG now tags $commit, not the pushed $GITHUB_SHA"
+            exit 1
+          fi
+          echo "COMMIT=$commit" >>"$GITHUB_ENV"
+          echo "tag-object=$(jq -r .sha <<<"$tag")" >>"$GITHUB_OUTPUT"
+      - name: On master
+        id: master
+        run: |
+          if ! git merge-base --is-ancestor "$COMMIT" origin/master; then
+            echo "::error::$TAG tags $COMMIT, which is not on master"
+            exit 1
+          fi
+          # Only master's head is the latest release; an older commit tagged
+          # after the fact must not displace it.
+          if [ "$COMMIT" = "$(git rev-parse origin/master)" ]; then
+            echo "latest=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "latest=false" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Named by its commit's version
+        run: |
+          set -eu
+          want="$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y.%m.%d "$COMMIT")-$(printf %s "$COMMIT" | cut -c1-12)"
+          if [ "$TAG" != "$want" ]; then
+            echo "::error::$TAG tags a commit whose version is $want"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      # The build script reads the commit and its date from git, so the
+      # checkout must be a repository, not an export.
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # No cache: a release builds from nothing but the tagged tree.
+      - name: Build
+        run: cargo build --release --locked -p teiryo -p teiryod
+      - name: Binaries report the tag as their version
+        run: |
+          set -eu
+          for bin in teiryo teiryod; do
+            got=$("target/release/$bin" -V | sed -n 1p)
+            if [ "$got" != "$bin $TAG" ]; then
+              echo "::error::$bin -V reports '$got', not '$bin $TAG'"
+              exit 1
+            fi
+          done
+      # Both binaries in one directory: the TUI starts the teiryod beside it.
+      - name: Package
+        run: |
+          set -eu
+          name="teiryo-$TAG-${{ matrix.target }}"
+          mkdir "$name"
+          cp target/release/teiryo target/release/teiryod README.md LICENSE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: teiryo-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum teiryo-*.tar.gz >SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/teiryo-*.tar.gz
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_OBJECT: ${{ needs.verify.outputs.tag-object }}
+          LATEST: ${{ needs.verify.outputs.latest }}
+        run: |
+          set -eu
+          # The builds took minutes; the tag must still be the object verify
+          # checked, or these binaries belong to a release nobody signed.
+          now=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha)
+          if [ "$now" != "$TAG_OBJECT" ]; then
+            echo "::error::$TAG moved during the run (now $now, verified $TAG_OBJECT)"
+            exit 1
+          fi
+          # A draft first, published only once every asset is attached, so a
+          # failure part-way leaves nothing public. A rerun finds that draft
+          # and finishes it; a release already published is never touched.
+          if draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$draft" != true ]; then
+              echo "::error::$TAG is already released"
+              exit 1
+            fi
+            gh release upload "$TAG" dist/teiryo-*.tar.gz dist/SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/teiryo-*.tar.gz dist/SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --title "Teiryo $TAG" \
+              --generate-notes
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest="$LATEST"

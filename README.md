@@ -4,7 +4,7 @@ Teiryō (定量) probes and records LLM subscription quotas for you.
 
 A headless daemon (`teiryod`) polls subscription usage across multiple LLM providers and accounts, persists history in SQLite, and serves it over a Unix domain socket. A terminal UI (`teiryo`) renders live quota dashboards on top. See [docs/](docs/) for the architecture.
 
-> Status (Sept 8, 2026): This is currently just for myself so no releases are made. Feature requests are accepted as long as it is actionable.
+> Status (Sept 8, 2026): This is currently just for myself, so releases are occasional dated snapshots of `master`. Feature requests are accepted as long as it is actionable.
 
 ## Prerequisites
 
@@ -37,15 +37,25 @@ To see which build is installed, ask either binary — neither starts a daemon o
 
 ```console
 $ teiryo -V
-teiryo 0.1.0
+teiryo 2026.10.17-f78c2ce0f940
 commit:   f78c2ce0f940 (2026-10-17T17:52:31+02:00)
 profile:  release
 rustc:    rustc 1.99.1 (58cf8f9c3 2026-10-13)
 built:    2026-10-18T19:55:42Z
-protocol: v6
+protocol: v9
 ```
 
-`commit` carries a `-dirty` suffix when the tree had uncommitted changes, and any fact the build could not establish reads `unknown`. `protocol` is the wire version: a TUI and daemon whose `protocol` lines differ cannot talk to each other, so comparing `teiryo -V` with `teiryod -V` is the quickest check after an upgrade.
+The version on the first line is the commit's date in UTC and its hash, `YYYY.MM.DD-<sha12>`: Teiryo has no semver, and every build of one commit reports the same version. `commit` carries a `-dirty` suffix when the tree had uncommitted changes, and so does the version, and any fact the build could not establish reads `unknown`. `protocol` is the wire version: a TUI and daemon whose `protocol` lines differ cannot talk to each other, so comparing `teiryo -V` with `teiryod -V` is the quickest check after an upgrade.
+
+### From a release
+
+Each [GitHub release](https://github.com/justin13888/Teiryo/releases) is a signed tag named by its version, with prebuilt archives for x86_64 and aarch64 Linux (glibc 2.35 or newer) and Apple-silicon macOS. Quit every `teiryo` TUI and stop any running `teiryod` (see above for why). Then extract both binaries into the same directory on your `PATH`, and check that the archive was built by this repository's release workflow:
+
+```bash
+gh attestation verify teiryo-<version>-<target>.tar.gz --repo justin13888/Teiryo
+```
+
+The macOS binaries are not notarized, so a browser download is quarantined. Clear the quarantine with `xattr -d com.apple.quarantine teiryo teiryod`, or download with `gh release download`, which doesn't set it.
 
 ### Remote daemon over SSH
 
@@ -83,6 +93,7 @@ mise run uninstall
 | `mise run tui` | Run the `teiryo` TUI |
 | `mise run install` | Install both binaries and restart the daemon |
 | `mise run uninstall` | Stop the daemon and remove both binaries |
+| `mise run release` | Tag `origin/master`'s head as a signed release and push it |
 
 ## Tech Stack
 
@@ -98,6 +109,8 @@ This project uses [hk](https://hk.jdx.dev). Pre-commit auto-fixes formatting and
 ## CI/CD
 
 GitHub Actions runs format checks, clippy, and tests on pushes to `master` and pull requests, plus conventional-commit checks on pull requests.
+
+Releases are cut with `mise run release` on a clean `master` level with `origin`. It creates a signed annotated tag named by the head commit's version and pushes it. The release workflow then publishes nothing until GitHub verifies the tag's signature, the tagged commit is on `master`, the tag's name matches that commit's version, and both built binaries report that version for `-V`. After that it attaches the archives, `SHA256SUMS`, and build-provenance attestations to the release. The signing key must be registered on GitHub as a signing key. The crates are never published to crates.io: none has a version, and all are `publish = false`.
 
 ## License
 

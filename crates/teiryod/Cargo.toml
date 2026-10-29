@@ -1,9 +1,9 @@
 [package]
 name = "teiryod"
-version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "Teiryo daemon: polls LLM subscription quotas and serves them over a Unix socket"
 
 [dependencies]
