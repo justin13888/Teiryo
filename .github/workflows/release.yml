@@ -131,13 +131,20 @@ jobs:
           # A draft first, published only once every asset is attached, so a
           # failure part-way leaves nothing public. A rerun finds that draft
           # and finishes it; a release already published is never touched.
-          if draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+          # Only "release not found" means there is none yet: any other error
+          # (a flaky API, a rate limit) could hide a draft and must not lead
+          # to creating a second one.
+          if draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>view.err); then
             if [ "$draft" != true ]; then
               echo "::error::$TAG is already released"
               exit 1
             fi
             gh release upload "$TAG" dist/teiryo-*.tar.gz dist/SHA256SUMS \
               --repo "$GITHUB_REPOSITORY" --clobber
+          elif ! grep -qx 'release not found' view.err; then
+            cat view.err >&2
+            echo "::error::could not tell whether $TAG already has a release"
+            exit 1
           else
             gh release create "$TAG" dist/teiryo-*.tar.gz dist/SHA256SUMS \
               --repo "$GITHUB_REPOSITORY" \
