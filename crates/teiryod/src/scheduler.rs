@@ -6,7 +6,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use teiryo_core::{
-    Account, PollEvent, PollId, PollOutcome, PollTrigger, ProbeError, ProviderAdapter,
+    Account, AuthError, Credential, PollEvent, PollId, PollOutcome, PollTrigger, ProbeError,
+    ProviderAdapter,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -135,6 +136,55 @@ impl Throttle {
 /// their new login more slowly than that.
 const CREDENTIAL_RECHECK_MAX: Duration = Duration::from_secs(30);
 
+/// First wait before retrying a credential renewal that failed.
+const REFRESH_BACKOFF_BASE: Duration = Duration::from_secs(30);
+
+/// Ceiling on that wait. Renewing costs the provider's token endpoint a
+/// request, unlike the re-check it rides on, so an outage there is asked
+/// about less and less often — but never less than four times an hour, or a
+/// recovered endpoint would leave the account dark for most of one.
+const REFRESH_BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// When a paused account may next try to renew its credential.
+///
+/// Separate from the re-check cadence on purpose: re-reading the local store
+/// is free and keeps a re-login immediate, while renewing spends a request,
+/// so only the latter backs off.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RefreshBackoff {
+    /// Consecutive failed renewals.
+    failures: u32,
+    /// No renewal before this.
+    not_before: Option<tokio::time::Instant>,
+    /// The last failure's message, so a repeat is not logged again.
+    last_error: Option<String>,
+}
+
+impl RefreshBackoff {
+    /// Whether a renewal may be attempted at `now`.
+    fn due(&self, now: tokio::time::Instant) -> bool {
+        self.not_before.is_none_or(|t| now >= t)
+    }
+
+    /// The wait the current number of failures buys.
+    fn delay(&self) -> Duration {
+        let doublings = self.failures.saturating_sub(1).min(16);
+        REFRESH_BACKOFF_BASE
+            .saturating_mul(1 << doublings)
+            .min(REFRESH_BACKOFF_MAX)
+    }
+
+    /// Record a failed renewal at `now`. Returns whether its message is new,
+    /// which is when it is worth a log line.
+    fn failed(&mut self, now: tokio::time::Instant, message: String) -> bool {
+        self.failures = self.failures.saturating_add(1);
+        self.not_before = Some(now + self.delay());
+        let new = self.last_error.as_deref() != Some(message.as_str());
+        self.last_error = Some(message);
+        new
+    }
+}
+
 /// What the poll task does next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -142,7 +192,8 @@ enum Step {
     Park,
     /// Poll now, without waiting.
     PollNow,
-    /// Re-resolve the credential after this long. Sends nothing.
+    /// Re-resolve the credential after this long, renewing it when due. Sends
+    /// no probe.
     Recheck {
         /// How long to wait first.
         after: Duration,
@@ -337,7 +388,13 @@ pub fn spawn_poller(
         let mut gate = Gate::default();
         // When the current pause began, for the one line that reports it.
         let mut paused_since: Option<Instant> = None;
+        // How soon a paused account may spend another renewal attempt.
+        let mut refresh_backoff = RefreshBackoff::default();
         loop {
+            // Whatever ended the pause, the renewals it was rationing are over.
+            if !gate.credential_stale {
+                refresh_backoff = RefreshBackoff::default();
+            }
             let schedule = *schedule_rx.borrow_and_update();
             let step = gate.next_step(schedule, poll_immediately);
             // Published before this iteration's first `.await`: `poll_once`
@@ -379,9 +436,10 @@ pub fn spawn_poller(
                         log_transition(&account, t, schedule, gate, &mut paused_since);
                     }
                 }
-                // Nothing is sent while paused: the credential we hold cannot
+                // No probe is sent while paused: the credential we hold cannot
                 // work, and asking anyway is what used to fill the log with
                 // thousands of identical failures over a single expired token.
+                // The re-check may spend a renewal, on its own backoff.
                 Step::Recheck { after } => {
                     tokio::select! {
                         // Jittered like a poll, though no request goes out: a
@@ -389,7 +447,7 @@ pub fn spawn_poller(
                         // several tasks, and recovering them all on the same
                         // tick would fire simultaneous probes.
                         _ = tokio::time::sleep(jittered(after)) => {
-                            if adapter.credential_for(&account).await.is_ok() {
+                            if recheck(adapter.as_ref(), &account, &mut refresh_backoff).await {
                                 if let Some(t) = gate.credential_ok() {
                                     log_transition(&account, t, schedule, gate, &mut paused_since);
                                 }
@@ -588,7 +646,7 @@ async fn poll_once(
 async fn poll_outcome(adapter: &dyn ProviderAdapter, account: &Account) -> Polled {
     // The one place a poll stops without reaching the provider. Everything
     // below it has sent a request, whatever it came back with.
-    let cred = match adapter.credential_for(account).await {
+    let cred = match resolve_credential(adapter, account).await {
         Ok(c) => c,
         Err(e) => {
             return Polled {
@@ -601,7 +659,23 @@ async fn poll_outcome(adapter: &dyn ProviderAdapter, account: &Account) -> Polle
         outcome,
         stage: Stage::Provider,
     };
-    let raw = match adapter.probe(account, &cred).await {
+    let mut probed = adapter.probe(account, &cred).await;
+    // The provider refused a credential that looked fine locally — revoked,
+    // or renewed by someone else since we read it. Renew once and ask again;
+    // a second refusal is the provider's answer and is reported as such.
+    if let Err(ProbeError::Auth(refused)) = &probed {
+        let refused = refused.clone();
+        match adapter.refresh_credential(account, Some(&cred)).await {
+            Ok(renewed) => probed = adapter.probe(account, &renewed).await,
+            Err(AuthError::RefreshUnsupported) => {}
+            Err(e) => {
+                return sent(PollOutcome::AuthError(format!(
+                    "{refused}; renewing the credential failed: {e}"
+                )))
+            }
+        }
+    }
+    let raw = match probed {
         Ok(r) => r,
         Err(ProbeError::Auth(m)) => return sent(PollOutcome::AuthError(m)),
         Err(ProbeError::RateLimited { retry_after }) => {
@@ -614,6 +688,64 @@ async fn poll_outcome(adapter: &dyn ProviderAdapter, account: &Account) -> Polle
     match adapter.parse(&raw) {
         Ok(windows) => sent(PollOutcome::Success { windows }),
         Err(e) => sent(PollOutcome::SchemaDrift(e.to_string())),
+    }
+}
+
+/// The credential to probe with: the adapter's cheap local read, renewed
+/// when that read says it has expired. An adapter that cannot renew keeps the
+/// error that asked for it, remedy and all.
+async fn resolve_credential(
+    adapter: &dyn ProviderAdapter,
+    account: &Account,
+) -> Result<Credential, AuthError> {
+    match adapter.credential_for(account).await {
+        Err(expired @ AuthError::Expired(_)) => {
+            match adapter.refresh_credential(account, None).await {
+                Err(AuthError::RefreshUnsupported) => Err(expired),
+                other => other,
+            }
+        }
+        other => other,
+    }
+}
+
+/// One re-check of a paused account: re-read the credential, which is free,
+/// and renew it when it has expired and the backoff allows. Sends no probe.
+/// Returns whether the credential is usable again.
+async fn recheck(
+    adapter: &dyn ProviderAdapter,
+    account: &Account,
+    backoff: &mut RefreshBackoff,
+) -> bool {
+    match adapter.credential_for(account).await {
+        Ok(_) => true,
+        Err(AuthError::Expired(_)) if backoff.due(tokio::time::Instant::now()) => {
+            match adapter.refresh_credential(account, None).await {
+                Ok(_) => {
+                    tracing::info!(
+                        provider = %account.provider,
+                        account = %account.id,
+                        "credential renewed"
+                    );
+                    true
+                }
+                Err(AuthError::RefreshUnsupported) => false,
+                Err(e) => {
+                    let message = e.to_string();
+                    if backoff.failed(tokio::time::Instant::now(), message.clone()) {
+                        tracing::warn!(
+                            provider = %account.provider,
+                            account = %account.id,
+                            error = %message,
+                            retry_secs = backoff.delay().as_secs(),
+                            "renewing the credential failed"
+                        );
+                    }
+                    false
+                }
+            }
+        }
+        Err(_) => false,
     }
 }
 
@@ -1069,5 +1201,304 @@ mod tests {
                 daemon.shutdown_tx.send_replace(true);
             })
             .await;
+    }
+
+    /// How [`Renewing`] answers a refresh.
+    #[derive(Clone)]
+    enum Renewal {
+        /// Issue this token, which `credential_for` then returns too.
+        Issue(&'static str),
+        /// Fail transiently.
+        Fail,
+        /// The adapter cannot refresh.
+        Unsupported,
+    }
+
+    /// An adapter whose stored token may be expired, refusable by the
+    /// provider, and renewable — the shape of a Claude login overnight.
+    struct Renewing {
+        /// The token `credential_for` returns; `None` reads as expired.
+        stored: std::sync::Mutex<Option<&'static str>>,
+        /// A token the provider refuses with a 401.
+        refused: Option<&'static str>,
+        renewal: std::sync::Mutex<Renewal>,
+        reads: std::sync::atomic::AtomicU32,
+        refreshes: std::sync::atomic::AtomicU32,
+        probes: std::sync::atomic::AtomicU32,
+    }
+
+    impl Renewing {
+        fn new(stored: Option<&'static str>, renewal: Renewal) -> Self {
+            Self {
+                stored: std::sync::Mutex::new(stored),
+                refused: None,
+                renewal: std::sync::Mutex::new(renewal),
+                reads: Default::default(),
+                refreshes: Default::default(),
+                probes: Default::default(),
+            }
+        }
+        fn count(counter: &std::sync::atomic::AtomicU32) -> u32 {
+            counter.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    fn token_of(cred: &Credential) -> String {
+        use secrecy::ExposeSecret;
+        match cred {
+            Credential::OAuthToken(t) => t.expose_secret().to_owned(),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl teiryo_core::Authenticator for Renewing {
+        async fn discover_accounts(&self) -> Result<Vec<Account>, AuthError> {
+            Ok(vec![renewing_account()])
+        }
+        async fn credential_for(&self, _account: &Account) -> Result<Credential, AuthError> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match *self.stored.lock().unwrap() {
+                Some(t) => Ok(Credential::OAuthToken(t.into())),
+                None => Err(AuthError::Expired(
+                    "token is past its expiry; run `x`".into(),
+                )),
+            }
+        }
+        async fn refresh_credential(
+            &self,
+            _account: &Account,
+            _rejected: Option<&Credential>,
+        ) -> Result<Credential, AuthError> {
+            let renewal = self.renewal.lock().unwrap().clone();
+            if !matches!(renewal, Renewal::Unsupported) {
+                self.refreshes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            match renewal {
+                Renewal::Issue(t) => {
+                    *self.stored.lock().unwrap() = Some(t);
+                    Ok(Credential::OAuthToken(t.into()))
+                }
+                Renewal::Fail => Err(AuthError::Store("token endpoint returned 503".into())),
+                Renewal::Unsupported => Err(AuthError::RefreshUnsupported),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl teiryo_core::Prober for Renewing {
+        async fn probe(
+            &self,
+            _account: &Account,
+            cred: &Credential,
+        ) -> Result<teiryo_core::RawResponse, ProbeError> {
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.refused == Some(token_of(cred).as_str()) {
+                return Err(ProbeError::Auth("usage endpoint returned 401".into()));
+            }
+            Ok(teiryo_core::RawResponse {
+                status: 200,
+                headers: vec![],
+                body: Vec::new(),
+                fetched_at: Utc::now(),
+            })
+        }
+    }
+
+    impl teiryo_core::QuotaParser for Renewing {
+        fn parse(
+            &self,
+            _raw: &teiryo_core::RawResponse,
+        ) -> Result<Vec<teiryo_core::QuotaWindow>, teiryo_core::ParseError> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl teiryo_core::WindowPresenter for Renewing {
+        fn render_hint(&self, _window: &teiryo_core::QuotaWindow) -> teiryo_core::RenderHint {
+            teiryo_core::RenderHint {
+                style: teiryo_core::BarStyle::Percent,
+                warn_threshold: 0.8,
+                critical_threshold: 0.95,
+                note: None,
+            }
+        }
+    }
+
+    impl ProviderAdapter for Renewing {
+        fn id(&self) -> String {
+            "stub".into()
+        }
+    }
+
+    fn renewing_account() -> Account {
+        Account {
+            id: teiryo_core::AccountId::from("stub:default"),
+            provider: "stub".into(),
+            label: "default".into(),
+        }
+    }
+
+    /// Start `adapter`'s one account at the 10 s cadence floor and let its
+    /// startup poll land.
+    async fn start_renewing(adapter: &Rc<Renewing>) -> Daemon {
+        let storage = teiryo_core::Storage::open_in_memory().unwrap();
+        let daemon = Daemon::new(storage, "config.toml".into(), vec!["stub".into()]);
+        daemon.apply_config(crate::config::parse("poll_interval_secs = 10\n").unwrap());
+        let dyn_adapter: Rc<dyn ProviderAdapter> = adapter.clone();
+        start_account(&daemon, &dyn_adapter, renewing_account());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        daemon
+    }
+
+    fn last_outcome(daemon: &Daemon) -> PollOutcome {
+        daemon
+            .watch_tx
+            .borrow()
+            .as_ref()
+            .expect("a poll was published")
+            .outcome
+            .clone()
+    }
+
+    /// The overnight case this all exists for: the stored token has expired,
+    /// and the daemon renews it itself instead of pausing until `claude` runs.
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_credential_is_renewed_and_the_poll_goes_through() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let adapter = Rc::new(Renewing::new(None, Renewal::Issue("fresh")));
+                let daemon = start_renewing(&adapter).await;
+                assert!(
+                    matches!(last_outcome(&daemon), PollOutcome::Success { .. }),
+                    "got {:?}",
+                    last_outcome(&daemon)
+                );
+                assert_eq!(Renewing::count(&adapter.refreshes), 1);
+                assert_eq!(Renewing::count(&adapter.probes), 1);
+                daemon.shutdown_tx.send_replace(true);
+            })
+            .await;
+    }
+
+    /// A token the provider refuses is renewed once and the probe retried
+    /// with the new one — not reported as a failure.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_credential_is_renewed_and_probed_once_more() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let adapter = Rc::new(Renewing {
+                    refused: Some("revoked"),
+                    ..Renewing::new(Some("revoked"), Renewal::Issue("fresh"))
+                });
+                let daemon = start_renewing(&adapter).await;
+                assert!(
+                    matches!(last_outcome(&daemon), PollOutcome::Success { .. }),
+                    "got {:?}",
+                    last_outcome(&daemon)
+                );
+                assert_eq!(Renewing::count(&adapter.refreshes), 1);
+                assert_eq!(Renewing::count(&adapter.probes), 2);
+                daemon.shutdown_tx.send_replace(true);
+            })
+            .await;
+    }
+
+    /// Falsifier for the test above: when renewing fails too, the refusal
+    /// is reported with both reasons, and there is no third request.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_that_cannot_be_renewed_reports_both_reasons() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let adapter = Rc::new(Renewing {
+                    refused: Some("revoked"),
+                    ..Renewing::new(Some("revoked"), Renewal::Fail)
+                });
+                let daemon = start_renewing(&adapter).await;
+                let PollOutcome::AuthError(message) = last_outcome(&daemon) else {
+                    panic!("got {:?}", last_outcome(&daemon));
+                };
+                assert!(message.contains("401"), "{message}");
+                assert!(message.contains("503"), "{message}");
+                assert_eq!(Renewing::count(&adapter.probes), 1);
+                daemon.shutdown_tx.send_replace(true);
+            })
+            .await;
+    }
+
+    /// While renewing keeps failing the account stays paused, re-reading the
+    /// store every re-check but spending renewals ever more rarely — and the
+    /// moment one succeeds, polling resumes with no user action at all.
+    #[tokio::test(start_paused = true)]
+    async fn failed_renewals_back_off_and_a_later_success_resumes_polling() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let adapter = Rc::new(Renewing::new(None, Renewal::Fail));
+                let daemon = start_renewing(&adapter).await;
+                assert!(matches!(last_outcome(&daemon), PollOutcome::AuthError(_)));
+
+                // Five minutes paused at a 10 s re-check: ~30 reads, but the
+                // renewals double from 30 s — the startup poll's, then at
+                // ~10 s, ~40 s, ~100 s, ~220 s.
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                let reads = Renewing::count(&adapter.reads);
+                let refreshes = Renewing::count(&adapter.refreshes);
+                assert!(reads >= 25, "re-checks stopped re-reading: {reads}");
+                assert!(
+                    (4..=6).contains(&refreshes),
+                    "renewals did not back off: {refreshes} in 300 s"
+                );
+                assert_eq!(Renewing::count(&adapter.probes), 0, "probed while paused");
+
+                // The endpoint recovers. The backoff never exceeds 15 min, so
+                // the account is polling again within that and one re-check.
+                *adapter.renewal.lock().unwrap() = Renewal::Issue("fresh");
+                tokio::time::sleep(REFRESH_BACKOFF_MAX + Duration::from_secs(12)).await;
+                assert!(
+                    matches!(last_outcome(&daemon), PollOutcome::Success { .. }),
+                    "got {:?}",
+                    last_outcome(&daemon)
+                );
+                daemon.shutdown_tx.send_replace(true);
+            })
+            .await;
+    }
+
+    /// An adapter that cannot renew keeps its own error, remedy included,
+    /// rather than a generic "cannot renew".
+    #[tokio::test(start_paused = true)]
+    async fn an_adapter_that_cannot_renew_reports_its_own_expiry() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let adapter = Rc::new(Renewing::new(None, Renewal::Unsupported));
+                let daemon = start_renewing(&adapter).await;
+                let PollOutcome::AuthError(message) = last_outcome(&daemon) else {
+                    panic!("got {:?}", last_outcome(&daemon));
+                };
+                assert!(message.contains("run `x`"), "{message}");
+                daemon.shutdown_tx.send_replace(true);
+            })
+            .await;
+    }
+
+    #[test]
+    fn the_renewal_backoff_doubles_up_to_its_ceiling() {
+        let now = tokio::time::Instant::now();
+        let mut b = RefreshBackoff::default();
+        assert!(b.due(now));
+        assert!(b.failed(now, "x".into()), "a first failure is news");
+        assert_eq!(b.delay(), REFRESH_BACKOFF_BASE);
+        assert!(!b.due(now + Duration::from_secs(29)));
+        assert!(b.due(now + Duration::from_secs(30)));
+        assert!(!b.failed(now, "x".into()), "a repeat is not news");
+        assert_eq!(b.delay(), REFRESH_BACKOFF_BASE * 2);
+        for _ in 0..40 {
+            b.failed(now, "x".into());
+        }
+        assert_eq!(b.delay(), REFRESH_BACKOFF_MAX);
+        assert!(b.failed(now, "y".into()), "a different failure is news");
     }
 }
