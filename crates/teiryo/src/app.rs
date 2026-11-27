@@ -596,7 +596,18 @@ pub struct App {
     pub remote_host: Option<String>,
     /// Time of the most recent update, for the header.
     pub last_update: Option<DateTime<Utc>>,
+    /// When `statuses` was last fetched, so a deadline the daemon published
+    /// can be noticed as passed (see [`App::schedule_lapsed`]).
+    pub statuses_fetched_at: Option<DateTime<Utc>>,
 }
+
+/// How long past a published deadline the TUI waits for the daemon to act
+/// on it before asking again.
+const SCHEDULE_GRACE: chrono::Duration = chrono::Duration::seconds(2);
+
+/// How often to re-ask while a deadline stays passed — a renewal the daemon
+/// started at the deadline may take a while to report.
+const SCHEDULE_REASK: chrono::Duration = chrono::Duration::seconds(10);
 
 impl App {
     /// Fresh app with no data yet.
@@ -646,6 +657,7 @@ impl App {
             build_mismatch: None,
             remote_host: None,
             last_update: None,
+            statuses_fetched_at: None,
         }
     }
 
@@ -670,6 +682,7 @@ impl App {
             (&a.account.provider, &a.account.label).cmp(&(&b.account.provider, &b.account.label))
         });
         let previous_index = self.selected_index();
+        self.statuses_fetched_at = Some(Utc::now());
         // The daemon coalesces wakeups, so a poll can land without an
         // `Update` of its own; each account's `last_poll` still says it did.
         for status in &statuses {
@@ -1439,6 +1452,28 @@ impl App {
         self.polling.insert(account, None);
     }
 
+    /// Whether a deadline the daemon published has passed without a `Status`
+    /// that reflects it. A re-check of a paused account is not a poll, so it
+    /// wakes no client: without asking again, "paused, retrying in 30s" would
+    /// count down to "due" and sit there, and a newer pause reason would never
+    /// arrive. The deadlines are the daemon's; this only notices they passed.
+    pub fn schedule_lapsed(&self, now: DateTime<Utc>) -> bool {
+        let fetched = self.statuses_fetched_at;
+        self.statuses.iter().any(|s| {
+            let deadline = match &s.schedule {
+                teiryo_core::PollSchedule::Polling { next_poll_at, .. } => *next_poll_at,
+                teiryo_core::PollSchedule::Paused {
+                    next_recheck_at, ..
+                } => *next_recheck_at,
+                _ => None,
+            };
+            deadline.is_some_and(|d| {
+                let due = d + SCHEDULE_GRACE;
+                due <= now && fetched.is_none_or(|f| f < due || f + SCHEDULE_REASK <= now)
+            })
+        })
+    }
+
     /// A poll of `account` landed as `poll`: clear its spinner if that poll
     /// is newer than the request it is spinning for.
     pub fn poll_settled(&mut self, account: &AccountId, poll: PollId) {
@@ -2050,13 +2085,10 @@ mod tests {
         assert_eq!(app.overlay, None);
     }
 
-    /// Poll ids in order. ULIDs order by millisecond and are random within
-    /// one, so each is minted in a millisecond of its own.
+    /// Poll ids in the order they were made, which `PollId::generate`
+    /// guarantees even inside one millisecond.
     fn ordered_ids<const N: usize>() -> [PollId; N] {
-        std::array::from_fn(|_| {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            PollId::generate()
-        })
+        std::array::from_fn(|_| PollId::generate())
     }
 
     fn event_with(id: PollId) -> PollEvent {
@@ -2111,6 +2143,38 @@ mod tests {
         landed.last_poll = Some(event_with(landed_id));
         app.set_statuses(vec![landed]);
         assert!(app.polling.is_empty());
+    }
+
+    /// A passed re-check deadline asks for a fresh `Status` once, then only
+    /// every few seconds while the daemon still shows it passed.
+    #[test]
+    fn a_passed_deadline_asks_for_status_again_but_not_every_tick() {
+        let mut app = App::new();
+        let mut paused = status("claude", "a", 1);
+        let deadline = Utc::now() - chrono::Duration::seconds(5);
+        paused.schedule = teiryo_core::PollSchedule::Paused {
+            reason: "x".into(),
+            next_recheck_at: Some(deadline),
+        };
+        // Fetched before the deadline passed: stale.
+        app.set_statuses(vec![paused.clone()]);
+        app.statuses_fetched_at = Some(deadline - chrono::Duration::seconds(1));
+        assert!(app.schedule_lapsed(Utc::now()));
+
+        // Just fetched, still showing the passed deadline: not again yet…
+        app.set_statuses(vec![paused]);
+        assert!(!app.schedule_lapsed(Utc::now()));
+        // …but again once the re-ask interval has gone by.
+        assert!(app.schedule_lapsed(Utc::now() + chrono::Duration::seconds(11)));
+
+        // A deadline still ahead asks for nothing.
+        let mut ahead = status("claude", "a", 1);
+        ahead.schedule = teiryo_core::PollSchedule::Paused {
+            reason: "x".into(),
+            next_recheck_at: Some(Utc::now() + chrono::Duration::seconds(30)),
+        };
+        app.set_statuses(vec![ahead]);
+        assert!(!app.schedule_lapsed(Utc::now() + chrono::Duration::seconds(11)));
     }
 
     #[test]

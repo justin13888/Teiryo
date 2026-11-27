@@ -354,6 +354,12 @@ async fn drive(
                 if app.disconnected && app.incompatible.is_none() && idle {
                     *reconnect_task = Some(spawn_reconnect(target.clone(), net_tx.clone()));
                 }
+                // A deadline the daemon published has passed with no update
+                // to show for it — a paused account's re-check wakes nobody —
+                // so ask what it is doing now.
+                if !app.disconnected && app.schedule_lapsed(chrono::Utc::now()) {
+                    refresh_status(command, app).await;
+                }
                 // Otherwise the tick just redraws countdowns and the spinner.
             }
         }

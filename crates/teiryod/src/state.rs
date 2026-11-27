@@ -199,10 +199,8 @@ fn replays_as_a_reset(rollover: &WindowRollover, window: &QuotaWindow) -> bool {
     }
 }
 
-/// Cadence in whole seconds. `0` means "no next poll to expect": either the
-/// account has no poller registered, or its provider is disabled in config.
-/// Clients already treat `0` as "draw no countdown", which is exactly right
-/// for a paused provider.
+/// A cadence in whole seconds, saturating at `u32::MAX`, as the wire
+/// carries it.
 pub(crate) fn interval_secs(interval: Duration) -> u32 {
     interval.as_secs().min(u64::from(u32::MAX)) as u32
 }
