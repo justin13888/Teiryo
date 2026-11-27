@@ -1881,7 +1881,11 @@ mod tests {
             windows: (0..windows).map(|i| view(&format!("w{i}"))).collect(),
             last_poll: None,
             last_success: None,
-            poll_interval_secs: 60,
+            configured_interval_secs: 60,
+            schedule: teiryo_core::PollSchedule::Polling {
+                interval_secs: 60,
+                next_poll_at: None,
+            },
         }
     }
 

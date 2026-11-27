@@ -469,7 +469,7 @@ fn derive(column: &Column<'_>, now: DateTime<Utc>) -> Derived {
         span,
         effective.as_ref(),
         &column.trend.snapshots,
-        chart_gap(column.trend.range, column.status.poll_interval_secs),
+        chart_gap(column.trend.range, column.status.configured_interval_secs),
     );
     Derived { effective, points }
 }
@@ -660,7 +660,7 @@ fn usage_pace_stack(
             Paragraph::new(Span::styled("data", theme::dim())).alignment(Alignment::Left),
             label,
         );
-        let gap = chart_gap(column.trend.range, column.status.poll_interval_secs);
+        let gap = chart_gap(column.trend.range, column.status.configured_interval_secs);
         frame.render_widget(
             Paragraph::new(coverage_line(
                 &axis,
@@ -763,7 +763,7 @@ fn projection_cone(
         return Vec::new();
     };
     let points = app.recent_points(&column.status.account.id, &column.view.window.id);
-    let max_gap = metrics::gap_tolerance(column.status.poll_interval_secs);
+    let max_gap = metrics::gap_tolerance(column.status.configured_interval_secs);
     let Some(rate) = metrics::estimate_rate(window, points, max_gap, now) else {
         return Vec::new();
     };
@@ -1365,7 +1365,7 @@ pub fn readout(app: &App, hits: &[ChartHit], now: DateTime<Utc>) -> Option<Strin
                 }),
             ];
             let range = app.charted_trend().map_or(app.range, |t| t.range);
-            let gap = chart_gap(range, status.poll_interval_secs);
+            let gap = chart_gap(range, status.configured_interval_secs);
             let span = view.window.span().unwrap_or_else(|| Duration::hours(5));
             let effective = metrics::effective_window(view, now);
             // A reading with no reset carries no window instance to measure a

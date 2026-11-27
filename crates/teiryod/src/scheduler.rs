@@ -6,12 +6,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use teiryo_core::{
-    Account, AuthError, Credential, PollEvent, PollId, PollOutcome, PollTrigger, ProbeError,
-    ProviderAdapter,
+    Account, AuthError, Credential, PollEvent, PollId, PollOutcome, PollSchedule, PollTrigger,
+    ProbeError, ProviderAdapter,
 };
 use tokio::sync::{mpsc, watch};
 
-use crate::state::Daemon;
+use crate::state::{interval_secs, Daemon};
 
 /// What the config currently says about one account's polling. Delivered over
 /// a `watch` rather than captured by value, so a `config.toml` edit reaches a
@@ -297,31 +297,59 @@ impl Gate {
     }
 }
 
-/// The cadence clients should count down to for `step`, given the wait the
-/// task will settle back to once it is polling normally again. `None` leaves
-/// the published value alone because something else owns it.
+/// What clients should be told the task is doing for `step`, given the wait
+/// it will settle back to once polling normally (`resting`), the jittered
+/// wait it is about to sleep (`wait`), and why it is paused if it is. `None`
+/// leaves the published value alone because something else owns it.
 ///
-/// A paused account reports `0`, the value `AccountStatus.poll_interval_secs`
-/// already uses for "no next poll to count down to". Reporting the re-check
-/// cadence instead would promise a poll that is not scheduled — nothing is
-/// polled while paused, and the re-check may find nothing for hours.
+/// The deadline is the one the task will actually sleep to, jitter included,
+/// so a client counts down to the real thing instead of guessing from the
+/// last poll and the cadence.
 ///
-/// `PollNow` reports `resting` rather than nothing, because the poll it is
-/// about to run is what *wakes* the clients: `record_event` returns every open
-/// `AwaitUpdate`, and the TUI's only refresh is that wakeup — it runs no timer
-/// of its own. Leaving the published value alone here would hand the client
-/// whichever cadence the previous step wrote, and the previous step on the
-/// path this whole change exists to create is a pause, which writes `0`. A
-/// freshly recovered account would have reported "no next poll" for a full
-/// cadence, having just started polling again.
-fn reported_interval(step: Step, resting: Duration) -> Option<Duration> {
+/// `PollNow` reports polling *now* rather than nothing, because the poll it
+/// is about to run is what *wakes* the clients: `record_event` returns every
+/// open `AwaitUpdate`, and the TUI's only refresh is that wakeup — it runs no
+/// timer of its own. Leaving the published value alone here would hand the
+/// client whichever state the previous step wrote, which on the recovery path
+/// is a pause. A freshly recovered account would have reported itself paused
+/// for a full cadence, having just started polling again.
+fn reported_schedule(
+    step: Step,
+    resting: Duration,
+    wait: Duration,
+    pause_reason: &str,
+) -> Option<PollSchedule> {
+    let at = |after: Duration| {
+        chrono::Duration::from_std(after)
+            .ok()
+            .and_then(|d| Utc::now().checked_add_signed(d))
+    };
     match step {
-        Step::Recheck { .. } => Some(Duration::ZERO),
-        Step::Wait { after } => Some(after),
-        Step::PollNow => Some(resting),
-        // The config's business: `apply_config` publishes `0` for a disabled
-        // provider as it parks it.
+        Step::Recheck { .. } => Some(PollSchedule::Paused {
+            reason: pause_reason.to_owned(),
+            next_recheck_at: at(wait),
+        }),
+        Step::Wait { after } => Some(PollSchedule::Polling {
+            interval_secs: interval_secs(after),
+            next_poll_at: at(wait),
+        }),
+        Step::PollNow => Some(PollSchedule::Polling {
+            interval_secs: interval_secs(resting),
+            next_poll_at: at(Duration::ZERO),
+        }),
+        // The config's business: `apply_config` publishes `Disabled` as it
+        // parks the task.
         Step::Park => None,
+    }
+}
+
+/// Keep the latest reason a poll gave for being unable to use its
+/// credential, for the pause it starts or prolongs.
+fn note_pause_reason(polled: &Polled, reason: &mut String) {
+    if polled.stage == Stage::Credential {
+        if let Some(message) = polled.outcome.error_message() {
+            *reason = message.to_owned();
+        }
     }
 }
 
@@ -390,6 +418,8 @@ pub fn spawn_poller(
         let mut paused_since: Option<Instant> = None;
         // How soon a paused account may spend another renewal attempt.
         let mut refresh_backoff = RefreshBackoff::default();
+        // Why the account is paused, for clients: the latest failure.
+        let mut pause_reason = String::new();
         loop {
             // Whatever ended the pause, the renewals it was rationing are over.
             if !gate.credential_stale {
@@ -397,13 +427,23 @@ pub fn spawn_poller(
             }
             let schedule = *schedule_rx.borrow_and_update();
             let step = gate.next_step(schedule, poll_immediately);
+            // Jittered here, once, so the deadline clients are told is the
+            // one slept to below.
+            let wait = match step {
+                Step::Recheck { after } | Step::Wait { after } => jittered(after),
+                Step::Park | Step::PollNow => Duration::ZERO,
+            };
             // Published before this iteration's first `.await`: `poll_once`
             // wakes every `AwaitUpdate` client as it records, and a client
-            // that got in between would latch the old cadence and not learn
+            // that got in between would latch the old schedule and not learn
             // better until the next poll — which, while paused, may be hours.
-            if let Some(interval) = reported_interval(step, gate.throttle.delay(schedule.interval))
-            {
-                daemon.set_reported_interval(&account.id, interval);
+            if let Some(published) = reported_schedule(
+                step,
+                gate.throttle.delay(schedule.interval),
+                wait,
+                &pause_reason,
+            ) {
+                daemon.set_schedule(&account.id, published);
             }
             match step {
                 Step::Park => {
@@ -432,6 +472,7 @@ pub fn spawn_poller(
                     poll_immediately = false;
                     let polled =
                         poll_once(&daemon, adapter.as_ref(), &account, PollTrigger::Startup).await;
+                    note_pause_reason(&polled, &mut pause_reason);
                     for t in gate.record(&polled).into_iter().flatten() {
                         log_transition(&account, t, schedule, gate, &mut paused_since);
                     }
@@ -440,18 +481,22 @@ pub fn spawn_poller(
                 // work, and asking anyway is what used to fill the log with
                 // thousands of identical failures over a single expired token.
                 // The re-check may spend a renewal, on its own backoff.
-                Step::Recheck { after } => {
+                Step::Recheck { .. } => {
                     tokio::select! {
                         // Jittered like a poll, though no request goes out: a
                         // future multi-account Claude reads one file from
                         // several tasks, and recovering them all on the same
                         // tick would fire simultaneous probes.
-                        _ = tokio::time::sleep(jittered(after)) => {
-                            if recheck(adapter.as_ref(), &account, &mut refresh_backoff).await {
-                                if let Some(t) = gate.credential_ok() {
-                                    log_transition(&account, t, schedule, gate, &mut paused_since);
+                        () = tokio::time::sleep(wait) => {
+                            match recheck(adapter.as_ref(), &account, &mut refresh_backoff).await {
+                                Ok(()) => {
+                                    if let Some(t) = gate.credential_ok() {
+                                        log_transition(&account, t, schedule, gate, &mut paused_since);
+                                    }
+                                    poll_immediately = true;
                                 }
-                                poll_immediately = true;
+                                Err(Some(reason)) => pause_reason = reason,
+                                Err(None) => {}
                             }
                         }
                         // A manual trigger is not held back by the pause: the
@@ -460,6 +505,7 @@ pub fn spawn_poller(
                         // pause through the same path a scheduled poll uses.
                         Some(trigger) = rx.recv() => {
                             let polled = poll_once(&daemon, adapter.as_ref(), &account, trigger).await;
+                            note_pause_reason(&polled, &mut pause_reason);
                             for t in gate.record(&polled).into_iter().flatten() {
                                 log_transition(&account, t, schedule, gate, &mut paused_since);
                             }
@@ -468,11 +514,12 @@ pub fn spawn_poller(
                         _ = shutdown_rx.changed() => break,
                     }
                 }
-                Step::Wait { after } => {
+                Step::Wait { .. } => {
                     tokio::select! {
-                        _ = tokio::time::sleep(jittered(after)) => {
+                        () = tokio::time::sleep(wait) => {
                             let polled =
                                 poll_once(&daemon, adapter.as_ref(), &account, PollTrigger::Scheduled).await;
+                            note_pause_reason(&polled, &mut pause_reason);
                             for t in gate.record(&polled).into_iter().flatten() {
                                 log_transition(&account, t, schedule, gate, &mut paused_since);
                             }
@@ -482,6 +529,7 @@ pub fn spawn_poller(
                         // backoff was stale and clears.
                         Some(trigger) = rx.recv() => {
                             let polled = poll_once(&daemon, adapter.as_ref(), &account, trigger).await;
+                            note_pause_reason(&polled, &mut pause_reason);
                             for t in gate.record(&polled).into_iter().flatten() {
                                 log_transition(&account, t, schedule, gate, &mut paused_since);
                             }
@@ -711,14 +759,15 @@ async fn resolve_credential(
 
 /// One re-check of a paused account: re-read the credential, which is free,
 /// and renew it when it has expired and the backoff allows. Sends no probe.
-/// Returns whether the credential is usable again.
+/// `Ok` when the credential is usable again; otherwise the newer reason it is
+/// not, or `None` when nothing new was learned (a renewal not yet due).
 async fn recheck(
     adapter: &dyn ProviderAdapter,
     account: &Account,
     backoff: &mut RefreshBackoff,
-) -> bool {
+) -> Result<(), Option<String>> {
     match adapter.credential_for(account).await {
-        Ok(_) => true,
+        Ok(_) => Ok(()),
         Err(AuthError::Expired(_)) if backoff.due(tokio::time::Instant::now()) => {
             match adapter.refresh_credential(account, None).await {
                 Ok(_) => {
@@ -727,9 +776,9 @@ async fn recheck(
                         account = %account.id,
                         "credential renewed"
                     );
-                    true
+                    Ok(())
                 }
-                Err(AuthError::RefreshUnsupported) => false,
+                Err(AuthError::RefreshUnsupported) => Err(None),
                 Err(e) => {
                     let message = e.to_string();
                     if backoff.failed(tokio::time::Instant::now(), message.clone()) {
@@ -741,11 +790,12 @@ async fn recheck(
                             "renewing the credential failed"
                         );
                     }
-                    false
+                    Err(Some(message))
                 }
             }
         }
-        Err(_) => false,
+        Err(AuthError::Expired(_)) => Err(None),
+        Err(e) => Err(Some(e.to_string())),
     }
 }
 
@@ -987,38 +1037,80 @@ mod tests {
         );
     }
 
-    /// No poll happens while paused, so there is no next poll to count down to
-    /// — and `0` is the value clients already read that way.
+    /// No poll happens while paused, so the account says it is paused — and
+    /// why — rather than offering a countdown to a poll that is not coming.
     #[test]
-    fn a_stale_credential_reports_no_next_poll() {
+    fn a_stale_credential_reports_a_pause_with_its_reason() {
         let mut g = Gate::default();
         g.record(&unusable_credential());
         let step = g.next_step(enabled(180), false);
-        assert_eq!(reported_interval(step, BASE), Some(Duration::ZERO));
+        let reported = reported_schedule(step, BASE, Duration::from_secs(30), "token expired");
+        let Some(PollSchedule::Paused {
+            reason,
+            next_recheck_at: Some(at),
+        }) = reported
+        else {
+            panic!("got {reported:?}");
+        };
+        assert_eq!(reason, "token expired");
+        let in_secs = (at - Utc::now()).num_seconds();
+        assert!((28..=30).contains(&in_secs), "re-check in {in_secs}s");
+    }
+
+    /// The deadline published is the wait actually slept, jitter included.
+    #[test]
+    fn a_polling_account_reports_the_deadline_it_sleeps_to() {
+        let reported = reported_schedule(
+            Step::Wait { after: BASE },
+            BASE,
+            Duration::from_secs(170),
+            "",
+        );
+        let Some(PollSchedule::Polling {
+            interval_secs,
+            next_poll_at: Some(at),
+        }) = reported
+        else {
+            panic!("got {reported:?}");
+        };
+        assert_eq!(interval_secs, 180);
+        let in_secs = (at - Utc::now()).num_seconds();
+        assert!((168..=170).contains(&in_secs), "next poll in {in_secs}s");
     }
 
     /// The poll that ends a pause is the one that wakes every client, and the
-    /// value standing at that moment is `0` — the pause published it. Leaving
-    /// it alone would hand a freshly recovered account "no next poll" for a
-    /// whole cadence, because the TUI refreshes on poll events and runs no
-    /// timer of its own.
+    /// value standing at that moment is the pause. Leaving it alone would hand
+    /// a freshly recovered account "paused" for a whole cadence, because the
+    /// TUI refreshes on poll events and runs no timer of its own.
     #[test]
     fn the_poll_that_ends_a_pause_publishes_the_cadence_it_returns_to() {
         let mut g = Gate::default();
         g.record(&unusable_credential());
-        assert_eq!(
-            reported_interval(g.next_step(enabled(180), false), BASE),
-            Some(Duration::ZERO),
-            "a paused account should offer no countdown"
+        assert!(
+            matches!(
+                reported_schedule(g.next_step(enabled(180), false), BASE, BASE, "x"),
+                Some(PollSchedule::Paused { .. })
+            ),
+            "a paused account should say so"
         );
 
         g.credential_ok();
         let step = g.next_step(enabled(180), true);
         assert_eq!(step, Step::PollNow);
-        assert_eq!(
-            reported_interval(step, g.throttle.delay(enabled(180).interval)),
-            Some(BASE),
-            "recovery left the client counting down to nothing"
+        assert!(
+            matches!(
+                reported_schedule(
+                    step,
+                    g.throttle.delay(enabled(180).interval),
+                    Duration::ZERO,
+                    "x"
+                ),
+                Some(PollSchedule::Polling {
+                    interval_secs: 180,
+                    next_poll_at: Some(_)
+                })
+            ),
+            "recovery left the client believing it paused"
         );
     }
 
@@ -1031,7 +1123,13 @@ mod tests {
         g.record(&limited(None));
         let step = g.next_step(enabled(180), false);
         assert_eq!(step, Step::Wait { after: BASE * 2 });
-        assert_eq!(reported_interval(step, BASE * 2), Some(BASE * 2));
+        assert!(matches!(
+            reported_schedule(step, BASE * 2, BASE * 2, ""),
+            Some(PollSchedule::Polling {
+                interval_secs: 360,
+                ..
+            })
+        ));
     }
 
     /// One line in, one line out — however long the stall lasts between them.

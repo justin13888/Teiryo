@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-use teiryo_core::{AccountStatus, QuotaSnapshot, WindowView};
+use teiryo_core::{AccountStatus, PollSchedule, QuotaSnapshot, WindowView};
 
 use crate::app::{App, Pane, RowRef};
 use crate::metrics;
@@ -134,16 +134,13 @@ fn connection_line(app: &App, now: DateTime<Utc>) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The soonest expected next poll across all accounts. Approximate: the
-/// scheduler jitters each cycle by ±10%, so this is a hint, not a promise.
+/// The soonest next poll across all accounts: the deadlines the daemon's
+/// poll tasks actually sleep to, jitter and backoff included. Paused and
+/// disabled accounts have none, so they offer no countdown.
 fn next_poll_at(app: &App, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     app.statuses
         .iter()
-        .filter(|s| s.poll_interval_secs > 0)
-        .filter_map(|s| {
-            let last = s.last_poll.as_ref()?.ts;
-            Some(last + chrono::Duration::seconds(i64::from(s.poll_interval_secs)))
-        })
+        .filter_map(|s| s.schedule.next_poll_at())
         .filter(|ts| *ts > now)
         .min()
 }
@@ -249,7 +246,7 @@ pub fn render_quotas(frame: &mut Frame<'_>, area: Rect, app: &mut App, now: Date
                         window_lines(
                             view,
                             points,
-                            status.poll_interval_secs,
+                            status.configured_interval_secs,
                             inner_width,
                             now,
                             two_line,
@@ -272,6 +269,22 @@ fn account_line(status: &AccountStatus, now: DateTime<Utc>) -> Line<'static> {
         format!("{}/{}", status.account.provider, status.account.label),
         Style::default().add_modifier(Modifier::BOLD),
     )];
+    // Said outright, from the daemon's own state, and first so a long error
+    // cannot push it off the row: a paused account recovers by itself, a
+    // disabled one never will, and the two used to look alike.
+    match &status.schedule {
+        PollSchedule::Paused {
+            next_recheck_at, ..
+        } => spans.push(Span::styled(
+            next_recheck_at.map_or_else(
+                || "  paused, retrying".to_owned(),
+                |at| format!("  paused, retrying in {}", format_countdown(at, now)),
+            ),
+            Style::default().fg(theme::WARN),
+        )),
+        PollSchedule::Disabled => spans.push(Span::styled("  disabled", theme::dim())),
+        PollSchedule::Polling { .. } | PollSchedule::Unregistered => {}
+    }
     match &status.last_poll {
         Some(event) => {
             let (text, failed) = outcome_text(event);

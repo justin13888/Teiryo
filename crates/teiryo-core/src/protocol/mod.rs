@@ -46,7 +46,7 @@ mod wire_fingerprint {
     };
     use super::wire::{
         AccountHealth, AccountStatus, ConfigEdit, ConfigState, ConfigView, HistoryPage,
-        ProviderHealth, ProviderSettings, Request, Response, WindowView,
+        PollSchedule, ProviderHealth, ProviderSettings, Request, Response, WindowView,
     };
     use crate::adapter::{BarStyle, RenderHint};
     use crate::domain::{
@@ -62,7 +62,7 @@ mod wire_fingerprint {
     /// not repin the hash on its own: bump `PROTOCOL_VERSION` by 1, update
     /// `docs/protocol.md` and the golden hello bytes in `handshake.rs`, and
     /// then repin both halves of this pair to what the failure prints.
-    const WIRE_FINGERPRINT: (u16, u64) = (9, 0x45f8_706f_f871_faa5);
+    const WIRE_FINGERPRINT: (u16, u64) = (10, 0xc82b_5553_fb5d_2f51);
 
     /// 64-bit FNV-1a. Inline rather than a dependency: it only has to be
     /// deterministic across builds and platforms, not collision resistant.
@@ -249,7 +249,11 @@ mod wire_fingerprint {
                     },
                 )),
                 last_success: Some(at(7, 45)),
-                poll_interval_secs: 60,
+                configured_interval_secs: 60,
+                schedule: PollSchedule::Polling {
+                    interval_secs: 120,
+                    next_poll_at: Some(at(7, 47)),
+                },
             }]),
             Response::PollAccepted {
                 poll_id: poll_id(2),
@@ -294,13 +298,42 @@ mod wire_fingerprint {
             )]),
             Response::Providers(vec![ProviderHealth {
                 provider: "claude".into(),
-                accounts: vec![AccountHealth {
-                    account: account(),
-                    consecutive_failures: 3,
-                    last_error: Some("rate limited".into()),
-                    last_poll_ts: Some(at(7, 45)),
-                    poll_interval_secs: 60,
-                }],
+                accounts: vec![
+                    AccountHealth {
+                        account: account(),
+                        consecutive_failures: 3,
+                        last_error: Some("rate limited".into()),
+                        last_poll_ts: Some(at(7, 45)),
+                        schedule: PollSchedule::Paused {
+                            reason: "token expired".into(),
+                            next_recheck_at: Some(at(7, 46)),
+                        },
+                    },
+                    AccountHealth {
+                        account: account(),
+                        consecutive_failures: 0,
+                        last_error: None,
+                        last_poll_ts: None,
+                        schedule: PollSchedule::Disabled,
+                    },
+                    AccountHealth {
+                        account: account(),
+                        consecutive_failures: 0,
+                        last_error: None,
+                        last_poll_ts: None,
+                        schedule: PollSchedule::Unregistered,
+                    },
+                    AccountHealth {
+                        account: account(),
+                        consecutive_failures: 0,
+                        last_error: None,
+                        last_poll_ts: None,
+                        schedule: PollSchedule::Polling {
+                            interval_secs: 60,
+                            next_poll_at: None,
+                        },
+                    },
+                ],
                 consecutive_failures: 3,
                 last_error: Some("rate limited".into()),
                 discovery_error: Some("no Claude Code login in the Keychain".into()),
