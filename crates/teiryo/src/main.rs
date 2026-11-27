@@ -298,7 +298,7 @@ async fn drive(
                 NetEvent::Update(event) => {
                     app.last_update = Some(event.ts);
                     app.disconnected = false;
-                    app.poll_settled(&event.account);
+                    app.poll_settled(&event.account, event.id);
                     refresh_status(command, app).await;
                     refresh_recent(command, app).await;
                     // The detail pane tracks the same data, so it refreshes
@@ -314,12 +314,12 @@ async fn drive(
                     refresh_recent(command, app).await;
                 }
                 NetEvent::Disconnected(message) => {
-                    app.disconnected = true;
+                    app.connection_lost();
                     app.error = Some(message);
                 }
                 NetEvent::ReconnectFailed(message) => app.error = Some(message),
                 NetEvent::Incompatible(message) => {
-                    app.disconnected = true;
+                    app.connection_lost();
                     app.incompatible = Some(message);
                 }
                 NetEvent::Reconnected(client) => {
@@ -527,9 +527,14 @@ async fn send_checked(command: &mut Client, app: &mut App, request: &Request) {
                 app.poll_refused(provider, account.as_ref());
             }
         }
+        Ok(Response::PollAccepted { poll_id }) => {
+            if let Request::PollNow { provider, account } = request {
+                app.poll_accepted(provider, account.as_ref(), poll_id);
+            }
+        }
         Ok(_) => {}
         Err(e) => {
-            app.disconnected = true;
+            app.connection_lost();
             app.error = Some(e.to_string());
         }
     }
@@ -542,7 +547,7 @@ fn note_unexpected(app: &mut App, response: Result<Response, client::ClientError
         }
         Ok(other) => app.error = Some(format!("unexpected daemon reply: {other:?}")),
         Err(e) => {
-            app.disconnected = true;
+            app.connection_lost();
             app.error = Some(e.to_string());
         }
     }

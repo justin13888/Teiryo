@@ -5,7 +5,7 @@
 //! settings) draw *over* it rather than replacing it, so there is no screen
 //! stack and no per-screen keymap to keep straight.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
 use crossterm::event::{
@@ -326,26 +326,33 @@ pub enum SettingsRow {
 
 /// Intervals a keypress moves between, in seconds.
 ///
-/// A ladder rather than ±1s: one press should be a change worth making, and
-/// the bottom rung is the daemon's own floor, so the overlay cannot propose a
-/// value that would come back rejected.
+/// A ladder rather than ±1s: one press should be a change worth making. The
+/// bottom of the ladder is not this list's but the daemon's own floor
+/// (`ConfigView.min_poll_interval_secs`), so the overlay cannot propose a
+/// value that would come back rejected, whatever that floor is.
 pub const INTERVAL_RUNGS: [u32; 10] = [10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
 
-/// The rung `delta` steps from `current`, clamped at both ends. A value
-/// between rungs (hand-written in `config.toml`) moves to the neighbouring
-/// rung in the requested direction rather than snapping backwards.
-fn step_interval(current: u32, delta: isize) -> u32 {
-    let at_or_after = INTERVAL_RUNGS.iter().position(|r| *r >= current);
+/// The rung `delta` steps from `current` on a ladder starting at `floor`,
+/// clamped at the bottom. A value between rungs (hand-written in
+/// `config.toml`) moves to the neighbouring rung in the requested direction
+/// rather than snapping backwards; one above every rung stays put on the way
+/// up — the ladder has nothing higher, and must not answer "longer" with a
+/// shorter interval — and comes down to the top rung.
+fn step_interval(current: u32, delta: isize, floor: u32) -> u32 {
+    let rungs: Vec<u32> = std::iter::once(floor)
+        .chain(INTERVAL_RUNGS.iter().copied().filter(|r| *r > floor))
+        .collect();
+    let last = rungs.len() as isize - 1;
+    let at_or_after = rungs.iter().position(|r| *r >= current);
     let index = match (at_or_after, delta) {
-        (Some(i), _) if INTERVAL_RUNGS[i] == current => i as isize + delta,
+        (Some(i), _) if rungs[i] == current => i as isize + delta,
         // Between rungs: up goes to the next one above, down to the one below.
         (Some(i), d) if d > 0 => i as isize,
         (Some(i), _) => i as isize - 1,
-        // Above every rung.
-        (None, d) if d > 0 => INTERVAL_RUNGS.len() as isize - 1,
-        (None, _) => INTERVAL_RUNGS.len() as isize - 1,
+        (None, d) if d > 0 => return current,
+        (None, _) => last,
     };
-    INTERVAL_RUNGS[index.clamp(0, INTERVAL_RUNGS.len() as isize - 1) as usize]
+    rungs[index.clamp(0, last) as usize]
 }
 
 /// One selectable dashboard row: an account header or one of its windows.
@@ -565,7 +572,11 @@ pub struct App {
     /// Cursor into [`App::settings_rows`], clamped on every use.
     pub settings_cursor: usize,
     /// Accounts with a manual poll in flight, for the spinner.
-    pub polling: HashSet<AccountId>,
+    /// Accounts with a manual poll in flight, each with the newest poll id
+    /// the daemon knew of when it accepted the request (`None` until the
+    /// acceptance arrives). Only a poll newer than that settles the spinner —
+    /// an older one is history, not the answer.
+    pub polling: HashMap<AccountId, Option<PollId>>,
     /// Spinner frame counter, advanced once per tick.
     pub spinner: usize,
     /// Status-line error, if any.
@@ -627,7 +638,7 @@ impl App {
             overlay: None,
             config: None,
             settings_cursor: 0,
-            polling: HashSet::new(),
+            polling: HashMap::new(),
             spinner: 0,
             error: None,
             disconnected: false,
@@ -659,6 +670,15 @@ impl App {
             (&a.account.provider, &a.account.label).cmp(&(&b.account.provider, &b.account.label))
         });
         let previous_index = self.selected_index();
+        // The daemon coalesces wakeups, so a poll can land without an
+        // `Update` of its own; each account's `last_poll` still says it did.
+        for status in &statuses {
+            if let Some(event) = &status.last_poll {
+                if matches!(self.polling.get(&status.account.id), Some(Some(_))) {
+                    self.poll_settled(&status.account.id, event.id);
+                }
+            }
+        }
         self.statuses = statuses;
         if self.user_moved {
             if self.selected_index().is_none() {
@@ -1416,12 +1436,51 @@ impl App {
 
     /// Note that a poll was requested for `account`, so the header can spin.
     fn mark_polling(&mut self, account: AccountId) {
-        self.polling.insert(account);
+        self.polling.insert(account, None);
     }
 
-    /// Clear the spinner for an account whose poll has landed.
-    pub fn poll_settled(&mut self, account: &AccountId) {
-        self.polling.remove(account);
+    /// A poll of `account` landed as `poll`: clear its spinner if that poll
+    /// is newer than the request it is spinning for.
+    pub fn poll_settled(&mut self, account: &AccountId, poll: PollId) {
+        if let Some(since) = self.polling.get(account) {
+            if since.is_none_or(|since| poll > since) {
+                self.polling.remove(account);
+            }
+        }
+    }
+
+    /// The daemon accepted a `PollNow`, naming the newest poll it knew of.
+    /// Recorded for every account the request targeted, so only a later poll
+    /// settles each one.
+    pub fn poll_accepted(
+        &mut self,
+        provider: &ProviderId,
+        account: Option<&AccountId>,
+        newest: PollId,
+    ) {
+        for id in self.targeted(provider, account) {
+            if let Some(since) = self.polling.get_mut(&id) {
+                *since = Some(newest);
+            }
+        }
+    }
+
+    /// The connection is gone: no poll in flight will be reported on it, so
+    /// every spinner stops rather than turning until a reconnect.
+    pub fn connection_lost(&mut self) {
+        self.disconnected = true;
+        self.polling.clear();
+    }
+
+    /// The accounts a `PollNow { provider, account }` reaches.
+    fn targeted(&self, provider: &ProviderId, account: Option<&AccountId>) -> Vec<AccountId> {
+        self.statuses
+            .iter()
+            .map(|s| &s.account)
+            .filter(|a| &a.provider == provider)
+            .filter(|a| account.is_none_or(|id| &a.id == id))
+            .map(|a| a.id.clone())
+            .collect()
     }
 
     /// Clear the spinner for every account a refused `PollNow` targeted.
@@ -1430,15 +1489,7 @@ impl App {
     /// poll arriving, and a poll the daemon refused — a disabled provider, say
     /// — never arrives.
     pub fn poll_refused(&mut self, provider: &ProviderId, account: Option<&AccountId>) {
-        let targeted: Vec<AccountId> = self
-            .statuses
-            .iter()
-            .map(|s| &s.account)
-            .filter(|a| &a.provider == provider)
-            .filter(|a| account.is_none_or(|id| &a.id == id))
-            .map(|a| a.id.clone())
-            .collect();
-        for id in targeted {
+        for id in self.targeted(provider, account) {
             self.polling.remove(&id);
         }
     }
@@ -1495,7 +1546,9 @@ impl App {
                     .poll_interval_secs
                     .unwrap_or(view.default_poll_interval_secs);
                 Action::EditConfig(ConfigEdit::GlobalPollInterval(Some(step_interval(
-                    current, delta,
+                    current,
+                    delta,
+                    view.min_poll_interval_secs,
                 ))))
             }
             SettingsRow::ProviderEnabled(i) => {
@@ -1509,7 +1562,11 @@ impl App {
                 let provider = &view.providers[i];
                 Action::EditConfig(ConfigEdit::ProviderPollInterval {
                     provider: provider.provider.clone(),
-                    secs: Some(step_interval(provider.effective_poll_interval_secs, delta)),
+                    secs: Some(step_interval(
+                        provider.effective_poll_interval_secs,
+                        delta,
+                        view.min_poll_interval_secs,
+                    )),
                 })
             }
         }
@@ -1768,7 +1825,7 @@ impl App {
             },
             KeyCode::Char('R') => {
                 for status in &self.statuses {
-                    self.polling.insert(status.account.id.clone());
+                    self.polling.insert(status.account.id.clone(), None);
                 }
                 Action::Send(
                     self.providers()
@@ -1993,6 +2050,80 @@ mod tests {
         assert_eq!(app.overlay, None);
     }
 
+    /// Poll ids in order. ULIDs order by millisecond and are random within
+    /// one, so each is minted in a millisecond of its own.
+    fn ordered_ids<const N: usize>() -> [PollId; N] {
+        std::array::from_fn(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            PollId::generate()
+        })
+    }
+
+    fn event_with(id: PollId) -> PollEvent {
+        PollEvent {
+            id,
+            ts: chrono::Utc::now(),
+            provider: "claude".into(),
+            account: AccountId::from("claude:a"),
+            trigger: teiryo_core::domain::PollTrigger::Scheduled,
+            outcome: teiryo_core::domain::PollOutcome::NetworkError("x".into()),
+            latency_ms: 1,
+        }
+    }
+
+    /// A spinner stops for the poll it asked for, not for one that landed
+    /// before the request was accepted.
+    #[test]
+    fn a_spinner_settles_only_on_a_poll_newer_than_its_request() {
+        let mut app = App::new();
+        app.set_statuses(vec![status("claude", "a", 1)]);
+        let [older, accepted, newer] = ordered_ids();
+
+        app.handle_key(key('r'));
+        app.poll_accepted(
+            &"claude".to_owned(),
+            Some(&AccountId::from("claude:a")),
+            accepted,
+        );
+        app.poll_settled(&AccountId::from("claude:a"), older);
+        assert_eq!(app.polling.len(), 1, "an older poll settled the spinner");
+        app.poll_settled(&AccountId::from("claude:a"), newer);
+        assert!(app.polling.is_empty());
+    }
+
+    /// The daemon wakes clients for the newest poll only, so several landing
+    /// together leave some accounts without an `Update` of their own. Their
+    /// `last_poll` in the next `Status` settles them instead.
+    #[test]
+    fn a_coalesced_poll_settles_its_spinner_through_status() {
+        let mut app = App::new();
+        app.set_statuses(vec![status("claude", "a", 1)]);
+        app.handle_key(key('R'));
+        let [accepted, landed_id] = ordered_ids();
+        app.poll_accepted(&"claude".to_owned(), None, accepted);
+
+        let mut stale = status("claude", "a", 1);
+        stale.last_poll = Some(event_with(PollId::zero()));
+        app.set_statuses(vec![stale]);
+        assert_eq!(app.polling.len(), 1, "an old last_poll settled it");
+
+        let mut landed = status("claude", "a", 1);
+        landed.last_poll = Some(event_with(landed_id));
+        app.set_statuses(vec![landed]);
+        assert!(app.polling.is_empty());
+    }
+
+    #[test]
+    fn losing_the_connection_stops_every_spinner() {
+        let mut app = App::new();
+        app.set_statuses(vec![status("claude", "a", 1), status("claude", "b", 1)]);
+        app.handle_key(key('R'));
+        assert_eq!(app.polling.len(), 2);
+        app.connection_lost();
+        assert!(app.polling.is_empty());
+        assert!(app.disconnected);
+    }
+
     /// A poll the daemon refuses never lands, so nothing else would clear its
     /// spinner and the account would appear to be polling forever.
     #[test]
@@ -2048,7 +2179,7 @@ mod tests {
         }
         // Every account spins until its poll lands.
         assert_eq!(app.polling.len(), 3);
-        app.poll_settled(&AccountId::from("claude:a"));
+        app.poll_settled(&AccountId::from("claude:a"), PollId::generate());
         assert_eq!(app.polling.len(), 2);
     }
 
@@ -2197,15 +2328,28 @@ mod tests {
     /// a value the daemon would reject.
     #[test]
     fn the_rung_ladder_clamps_at_both_ends() {
-        assert_eq!(step_interval(INTERVAL_RUNGS[0], -1), INTERVAL_RUNGS[0]);
+        assert_eq!(step_interval(INTERVAL_RUNGS[0], -1, 10), INTERVAL_RUNGS[0]);
         let top = INTERVAL_RUNGS[INTERVAL_RUNGS.len() - 1];
-        assert_eq!(step_interval(top, 1), top);
+        assert_eq!(step_interval(top, 1, 10), top);
         // A hand-written value between rungs moves to the neighbour in the
         // requested direction, not backwards past it.
-        assert_eq!(step_interval(45, 1), 60);
-        assert_eq!(step_interval(45, -1), 30);
-        // And one above every rung still comes down.
-        assert_eq!(step_interval(7_200, -1), top);
+        assert_eq!(step_interval(45, 1, 10), 60);
+        assert_eq!(step_interval(45, -1, 10), 30);
+        // One above every rung still comes down…
+        assert_eq!(step_interval(7_200, -1, 10), top);
+        // …but asking for longer never makes it shorter.
+        assert_eq!(step_interval(7_200, 1, 10), 7_200);
+    }
+
+    /// The bottom is the daemon's floor, not the ladder's: a daemon that
+    /// demands at least 20 s is never offered 10 or 15.
+    #[test]
+    fn the_rung_ladder_starts_at_the_daemons_floor() {
+        assert_eq!(step_interval(30, -1, 20), 20);
+        assert_eq!(step_interval(20, -1, 20), 20);
+        assert_eq!(step_interval(20, 1, 20), 30);
+        // A value under a raised floor comes up to it.
+        assert_eq!(step_interval(10, 1, 20), 20);
     }
 
     #[test]
