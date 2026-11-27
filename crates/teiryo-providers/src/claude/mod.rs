@@ -248,7 +248,7 @@ impl teiryo_core::Authenticator for ClaudeAdapter {
         if let (Some(refused), Some(issued)) = (rejected, &state.issued) {
             if refused.expose_secret() == issued.expose_secret() {
                 return Err(AuthError::Expired(
-                    "the provider refused an access token teiryo had just renewed, so renewing \
+                    "the provider refused the access token teiryo last renewed, so renewing \
                      again would not help; run `claude` to log in again"
                         .into(),
                 ));
@@ -343,6 +343,10 @@ impl ClaudeAdapter {
                 Ok(None)
             }
             Ok(credentials::Stored::Superseded) => Ok(None),
+            // The user logged out (file or section gone): the held login goes
+            // with it, rather than outliving the logout by hours.
+            Err(AuthError::NotLoggedIn(_)) => Ok(None),
+            Err(_) if !self.credentials_path.exists() => Ok(None),
             Err(e) => {
                 let usable = chrono::Utc::now().timestamp_millis() < unsaved.renewed.expires_at_ms;
                 let access = unsaved.renewed.access_token.clone();
@@ -966,6 +970,13 @@ mod refresh_tests {
     #[tokio::test]
     async fn a_renewal_that_cannot_be_written_is_held_and_written_later() {
         use std::os::unix::fs::PermissionsExt;
+        // A read-only directory is what makes the write fail, and root
+        // writes through it.
+        // SAFETY: `geteuid` has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: running as root, a read-only directory does not stop the write");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".credentials.json");
         std::fs::write(&path, EXPIRED).unwrap();
@@ -992,6 +1003,41 @@ mod refresh_tests {
         let doc = written(&path);
         assert_eq!(doc["claudeAiOauth"]["accessToken"], "new-access");
         assert_eq!(doc["claudeAiOauth"]["refreshToken"], "new-refresh");
+    }
+
+    /// A held renewal does not outlive a logout: with the file gone, the
+    /// adapter reports no login instead of polling on with the held token.
+    #[tokio::test]
+    async fn a_held_renewal_is_dropped_when_the_user_logs_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        let adapter = adapter_for(&path, String::new());
+        adapter.refresh_lock.lock().await.unsaved = Some(Unsaved {
+            renewed: credentials::Renewed {
+                access_token: SecretString::from("held"),
+                refresh_token: None,
+                expires_at_ms: i64::MAX,
+            },
+            spent: SecretString::from("old-refresh"),
+        });
+        let err = expect_err(adapter.refresh_credential(&account(), None).await);
+        assert!(matches!(err, AuthError::NotLoggedIn(_)), "got {err:?}");
+        assert!(adapter.refresh_lock.lock().await.unsaved.is_none());
+    }
+
+    /// The falsifier for the bare-403 case: a 403 the authorization server
+    /// itself sends, with an OAuth error code, is still a dead token.
+    #[tokio::test]
+    async fn a_403_with_an_oauth_error_is_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(&path, EXPIRED).unwrap();
+        let (url, hits, _) = endpoint(403, r#"{"error":"invalid_grant"}"#, || {}).await;
+        let adapter = adapter_for(&path, url);
+        let err = expect_err(adapter.refresh_credential(&account(), None).await);
+        assert!(matches!(err, AuthError::Expired(_)), "got {err:?}");
+        let _ = adapter.refresh_credential(&account(), None).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     /// A 403 with no OAuth error body is a proxy or firewall, not a verdict
