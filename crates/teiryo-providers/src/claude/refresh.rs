@@ -89,10 +89,13 @@ pub(crate) async fn exchange(
     let detail = code
         .as_deref()
         .map_or_else(String::new, |c| format!(" ({c})"));
+    // A 403 with no OAuth error body is a proxy or firewall talking, not the
+    // authorization server: it says nothing about the token.
+    let oauth_refusal = matches!(status.as_u16(), 400 | 401) || code.is_some();
     match status.as_u16() {
         // `invalid_grant` and friends: the refresh token is no good. A 400 for
         // any other reason is still not something a retry fixes.
-        400 | 401 | 403 => Err(Failure::Rejected(format!(
+        400 | 401 | 403 if oauth_refusal => Err(Failure::Rejected(format!(
             "the Claude login could not be renewed: token endpoint returned {status}{detail}; \
              run `claude` to log in again"
         ))),
