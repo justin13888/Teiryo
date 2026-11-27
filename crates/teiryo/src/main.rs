@@ -359,6 +359,8 @@ async fn drive(
                 // so ask what it is doing now.
                 if !app.disconnected && app.schedule_lapsed(chrono::Utc::now()) {
                     refresh_status(command, app).await;
+                    // The Health tab shows the same schedules, from `Providers`.
+                    reload_detail(command, app).await;
                 }
                 // Otherwise the tick just redraws countdowns and the spinner.
             }
