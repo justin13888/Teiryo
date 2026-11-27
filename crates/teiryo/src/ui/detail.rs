@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use teiryo_core::domain::{ClientKind, PollOutcome, PollTrigger, QuotaUnit, WindowScope};
-use teiryo_core::{PollEvent, ProviderHealth, WindowRollover, WindowView};
+use teiryo_core::{PollEvent, PollSchedule, ProviderHealth, WindowRollover, WindowView};
 
 use crate::app::{App, DetailTab, Pane, TimeRange, Trend};
 use crate::metrics;
@@ -175,7 +175,7 @@ fn trend_footer(app: &App, now: DateTime<Utc>) -> Line<'static> {
         // Named for what separates it from the pace beside it: that one is the
         // average since the window opened, this one only the recent end of it.
         let points = app.recent_points(&status.account.id, &view.window.id);
-        let max_gap = metrics::gap_tolerance(status.poll_interval_secs);
+        let max_gap = metrics::gap_tolerance(status.configured_interval_secs);
         if let Some((window, recent)) = effective
             .as_ref()
             .and_then(|w| metrics::estimate_rate(w, points, max_gap, now).map(|rate| (w, rate)))
@@ -714,11 +714,40 @@ fn account_lines(provider: &ProviderHealth, now: DateTime<Utc>) -> Vec<Line<'sta
                 Style::default().fg(theme::CRIT),
             ));
         }
-        if account.poll_interval_secs > 0 {
-            spans.push(Span::styled(
-                format!("every {}s", account.poll_interval_secs),
-                theme::dim(),
-            ));
+        // What the daemon says the task is doing, never inferred here.
+        let mut pause_reason = None;
+        match &account.schedule {
+            PollSchedule::Polling {
+                interval_secs,
+                next_poll_at,
+            } => {
+                spans.push(Span::styled(
+                    format!("every {interval_secs}s"),
+                    theme::dim(),
+                ));
+                if let Some(next) = next_poll_at {
+                    spans.push(Span::styled(
+                        format!(", next {}", format_countdown(*next, now)),
+                        theme::dim(),
+                    ));
+                }
+            }
+            PollSchedule::Paused {
+                reason,
+                next_recheck_at,
+            } => {
+                let retry = next_recheck_at.map_or_else(
+                    || "retrying".to_owned(),
+                    |at| format!("retrying in {}", format_countdown(at, now)),
+                );
+                spans.push(Span::styled(
+                    format!("paused, {retry}"),
+                    Style::default().fg(theme::WARN),
+                ));
+                pause_reason = Some(reason);
+            }
+            PollSchedule::Disabled => spans.push(Span::styled("disabled", theme::dim())),
+            PollSchedule::Unregistered => {}
         }
         if let Some(ts) = account.last_poll_ts {
             spans.push(Span::styled(
@@ -733,6 +762,14 @@ fn account_lines(provider: &ProviderHealth, now: DateTime<Utc>) -> Vec<Line<'sta
             lines.push(Line::from(Span::styled(
                 format!("       {error}"),
                 Style::default().fg(theme::CRIT),
+            )));
+        }
+        // A pause can outlive the poll that started it with a newer reason —
+        // a renewal that failed since — and that one is the actionable one.
+        if let Some(reason) = pause_reason.filter(|r| Some(*r) != account.last_error.as_ref()) {
+            lines.push(Line::from(Span::styled(
+                format!("       paused: {reason}"),
+                Style::default().fg(theme::WARN),
             )));
         }
     }
@@ -1050,7 +1087,10 @@ mod tests {
                     consecutive_failures: 0,
                     last_error: None,
                     last_poll_ts: Some(now()),
-                    poll_interval_secs: 300,
+                    schedule: teiryo_core::PollSchedule::Polling {
+                        interval_secs: 300,
+                        next_poll_at: None,
+                    },
                 }],
                 consecutive_failures: 0,
                 last_error: None,

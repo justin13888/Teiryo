@@ -73,6 +73,10 @@ pub enum AuthError {
     /// Failure reading the credential store (keychain, config dir, ...).
     #[error("credential store: {0}")]
     Store(String),
+    /// The adapter has no way to renew a credential; the error that called
+    /// for the renewal stands.
+    #[error("this provider cannot renew its credential")]
+    RefreshUnsupported,
 }
 
 /// Probe (transport-level) failure.

@@ -29,8 +29,8 @@ pub use protocol::handshake::{
     client_handshake, server_handshake, Hello, PROTOCOL_MAGIC, PROTOCOL_VERSION,
 };
 pub use protocol::wire::{
-    AccountHealth, AccountStatus, ConfigEdit, ConfigState, ConfigView, HistoryPage, ProviderHealth,
-    ProviderSettings, Request, Response, WindowView,
+    AccountHealth, AccountStatus, ConfigEdit, ConfigState, ConfigView, HistoryPage, PollSchedule,
+    ProviderHealth, ProviderSettings, Request, Response, WindowView,
 };
 pub use rollover::{is_collapse, ObservedStart, RolloverKind, WindowRollover, RESET_TOLERANCE};
 pub use storage::{Storage, StorageError, MAX_HISTORY_POINTS};

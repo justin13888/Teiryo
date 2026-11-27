@@ -479,7 +479,11 @@ mod tests {
                 latency_ms: 1,
             }),
             last_success: None,
-            poll_interval_secs: 60,
+            configured_interval_secs: 60,
+            schedule: teiryo_core::PollSchedule::Polling {
+                interval_secs: 60,
+                next_poll_at: None,
+            },
         }
     }
 

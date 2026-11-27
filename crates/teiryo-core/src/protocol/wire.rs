@@ -166,8 +166,52 @@ pub struct AccountStatus {
     /// `last_poll.ts`: a later failure leaves the windows stale but valid, and
     /// only this field says how stale.
     pub last_success: Option<DateTime<Utc>>,
-    /// Scheduler cadence for this account. Actual polls jitter ±10% around it.
-    pub poll_interval_secs: u32,
+    /// The cadence `config.toml` sets for this account's provider, whatever
+    /// the scheduler is doing right now — the steady-state spacing a series of
+    /// this account's readings should have. `schedule` says what is actually
+    /// happening.
+    pub configured_interval_secs: u32,
+    /// What the account's poll task is doing, as the scheduler decided it.
+    pub schedule: PollSchedule,
+}
+
+/// What one account's poll task is doing. Decided by the daemon's scheduler
+/// and reported as is, so a client never infers it from cadences or errors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PollSchedule {
+    /// Polling on a schedule.
+    Polling {
+        /// The wait currently in force between polls: the configured cadence,
+        /// or longer while the provider is rate limiting us.
+        interval_secs: u32,
+        /// When the next scheduled poll is due, jitter included. `None` for
+        /// the moment between a config change and the task re-arming.
+        next_poll_at: Option<DateTime<Utc>>,
+    },
+    /// Not polling, because the credential is unusable. The daemon re-checks
+    /// it — re-reading the store and, on a backoff, renewing it — and resumes
+    /// by itself the moment it works.
+    Paused {
+        /// Why: the latest failure resolving or renewing the credential, with
+        /// the adapter's own remedy in it.
+        reason: String,
+        /// When the next re-check is due.
+        next_recheck_at: Option<DateTime<Utc>>,
+    },
+    /// The provider is disabled in `config.toml`.
+    Disabled,
+    /// No poll task is registered for the account.
+    Unregistered,
+}
+
+impl PollSchedule {
+    /// When the next scheduled poll is due, if one is.
+    pub fn next_poll_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Polling { next_poll_at, .. } => *next_poll_at,
+            _ => None,
+        }
+    }
 }
 
 /// Health of one account's poll task.
@@ -181,8 +225,8 @@ pub struct AccountHealth {
     pub last_error: Option<String>,
     /// When the last poll of any outcome completed.
     pub last_poll_ts: Option<DateTime<Utc>>,
-    /// Scheduler cadence for this account.
-    pub poll_interval_secs: u32,
+    /// What the account's poll task is doing.
+    pub schedule: PollSchedule,
 }
 
 /// The daemon's view of `config.toml`: what is in effect, and what its last

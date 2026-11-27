@@ -302,7 +302,11 @@ mod tests {
                     windows: vec![sample_window()],
                 })),
                 last_success: Some(Utc::now()),
-                poll_interval_secs: 60,
+                configured_interval_secs: 60,
+                schedule: crate::PollSchedule::Polling {
+                    interval_secs: 60,
+                    next_poll_at: Some(Utc::now()),
+                },
             }]),
             Response::PollAccepted {
                 poll_id: PollId::generate(),
@@ -353,7 +357,10 @@ mod tests {
                     consecutive_failures: 3,
                     last_error: Some("rate limited".into()),
                     last_poll_ts: Some(Utc::now()),
-                    poll_interval_secs: 60,
+                    schedule: crate::PollSchedule::Paused {
+                        reason: "token expired".into(),
+                        next_recheck_at: None,
+                    },
                 }],
                 consecutive_failures: 3,
                 last_error: Some("rate limited".into()),

@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use teiryo_core::{
     is_collapse, rollover, Account, AccountHealth, AccountId, AccountStatus, BarStyle, ConfigState,
-    ObservedStart, PollEvent, PollOutcome, PollTrigger, ProviderAdapter, ProviderHealth,
-    ProviderId, QuotaWindow, RenderHint, RolloverKind, Storage, WindowId, WindowRollover,
-    WindowView,
+    ObservedStart, PollEvent, PollOutcome, PollSchedule, PollTrigger, ProviderAdapter,
+    ProviderHealth, ProviderId, QuotaWindow, RenderHint, RolloverKind, Storage, WindowId,
+    WindowRollover, WindowView,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -47,10 +47,10 @@ pub struct SharedState {
     /// Live schedule senders into each poll task. A config reload publishes
     /// here rather than respawning tasks.
     pub schedules: HashMap<(ProviderId, AccountId), watch::Sender<Schedule>>,
-    /// Effective scheduler cadence per account, so clients can show how long
-    /// until the next poll without knowing the daemon's config. Zero when the
-    /// account's provider is disabled — there is no next poll to count down to.
-    pub poll_intervals: HashMap<AccountId, Duration>,
+    /// What each account's poll task is doing, as it last published it, so
+    /// clients are told rather than left to infer it. A config reload writes
+    /// here too, and the woken task overwrites that with its own decision.
+    pub poll_schedules: HashMap<AccountId, PollSchedule>,
     /// Settings currently in effect.
     pub config: Config,
     /// Wire-facing snapshot of `config`, plus how the last read of the file
@@ -199,12 +199,10 @@ fn replays_as_a_reset(rollover: &WindowRollover, window: &QuotaWindow) -> bool {
     }
 }
 
-/// Cadence in whole seconds. `0` means "no next poll to expect": either the
-/// account has no poller registered, or its provider is disabled in config.
-/// Clients already treat `0` as "draw no countdown", which is exactly right
-/// for a paused provider.
-fn interval_secs(interval: Option<&Duration>) -> u32 {
-    interval.map_or(0, |d| d.as_secs().min(u64::from(u32::MAX)) as u32)
+/// A cadence in whole seconds, saturating at `u32::MAX`, as the wire
+/// carries it.
+pub(crate) fn interval_secs(interval: Duration) -> u32 {
+    interval.as_secs().min(u64::from(u32::MAX)) as u32
 }
 
 /// What one provider's settings resolve to for its poll tasks.
@@ -215,12 +213,17 @@ fn schedule(config: &Config, provider: &ProviderId) -> Schedule {
     }
 }
 
-/// The cadence to report to clients: zero while disabled, per [`interval_secs`].
-fn reported(schedule: Schedule) -> Duration {
+/// What to report for a schedule the config just set, until the task it
+/// wakes publishes its own decision: `Disabled`, or polling at the configured
+/// cadence with no deadline yet.
+fn reported(schedule: Schedule) -> PollSchedule {
     if schedule.enabled {
-        schedule.interval
+        PollSchedule::Polling {
+            interval_secs: interval_secs(schedule.interval),
+            next_poll_at: None,
+        }
     } else {
-        Duration::ZERO
+        PollSchedule::Disabled
     }
 }
 
@@ -287,7 +290,7 @@ impl Daemon {
                 health: HashMap::new(),
                 pollers: HashMap::new(),
                 schedules: HashMap::new(),
-                poll_intervals: HashMap::new(),
+                poll_schedules: HashMap::new(),
                 config,
                 config_state,
                 known_providers,
@@ -349,7 +352,7 @@ impl Daemon {
                 .collect()
         };
         for (key, next) in updates {
-            st.poll_intervals.insert(key.1.clone(), reported(next));
+            st.poll_schedules.insert(key.1.clone(), reported(next));
             if let Some(tx) = st.schedules.get(&key) {
                 tx.send_replace(next);
             }
@@ -596,7 +599,12 @@ impl Daemon {
                     windows,
                     last_poll: st.latest_poll.get(&a.id).cloned(),
                     last_success: success.map(|e| e.ts),
-                    poll_interval_secs: interval_secs(st.poll_intervals.get(&a.id)),
+                    configured_interval_secs: interval_secs(st.config.poll_interval(&a.provider)),
+                    schedule: st
+                        .poll_schedules
+                        .get(&a.id)
+                        .cloned()
+                        .unwrap_or(PollSchedule::Unregistered),
                 }
             })
             .collect()
@@ -634,7 +642,11 @@ impl Daemon {
                 consecutive_failures: counters.consecutive_failures,
                 last_error: counters.last_error,
                 last_poll_ts: st.latest_poll.get(&account.id).map(|e| e.ts),
-                poll_interval_secs: interval_secs(st.poll_intervals.get(&account.id)),
+                schedule: st
+                    .poll_schedules
+                    .get(&account.id)
+                    .cloned()
+                    .unwrap_or(PollSchedule::Unregistered),
             });
         }
         for (provider, error) in &st.discovery_errors {
@@ -668,23 +680,23 @@ impl Daemon {
         let (tx, rx) = watch::channel(initial);
         st.schedules
             .insert((account.provider.clone(), account.id.clone()), tx);
-        st.poll_intervals
+        st.poll_schedules
             .insert(account.id.clone(), reported(initial));
         st.presenters.insert(account.provider.clone(), adapter);
         rx
     }
 
-    /// Record the cadence a poll task is *actually* running at, which while a
-    /// provider is rate limiting us is longer than the configured one.
+    /// Record what a poll task is *actually* doing: its real next deadline,
+    /// its backed-off cadence while rate limited, or that it is paused.
     ///
-    /// A config reload overwrites this with the configured value, which is
+    /// A config reload overwrites this with what the config says, which is
     /// correct rather than racy: the reload wakes every poll task, and each
-    /// republishes its own cadence as it re-arms.
-    pub fn set_reported_interval(&self, account: &AccountId, interval: Duration) {
+    /// republishes its own decision as it re-arms.
+    pub fn set_schedule(&self, account: &AccountId, schedule: PollSchedule) {
         self.state
             .borrow_mut()
-            .poll_intervals
-            .insert(account.clone(), interval);
+            .poll_schedules
+            .insert(account.clone(), schedule);
     }
 
     /// The newest poll id published so far (zero if none yet).
@@ -766,6 +778,15 @@ mod tests {
     use teiryo_core::domain::{PollId, QuotaUnit, QuotaWindow, ResetKind, WindowId, WindowScope};
 
     use super::*;
+
+    /// What a freshly configured, enabled account reports until its task
+    /// publishes a deadline.
+    fn polling(interval_secs: u32) -> PollSchedule {
+        PollSchedule::Polling {
+            interval_secs,
+            next_poll_at: None,
+        }
+    }
 
     fn account() -> Account {
         Account {
@@ -885,13 +906,14 @@ mod tests {
             }
         );
         assert_eq!(
-            daemon.status(None, None)[0].poll_interval_secs,
-            crate::config::DEFAULT_POLL_INTERVAL.as_secs() as u32
+            daemon.status(None, None)[0].schedule,
+            polling(crate::config::DEFAULT_POLL_INTERVAL.as_secs() as u32)
         );
 
         daemon.apply_config(crate::config::parse("poll_interval_secs = 300").unwrap());
         assert_eq!(rx.borrow_and_update().interval, Duration::from_secs(300));
-        assert_eq!(daemon.status(None, None)[0].poll_interval_secs, 300);
+        assert_eq!(daemon.status(None, None)[0].schedule, polling(300));
+        assert_eq!(daemon.status(None, None)[0].configured_interval_secs, 300);
         assert_eq!(
             daemon.config_state().effective.poll_interval_secs,
             Some(300)
@@ -900,27 +922,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Disabling reports a cadence of zero, which is already how clients spell
-    /// "no next poll to count down to".
+    /// Disabling is reported as such — not as a cadence of zero a client has
+    /// to tell apart from a paused account.
     #[test]
-    fn disabling_a_provider_parks_it_and_zeroes_the_reported_cadence() {
+    fn disabling_a_provider_parks_it_and_reports_it_disabled() {
         let dir = std::env::temp_dir().join(format!("teiryod-state-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let (daemon, mut rx) = scheduled(&dir.join("teiryo.db"));
 
         daemon.apply_config(crate::config::parse("[providers.stub]\nenabled = false").unwrap());
         assert!(!rx.borrow_and_update().enabled);
-        assert_eq!(daemon.status(None, None)[0].poll_interval_secs, 0);
         assert_eq!(
-            daemon.provider_health()[0].accounts[0].poll_interval_secs,
-            0
+            daemon.status(None, None)[0].schedule,
+            PollSchedule::Disabled
+        );
+        assert_eq!(
+            daemon.provider_health()[0].accounts[0].schedule,
+            PollSchedule::Disabled
+        );
+        // The configured cadence is still reported: it describes the
+        // readings already stored, not what is running.
+        assert_eq!(
+            daemon.status(None, None)[0].configured_interval_secs,
+            crate::config::DEFAULT_POLL_INTERVAL.as_secs() as u32
         );
 
         daemon.apply_config(crate::config::parse("").unwrap());
         assert!(rx.borrow_and_update().enabled);
         assert_eq!(
-            daemon.status(None, None)[0].poll_interval_secs,
-            crate::config::DEFAULT_POLL_INTERVAL.as_secs() as u32
+            daemon.status(None, None)[0].schedule,
+            polling(crate::config::DEFAULT_POLL_INTERVAL.as_secs() as u32)
         );
 
         std::fs::remove_dir_all(&dir).ok();

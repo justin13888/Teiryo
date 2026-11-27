@@ -298,7 +298,7 @@ async fn drive(
                 NetEvent::Update(event) => {
                     app.last_update = Some(event.ts);
                     app.disconnected = false;
-                    app.poll_settled(&event.account);
+                    app.poll_settled(&event.account, event.id);
                     refresh_status(command, app).await;
                     refresh_recent(command, app).await;
                     // The detail pane tracks the same data, so it refreshes
@@ -314,12 +314,12 @@ async fn drive(
                     refresh_recent(command, app).await;
                 }
                 NetEvent::Disconnected(message) => {
-                    app.disconnected = true;
+                    app.connection_lost();
                     app.error = Some(message);
                 }
                 NetEvent::ReconnectFailed(message) => app.error = Some(message),
                 NetEvent::Incompatible(message) => {
-                    app.disconnected = true;
+                    app.connection_lost();
                     app.incompatible = Some(message);
                 }
                 NetEvent::Reconnected(client) => {
@@ -353,6 +353,14 @@ async fn drive(
                 let idle = reconnect_task.as_ref().is_none_or(JoinHandle::is_finished);
                 if app.disconnected && app.incompatible.is_none() && idle {
                     *reconnect_task = Some(spawn_reconnect(target.clone(), net_tx.clone()));
+                }
+                // A deadline the daemon published has passed with no update
+                // to show for it — a paused account's re-check wakes nobody —
+                // so ask what it is doing now.
+                if !app.disconnected && app.schedule_lapsed(chrono::Utc::now()) {
+                    refresh_status(command, app).await;
+                    // The Health tab shows the same schedules, from `Providers`.
+                    reload_detail(command, app).await;
                 }
                 // Otherwise the tick just redraws countdowns and the spinner.
             }
@@ -527,9 +535,14 @@ async fn send_checked(command: &mut Client, app: &mut App, request: &Request) {
                 app.poll_refused(provider, account.as_ref());
             }
         }
+        Ok(Response::PollAccepted { poll_id }) => {
+            if let Request::PollNow { provider, account } = request {
+                app.poll_accepted(provider, account.as_ref(), poll_id);
+            }
+        }
         Ok(_) => {}
         Err(e) => {
-            app.disconnected = true;
+            app.connection_lost();
             app.error = Some(e.to_string());
         }
     }
@@ -542,7 +555,7 @@ fn note_unexpected(app: &mut App, response: Result<Response, client::ClientError
         }
         Ok(other) => app.error = Some(format!("unexpected daemon reply: {other:?}")),
         Err(e) => {
-            app.disconnected = true;
+            app.connection_lost();
             app.error = Some(e.to_string());
         }
     }

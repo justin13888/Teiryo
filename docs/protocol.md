@@ -37,7 +37,7 @@ A hand-decoded, **never-changing** preamble runs before any bincode bytes:
 
 ```rust
 // First 6 bytes on every connection, raw — not bincode, so it can never itself go stale
-struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 9 */ }
+struct Hello { magic: [u8; 4] /* b"TEIR" */, protocol_version: u16 /* little-endian; currently 10 */ }
 ```
 
 - Client sends the 6-byte Hello, followed (since v9) by its build commit. Daemon replies with **one raw status byte**: `0x00` accepted, `0x01` version mismatch. After `0x00` the daemon (since v9) sends its own build commit, then bincode frames may follow. After `0x01` the daemon (since v8) sends its own `PROTOCOL_VERSION` as a little-endian `u16`, then closes the connection without ever attempting to decode a `Request`.
@@ -132,7 +132,17 @@ struct AccountStatus {
     windows: Vec<WindowView>,
     last_poll: Option<PollEvent>,       // any outcome, may be a failure
     last_success: Option<DateTime<Utc>>, // when the poll backing `windows` completed
-    poll_interval_secs: u32,             // cadence in force now; jitters ±10%, stretches under backoff
+    configured_interval_secs: u32,       // config.toml's cadence for the provider, whatever is running
+    schedule: PollSchedule,              // what the poll task is doing, as the scheduler decided it
+}
+
+enum PollSchedule {
+    Polling { interval_secs: u32,                    // wait in force now; longer under backoff
+              next_poll_at: Option<DateTime<Utc>> }, // the deadline actually slept to, jitter included
+    Paused  { reason: String,                        // latest failure resolving or renewing the credential
+              next_recheck_at: Option<DateTime<Utc>> },
+    Disabled,                                        // provider disabled in config.toml
+    Unregistered,                                    // no poll task for the account
 }
 
 struct AccountHealth {
@@ -140,7 +150,7 @@ struct AccountHealth {
     consecutive_failures: u32,
     last_error: Option<String>,
     last_poll_ts: Option<DateTime<Utc>>,
-    poll_interval_secs: u32,
+    schedule: PollSchedule,
 }
 struct ProviderHealth {
     provider: ProviderId,
@@ -192,7 +202,7 @@ enum ConfigEdit {
 
 **`ProviderSettings` covers the registry, not just the file.** A compiled-in provider the config never mentions still gets a row, or a client would have no way to configure it.
 
-`poll_interval_secs` on `AccountStatus` and `AccountHealth` is `0` when the account's provider is disabled, when no poller is registered, and while the account's local credential cannot be resolved — all three mean "no next poll to count down to". The third is a pause rather than a park: the daemon is re-checking that credential and resumes on its own once it resolves (see [architecture.md](architecture.md)). A client that wants to tell the two apart has what it needs without a new field — `ConfigView` says whether the provider is enabled, and `last_poll` carries the `AuthError` with the adapter's own remedy in it, beside a `last_success` saying how stale the windows are. The TUI does not yet draw that distinction: it branches on `poll_interval_secs > 0` alone, so a paused account currently renders like a disabled one. It reports the cadence the poll task is *actually* running at, so while the provider is rate limiting us it reads longer than `ConfigView.effective_poll_interval_secs`; a client counting down to the next poll wants the former, and one labelling the user's setting wants the latter. See [domain.md](domain.md) and [architecture.md](architecture.md).
+`schedule` on `AccountStatus` and `AccountHealth` is the poll task's own account of itself, so a client states it rather than inferring it. `Polling.next_poll_at` is the deadline the task is actually sleeping to — jitter and any rate-limit backoff included — so a "next poll in" countdown needs no arithmetic on `last_poll` and cadences; it is `None` only for the instant between a config change and the task re-arming. `Paused` means the credential is unusable and the daemon is re-checking it (re-reading the store, and renewing it on a backoff — see [architecture.md](architecture.md)): it resumes on its own, unlike `Disabled`, and `reason` carries the latest failure with the adapter's remedy, which may be newer than `last_poll` because a failed renewal is not a poll. `configured_interval_secs` is the cadence `config.toml` sets for the account's provider, reported in every state: it is the spacing stored readings are expected to have, which is what a client judging gaps in a series wants, where `Polling.interval_secs` is the cadence in force right now. A re-check is not a poll and wakes no `AwaitUpdate`, so a client showing these deadlines asks `Status` again once one has passed (the TUI: two seconds after it, then every ten while it stays passed) — that is how a paused account's next re-check and newer `reason` reach it. Both replaced `poll_interval_secs` in protocol v10, which overloaded `0` to mean disabled, unregistered *and* paused, so a paused account could not be told from a disabled one. See [domain.md](domain.md) and [architecture.md](architecture.md).
 
 **Windows carry their render hint.** `WindowView` pairs each `QuotaWindow` with the `RenderHint` its adapter produced, so warn/critical thresholds and the provider caveat (`"blocks entirely at cap"` vs. `"auto-downgrades, doesn't block"`) reach the client instead of being hardcoded there. Pairing them in one struct rather than parallel `Vec`s makes it impossible for the two to drift apart. See [providers.md](providers.md).
 

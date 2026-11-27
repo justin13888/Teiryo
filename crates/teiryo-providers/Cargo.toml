@@ -10,6 +10,8 @@ description = "Provider adapters (Claude, ...) for Teiryo"
 teiryo-core.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+# `flock` on the refresh lock, as teiryod already does for its instance lock.
+libc = "0.2"
 reqwest.workspace = true
 secrecy.workspace = true
 serde.workspace = true

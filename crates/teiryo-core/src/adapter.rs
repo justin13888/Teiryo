@@ -62,8 +62,35 @@ pub trait Authenticator: Send + Sync {
     /// how the daemon notices the user has logged in again. An implementation
     /// that cannot meet this — one that would prompt, spend a network
     /// round-trip, or rotate anything — must fail fast instead, because the
-    /// cost is paid repeatedly and unattended.
+    /// cost is paid repeatedly and unattended. Renewing an expired credential
+    /// is [`Self::refresh_credential`]'s job, not this method's: answer
+    /// [`AuthError::Expired`] and the daemon calls it.
     async fn credential_for(&self, account: &Account) -> Result<Credential, AuthError>;
+
+    /// Mint a fresh credential for `account`, for when the stored one cannot
+    /// be used: [`Self::credential_for`] answered [`AuthError::Expired`]
+    /// (`rejected` is `None`), or the provider refused the credential it
+    /// returned (`rejected` is that credential).
+    ///
+    /// Unlike `credential_for` this may spend a network round-trip and rotate
+    /// tokens, so the daemon decides when to call it — only on one of those
+    /// two events, and on a backed-off cadence while it keeps failing. An
+    /// implementation must still never prompt. It should hand back a stored
+    /// credential that has meanwhile become usable, rather than rotating again,
+    /// whenever that credential is not `rejected`.
+    ///
+    /// The default cannot refresh, and says so as
+    /// [`AuthError::RefreshUnsupported`]: the daemon then reports the error
+    /// that prompted the refresh, with the adapter's own remedy in it, and
+    /// keeps the account paused and re-checked as it always has.
+    async fn refresh_credential(
+        &self,
+        account: &Account,
+        rejected: Option<&Credential>,
+    ) -> Result<Credential, AuthError> {
+        let _ = (account, rejected);
+        Err(AuthError::RefreshUnsupported)
+    }
 }
 
 /// Performs one usage probe against the provider.
@@ -153,5 +180,31 @@ mod tests {
         let debug = format!("{cred:?}");
         assert!(!debug.contains("super-secret"));
         assert!(debug.contains("REDACTED"));
+    }
+
+    struct CannotRefresh;
+
+    #[async_trait]
+    impl Authenticator for CannotRefresh {
+        async fn discover_accounts(&self) -> Result<Vec<Account>, AuthError> {
+            Ok(Vec::new())
+        }
+        async fn credential_for(&self, _: &Account) -> Result<Credential, AuthError> {
+            Err(AuthError::Expired("old".into()))
+        }
+    }
+
+    /// An adapter that never opted in keeps the pause it always had: the
+    /// default refresh says it cannot, which the daemon treats as "still
+    /// unusable", never as a credential.
+    #[tokio::test]
+    async fn the_default_refresh_says_it_cannot_refresh() {
+        let account = Account {
+            id: crate::domain::AccountId::from("x:default"),
+            provider: "x".into(),
+            label: "default".into(),
+        };
+        let result = CannotRefresh.refresh_credential(&account, None).await;
+        assert!(matches!(result, Err(AuthError::RefreshUnsupported)));
     }
 }

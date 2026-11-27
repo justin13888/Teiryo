@@ -8,13 +8,14 @@
 
 mod credentials;
 mod parser;
+mod refresh;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use teiryo_core::{
     Account, AccountId, AuthError, BarStyle, Credential, ParseError, ProbeError, Prober,
     ProviderAdapter, ProviderId, QuotaParser, QuotaWindow, RawResponse, RenderHint, WindowId,
@@ -23,6 +24,7 @@ use teiryo_core::{
 use tokio::sync::Mutex;
 
 pub use parser::ASSUMED_SCHEMA;
+pub use refresh::DEFAULT_TOKEN_URL;
 
 /// Stable provider id.
 pub const PROVIDER_ID: &str = "claude";
@@ -45,8 +47,16 @@ pub const ENV_CREDENTIALS_PATH: &str = "TEIRYO_CLAUDE_CREDENTIALS";
 /// Env var overriding the API base URL (mainly for tests/config).
 pub const ENV_BASE_URL: &str = "TEIRYO_CLAUDE_BASE_URL";
 
+/// Env var overriding the OAuth token endpoint (mainly for tests).
+pub const ENV_TOKEN_URL: &str = "TEIRYO_CLAUDE_TOKEN_URL";
+
+/// How long a refresh waits for another teiryod process to finish its own
+/// refresh of the same credentials file before giving up for this attempt.
+const REFRESH_LOCK_WAIT: Duration = Duration::from_secs(10);
+
 /// Claude subscription adapter: discovers the local Claude Code login,
-/// probes the OAuth usage endpoint, and parses headroom percentages.
+/// renews it when its access token has expired, probes the OAuth usage
+/// endpoint, and parses headroom percentages.
 pub struct ClaudeAdapter {
     credentials_path: PathBuf,
     /// Read the macOS Keychain when `credentials_path` does not exist. Only
@@ -54,9 +64,41 @@ pub struct ClaudeAdapter {
     /// meant, and silently reading a different store would hide a typo.
     keychain_fallback: bool,
     base_url: String,
+    /// Where expired tokens are renewed.
+    token_url: String,
+    /// Serializes refreshes inside this process: two accounts, or a manual
+    /// poll racing a scheduled one, must not both spend the same refresh
+    /// token. Across processes the lock file does the same job.
+    refresh_lock: Mutex<RefreshState>,
     /// One persistent HTTP client per account — separate accounts must not
     /// share a connection pool; reuse across probes keeps connection fidelity.
     clients: Mutex<HashMap<AccountId, reqwest::Client>>,
+}
+
+/// What the adapter remembers between refreshes.
+#[derive(Default)]
+struct RefreshState {
+    /// The refresh token the OAuth server last refused. Asking again with it
+    /// can never succeed, so it is not sent again; a new login replaces the
+    /// token in the file and lifts this by no longer matching it.
+    rejected: Option<SecretString>,
+    /// The client token-endpoint requests go through, built on first use.
+    client: Option<reqwest::Client>,
+    /// The access token teiryo itself was last issued. A provider that
+    /// refuses even that one is not answered by rotating again — that would
+    /// spend a refresh token, and rewrite Claude Code's file, on every poll.
+    issued: Option<SecretString>,
+    /// A renewal the server granted but that could not be written back. The
+    /// refresh token it spent is dead, so this pair is the login now: it is
+    /// polled with, and written back as soon as the file can be written.
+    unsaved: Option<Unsaved>,
+}
+
+/// A granted renewal not yet written into the credentials file.
+struct Unsaved {
+    renewed: credentials::Renewed,
+    /// The refresh token the renewal spent, which the file still holds.
+    spent: SecretString,
 }
 
 /// Where an adapter reads credentials from on a given call.
@@ -90,9 +132,11 @@ impl ClaudeAdapter {
         let keychain_fallback = keychain_fallback_for(overridden.as_deref());
         let credentials_path = overridden.unwrap_or_else(credentials::default_path);
         let base_url = std::env::var(ENV_BASE_URL).unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
+        let token_url =
+            std::env::var(ENV_TOKEN_URL).unwrap_or_else(|_| DEFAULT_TOKEN_URL.to_owned());
         Self {
             keychain_fallback,
-            ..Self::with_config(credentials_path, base_url)
+            ..Self::with_config(credentials_path, base_url).with_token_url(token_url)
         }
     }
 
@@ -103,8 +147,17 @@ impl ClaudeAdapter {
             credentials_path,
             keychain_fallback: false,
             base_url,
+            token_url: DEFAULT_TOKEN_URL.to_owned(),
+            refresh_lock: Mutex::new(RefreshState::default()),
             clients: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The same adapter, renewing expired tokens at `token_url` instead.
+    #[must_use]
+    pub fn with_token_url(mut self, token_url: String) -> Self {
+        self.token_url = token_url;
+        self
     }
 
     /// Load the current credentials from wherever this adapter reads them.
@@ -161,6 +214,205 @@ impl teiryo_core::Authenticator for ClaudeAdapter {
             ));
         }
         Ok(Credential::OAuthToken(creds.access_token))
+    }
+
+    async fn refresh_credential(
+        &self,
+        _account: &Account,
+        rejected: Option<&Credential>,
+    ) -> Result<Credential, AuthError> {
+        // The Keychain is read, never written, so a Keychain login cannot be
+        // renewed: the error that asked for a renewal stands, with its remedy.
+        if self.credential_source() == CredentialSource::Keychain {
+            return Err(AuthError::RefreshUnsupported);
+        }
+        let rejected = match rejected {
+            Some(Credential::OAuthToken(token)) => Some(token),
+            _ => None,
+        };
+        let mut state = self.refresh_lock.lock().await;
+        let _flock = FileLock::acquire(&lock_path(&self.credentials_path)).await?;
+
+        // Read under the lock: Claude Code, or another teiryod, may have
+        // renewed the login since the caller's read. Using that is free;
+        // rotating again would be a second spend of a token for nothing.
+        if let Some(cred) = self.flush_unsaved(&mut state)? {
+            return Ok(cred);
+        }
+        let current = credentials::load(&self.credentials_path)?;
+        let was_rejected =
+            rejected.is_some_and(|r| r.expose_secret() == current.access_token.expose_secret());
+        if !current.is_expired() && !was_rejected {
+            return Ok(Credential::OAuthToken(current.access_token));
+        }
+        if let (Some(refused), Some(issued)) = (rejected, &state.issued) {
+            if refused.expose_secret() == issued.expose_secret() {
+                return Err(AuthError::Expired(
+                    "the provider refused the access token teiryo last renewed, so renewing \
+                     again would not help; run `claude` to log in again"
+                        .into(),
+                ));
+            }
+        }
+        let Some(refresh_token) = current.refresh_token else {
+            return Err(AuthError::Expired(
+                "Claude Code access token is past its expiry and the credentials file holds \
+                 no refresh token; run `claude` to log in again"
+                    .into(),
+            ));
+        };
+        if state
+            .rejected
+            .as_ref()
+            .is_some_and(|r| r.expose_secret() == refresh_token.expose_secret())
+        {
+            return Err(AuthError::Expired(
+                "the Claude login could not be renewed earlier and has not changed since; \
+                 run `claude` to log in again"
+                    .into(),
+            ));
+        }
+        let client = match &state.client {
+            Some(client) => client.clone(),
+            None => {
+                let client = reqwest::Client::builder()
+                    .user_agent(USER_AGENT)
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .map_err(|e| AuthError::Store(format!("building http client: {e}")))?;
+                state.client = Some(client.clone());
+                client
+            }
+        };
+        let renewed = match refresh::exchange(&client, &self.token_url, &refresh_token).await {
+            Ok(renewed) => renewed,
+            Err(refresh::Failure::Rejected(message)) => {
+                state.rejected = Some(refresh_token);
+                return Err(AuthError::Expired(message));
+            }
+            Err(refresh::Failure::Transient(message)) => return Err(AuthError::Store(message)),
+        };
+        state.issued = Some(renewed.access_token.clone());
+        let access = renewed.access_token.clone();
+        match credentials::store_renewed(&self.credentials_path, &renewed, &refresh_token) {
+            Ok(credentials::Stored::Written) => tracing::info!(
+                path = %self.credentials_path.display(),
+                expires_in_secs = (renewed.expires_at_ms - chrono::Utc::now().timestamp_millis()) / 1000,
+                "renewed the Claude access token and wrote it back"
+            ),
+            // The token we hold is valid either way; only the file's pair is
+            // Claude Code's to keep.
+            Ok(credentials::Stored::Superseded) => tracing::warn!(
+                path = %self.credentials_path.display(),
+                "the Claude login was renewed elsewhere while teiryo renewed it; kept the file's"
+            ),
+            // The server already spent the old refresh token: dropping this
+            // pair would leave nobody holding a working login. Keep it, poll
+            // with it, and write it back on the next renewal attempt.
+            Err(e) => {
+                tracing::error!(
+                    path = %self.credentials_path.display(),
+                    error = %e,
+                    "renewed the Claude login but could not write it back; holding it until the file can be written"
+                );
+                state.unsaved = Some(Unsaved {
+                    renewed,
+                    spent: refresh_token,
+                });
+            }
+        }
+        Ok(Credential::OAuthToken(access))
+    }
+}
+
+impl ClaudeAdapter {
+    /// Retry writing back a renewal that could not be saved. `Some` is the
+    /// credential to use now: the held pair, still unsaved but valid. `None`
+    /// means nothing is held any more (written, or superseded by a newer
+    /// login in the file) and the caller reads the file as usual.
+    fn flush_unsaved(&self, state: &mut RefreshState) -> Result<Option<Credential>, AuthError> {
+        let Some(unsaved) = state.unsaved.take() else {
+            return Ok(None);
+        };
+        match credentials::store_renewed(&self.credentials_path, &unsaved.renewed, &unsaved.spent) {
+            Ok(credentials::Stored::Written) => {
+                tracing::info!(
+                    path = %self.credentials_path.display(),
+                    "wrote back the Claude login renewed earlier"
+                );
+                Ok(None)
+            }
+            Ok(credentials::Stored::Superseded) => Ok(None),
+            // The user logged out (file or section gone): the held login goes
+            // with it, rather than outliving the logout by hours.
+            Err(AuthError::NotLoggedIn(_)) => Ok(None),
+            Err(_) if !self.credentials_path.exists() => Ok(None),
+            Err(e) => {
+                let usable = chrono::Utc::now().timestamp_millis() < unsaved.renewed.expires_at_ms;
+                let access = unsaved.renewed.access_token.clone();
+                state.unsaved = Some(unsaved);
+                if usable {
+                    Ok(Some(Credential::OAuthToken(access)))
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+/// The lock file serializing refreshes of `credentials` across processes —
+/// a development daemon and the installed one may share one login.
+fn lock_path(credentials: &std::path::Path) -> PathBuf {
+    let mut name = credentials
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".teiryo.lock");
+    credentials.with_file_name(name)
+}
+
+/// An exclusive `flock`, released when dropped.
+struct FileLock {
+    _file: std::fs::File,
+}
+
+impl FileLock {
+    /// Take the lock at `path`, polling rather than blocking: the daemon runs
+    /// on one thread, and a blocking `flock` would stall every client.
+    async fn acquire(path: &std::path::Path) -> Result<Self, AuthError> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| AuthError::Store(format!("opening {}: {e}", path.display())))?;
+        let deadline = tokio::time::Instant::now() + REFRESH_LOCK_WAIT;
+        loop {
+            // SAFETY: `file` owns a valid descriptor for the whole call.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Self { _file: file });
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(AuthError::Store(format!(
+                    "locking {}: {err}",
+                    path.display()
+                )));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AuthError::Store(format!(
+                    "another teiryod has been renewing the Claude login for over {}s",
+                    REFRESH_LOCK_WAIT.as_secs()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 
@@ -356,6 +608,462 @@ mod tests {
         assert_eq!(
             ids,
             ["session_5h", "weekly", "weekly_opus", "weekly_sonnet"]
+        );
+    }
+}
+
+/// Token refresh, end to end against a stand-in token endpoint: what is sent,
+/// what is written back, and when nothing is sent at all.
+#[cfg(test)]
+mod refresh_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use teiryo_core::Authenticator;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    /// An access token that expired long ago, a refresh token, and fields
+    /// teiryo does not know about, inside the section and beside it.
+    const EXPIRED: &str = r#"{"claudeAiOauth":{"accessToken":"old-access","refreshToken":"old-refresh","expiresAt":1,"scopes":["user:inference"],"subscriptionType":"max","refreshTokenExpiresAt":4102444800000},"other":{"keep":true}}"#;
+
+    const RENEWED: &str =
+        r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":28800}"#;
+
+    fn account() -> Account {
+        Account {
+            id: AccountId::from("claude:default"),
+            provider: PROVIDER_ID.into(),
+            label: "default".into(),
+        }
+    }
+
+    fn token(cred: &Credential) -> &str {
+        match cred {
+            Credential::OAuthToken(t) => t.expose_secret(),
+            other => panic!("expected an OAuth token, got {other:?}"),
+        }
+    }
+
+    fn expect_err(result: Result<Credential, AuthError>) -> AuthError {
+        match result {
+            Ok(cred) => panic!("expected an error, got {cred:?}"),
+            Err(e) => e,
+        }
+    }
+
+    /// A one-route HTTP server answering every request with `status` and
+    /// `body`, after running `before_reply` (which may tamper with the file).
+    /// Returns the URL, a request counter, and the last request body seen.
+    async fn endpoint(
+        status: u16,
+        body: &'static str,
+        before_reply: impl Fn() + Send + Sync + 'static,
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/oauth/token", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let (h, s) = (hits.clone(), seen.clone());
+        let before_reply = Arc::new(before_reply);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                h.fetch_add(1, Ordering::SeqCst);
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Read the head, then exactly Content-Length more bytes.
+                let request = loop {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).into_owned();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break text[end + 4..end + 4 + len].to_owned();
+                        }
+                    }
+                    if n == 0 {
+                        break String::new();
+                    }
+                };
+                *s.lock().unwrap() = request;
+                before_reply();
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(reply.as_bytes()).await.unwrap();
+                let _ = sock.shutdown().await;
+            }
+        });
+        (url, hits, seen)
+    }
+
+    fn adapter_for(path: &std::path::Path, token_url: String) -> ClaudeAdapter {
+        ClaudeAdapter::with_config(path.to_path_buf(), String::new()).with_token_url(token_url)
+    }
+
+    fn written(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_is_renewed_and_written_back_with_every_other_field_kept() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(&path, EXPIRED).unwrap();
+        let inode_before = std::fs::metadata(&path).unwrap().ino();
+        let (url, hits, seen) = endpoint(200, RENEWED, || {}).await;
+        let adapter = adapter_for(&path, url);
+
+        let cred = adapter.refresh_credential(&account(), None).await.unwrap();
+
+        assert_eq!(token(&cred), "new-access");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let sent: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()).unwrap();
+        assert_eq!(sent["grant_type"], "refresh_token");
+        assert_eq!(sent["refresh_token"], "old-refresh");
+        assert_eq!(sent["client_id"], refresh::CLIENT_ID);
+
+        let doc = written(&path);
+        let oauth = &doc["claudeAiOauth"];
+        assert_eq!(oauth["accessToken"], "new-access");
+        assert_eq!(oauth["refreshToken"], "new-refresh");
+        let expires = oauth["expiresAt"].as_i64().unwrap();
+        let in_secs = (expires - chrono::Utc::now().timestamp_millis()) / 1000;
+        assert!(
+            (28_700..=28_800).contains(&in_secs),
+            "expires in {in_secs}s"
+        );
+        assert_eq!(oauth["scopes"], serde_json::json!(["user:inference"]));
+        assert_eq!(oauth["subscriptionType"], "max");
+        assert_eq!(oauth["refreshTokenExpiresAt"], 4_102_444_800_000_i64);
+        assert_eq!(doc["other"]["keep"], true);
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_ne!(
+            meta.ino(),
+            inode_before,
+            "replaced by rename, not rewritten in place"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+
+        // And the cheap path now resolves it without the network.
+        let cred = adapter.credential_for(&account()).await.unwrap();
+        assert_eq!(token(&cred), "new-access");
+    }
+
+    /// A server that does not rotate the refresh token keeps the old one.
+    #[tokio::test]
+    async fn a_reply_without_a_refresh_token_keeps_the_old_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(&path, EXPIRED).unwrap();
+        let (url, _, _) = endpoint(
+            200,
+            r#"{"access_token":"new-access","expires_in":60}"#,
+            || {},
+        )
+        .await;
+        adapter_for(&path, url)
+            .refresh_credential(&account(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            written(&path)["claudeAiOauth"]["refreshToken"],
+            "old-refresh"
+        );
+    }
+
+    /// A login that became usable since the caller looked — Claude Code ran —
+    /// is handed back as is: refreshing it would spend a token for nothing.
+    #[tokio::test]
+    async fn a_usable_stored_token_is_returned_without_a_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"fresh","refreshToken":"r","expiresAt":99999999999999}}"#,
+        )
+        .unwrap();
+        let (url, hits, _) = endpoint(200, RENEWED, || {}).await;
+        let cred = adapter_for(&path, url)
+            .refresh_credential(&account(), None)
+            .await
+            .unwrap();
+        assert_eq!(token(&cred), "fresh");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// Falsifier for the test above: an unexpired token the provider just
+    /// refused is not handed back again; it is renewed.
+    #[tokio::test]
+    async fn a_token_the_provider_rejected_is_renewed_even_before_its_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"refused","refreshToken":"old-refresh","expiresAt":99999999999999}}"#,
+        )
+        .unwrap();
+        let (url, hits, _) = endpoint(200, RENEWED, || {}).await;
+        let refused = Credential::OAuthToken(SecretString::from("refused"));
+        let cred = adapter_for(&path, url)
+            .refresh_credential(&account(), Some(&refused))
+            .await
+            .unwrap();
+        assert_eq!(token(&cred), "new-access");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A refused refresh token is asked about once: every later attempt with
+    /// the same token fails without a request, until the login changes.
+    #[tokio::test]
+    async fn a_rejected_refresh_token_is_not_sent_again_until_the_login_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(&path, EXPIRED).unwrap();
+        let (url, hits, _) = endpoint(400, r#"{"error":"invalid_grant"}"#, || {}).await;
+        let adapter = adapter_for(&path, url);
+
+        let first = expect_err(adapter.refresh_credential(&account(), None).await);
+        let AuthError::Expired(message) = first else {
+            panic!("a refused refresh token is an expired login, got {first:?}");
+        };
+        assert!(message.contains("invalid_grant"), "{message}");
+        assert!(message.contains("run `claude`"), "{message}");
+        let again = expect_err(adapter.refresh_credential(&account(), None).await);
+        assert!(matches!(again, AuthError::Expired(_)), "got {again:?}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the dead token was sent again"
+        );
+        assert_eq!(written(&path)["claudeAiOauth"]["accessToken"], "old-access");
+
+        // A re-login writes a different refresh token, which is tried.
+        std::fs::write(&path, EXPIRED.replace("old-refresh", "relogin-refresh")).unwrap();
+        let _ = adapter.refresh_credential(&account(), None).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// An outage is not a verdict on the token: a store error, retried later.
+    #[tokio::test]
+    async fn a_server_error_is_transient_and_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(&path, EXPIRED).unwrap();
+        let (url, hits, _) = endpoint(503, "{}", || {}).await;
+        let adapter = adapter_for(&path, url);
+        let err = expect_err(adapter.refresh_credential(&account(), None).await);
+        assert!(matches!(err, AuthError::Store(_)), "got {err:?}");
+        let _ = adapter.refresh_credential(&account(), None).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a transient failure is retried"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EXPIRED);
+    }
+
+    /// Claude Code renewing the login while teiryo's own renewal is in flight
+    /// wins: its pair stays in the file, and teiryo still polls with the token
+    /// it was issued.
+    #[tokio::test]
+    async fn a_login_renewed_elsewhere_meanwhile_is_left_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(&path, EXPIRED).unwrap();
+        let theirs = EXPIRED
+            .replace("old-refresh", "claude-code-refresh")
+            .replace("old-access", "claude-code-access");
+        let (p, t) = (path.clone(), theirs.clone());
+        let (url, _, _) = endpoint(200, RENEWED, move || std::fs::write(&p, &t).unwrap()).await;
+        let cred = adapter_for(&path, url)
+            .refresh_credential(&account(), None)
+            .await
+            .unwrap();
+        assert_eq!(token(&cred), "new-access");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
+    }
+
+    #[tokio::test]
+    async fn a_file_without_a_refresh_token_is_expired_without_a_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"a","expiresAt":1}}"#,
+        )
+        .unwrap();
+        let (url, hits, _) = endpoint(200, RENEWED, || {}).await;
+        let err = expect_err(
+            adapter_for(&path, url)
+                .refresh_credential(&account(), None)
+                .await,
+        );
+        assert!(matches!(err, AuthError::Expired(_)), "got {err:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// The Keychain is read, never written: a Keychain login is not renewed.
+    #[tokio::test]
+    async fn a_keychain_login_is_not_renewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, hits, _) = endpoint(200, RENEWED, || {}).await;
+        let adapter = ClaudeAdapter {
+            keychain_fallback: true,
+            ..adapter_for(&dir.path().join("missing.json"), url)
+        };
+        let err = expect_err(adapter.refresh_credential(&account(), None).await);
+        assert!(matches!(err, AuthError::RefreshUnsupported), "got {err:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// A provider that refuses even the token teiryo was just issued is not
+    /// answered with another rotation: that would rewrite Claude Code's file
+    /// and spend a refresh token on every poll, forever.
+    #[tokio::test]
+    async fn a_refused_freshly_issued_token_is_not_rotated_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(&path, EXPIRED).unwrap();
+        let (url, hits, _) = endpoint(200, RENEWED, || {}).await;
+        let adapter = adapter_for(&path, url);
+        let issued = adapter.refresh_credential(&account(), None).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let err = expect_err(adapter.refresh_credential(&account(), Some(&issued)).await);
+        assert!(matches!(err, AuthError::Expired(_)), "got {err:?}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "rotated again for a refusal"
+        );
+        assert_eq!(
+            written(&path)["claudeAiOauth"]["refreshToken"],
+            "new-refresh"
+        );
+    }
+
+    /// Once the server has granted a renewal the old refresh token is dead,
+    /// so a write-back that fails must not lose the new pair: it is used, and
+    /// written as soon as the file can be — without a second exchange.
+    #[tokio::test]
+    async fn a_renewal_that_cannot_be_written_is_held_and_written_later() {
+        use std::os::unix::fs::PermissionsExt;
+        // A read-only directory is what makes the write fail, and root
+        // writes through it.
+        // SAFETY: `geteuid` has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: running as root, a read-only directory does not stop the write");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(&path, EXPIRED).unwrap();
+        let (url, hits, _) = endpoint(200, RENEWED, || {}).await;
+        let adapter = adapter_for(&path, url);
+
+        // The lock file must exist first, or the read-only directory would
+        // refuse it before the write-back is ever reached.
+        std::fs::write(lock_path(&path), "").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let cred = adapter.refresh_credential(&account(), None).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cred = cred.unwrap_or_else(|e| panic!("the granted pair was dropped: {e}"));
+        assert_eq!(token(&cred), "new-access");
+        assert_eq!(written(&path)["claudeAiOauth"]["accessToken"], "old-access");
+
+        let cred = adapter.refresh_credential(&account(), None).await.unwrap();
+        assert_eq!(token(&cred), "new-access");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the dead refresh token was sent"
+        );
+        let doc = written(&path);
+        assert_eq!(doc["claudeAiOauth"]["accessToken"], "new-access");
+        assert_eq!(doc["claudeAiOauth"]["refreshToken"], "new-refresh");
+    }
+
+    /// A held renewal does not outlive a logout: with the file gone, the
+    /// adapter reports no login instead of polling on with the held token.
+    #[tokio::test]
+    async fn a_held_renewal_is_dropped_when_the_user_logs_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        let adapter = adapter_for(&path, String::new());
+        adapter.refresh_lock.lock().await.unsaved = Some(Unsaved {
+            renewed: credentials::Renewed {
+                access_token: SecretString::from("held"),
+                refresh_token: None,
+                expires_at_ms: i64::MAX,
+            },
+            spent: SecretString::from("old-refresh"),
+        });
+        let err = expect_err(adapter.refresh_credential(&account(), None).await);
+        assert!(matches!(err, AuthError::NotLoggedIn(_)), "got {err:?}");
+        assert!(adapter.refresh_lock.lock().await.unsaved.is_none());
+    }
+
+    /// The falsifier for the bare-403 case: a 403 the authorization server
+    /// itself sends, with an OAuth error code, is still a dead token.
+    #[tokio::test]
+    async fn a_403_with_an_oauth_error_is_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(&path, EXPIRED).unwrap();
+        let (url, hits, _) = endpoint(403, r#"{"error":"invalid_grant"}"#, || {}).await;
+        let adapter = adapter_for(&path, url);
+        let err = expect_err(adapter.refresh_credential(&account(), None).await);
+        assert!(matches!(err, AuthError::Expired(_)), "got {err:?}");
+        let _ = adapter.refresh_credential(&account(), None).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A 403 with no OAuth error body is a proxy or firewall, not a verdict
+    /// on the token: retried later, never remembered as dead.
+    #[tokio::test]
+    async fn a_bare_403_is_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(&path, EXPIRED).unwrap();
+        let (url, hits, _) = endpoint(403, "<html>blocked</html>", || {}).await;
+        let adapter = adapter_for(&path, url);
+        let err = expect_err(adapter.refresh_credential(&account(), None).await);
+        assert!(matches!(err, AuthError::Store(_)), "got {err:?}");
+        let _ = adapter.refresh_credential(&account(), None).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a bare 403 marked the token dead"
+        );
+    }
+
+    #[test]
+    fn the_lock_file_sits_beside_the_credentials_it_guards() {
+        assert_eq!(
+            lock_path(std::path::Path::new("/h/.claude/.credentials.json")),
+            PathBuf::from("/h/.claude/.credentials.json.teiryo.lock")
         );
     }
 }

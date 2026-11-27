@@ -10,9 +10,9 @@ use secrecy::SecretString;
 use teiryo_core::{
     client_handshake, decode_frame, encode_frame, framed, Account, AccountId, AuthError,
     Authenticator, BarStyle, ConfigEdit, ConfigState, Credential, ErrorKind, ParseError, PollId,
-    PollOutcome, PollTrigger, ProbeError, Prober, ProviderAdapter, QuotaParser, QuotaUnit,
-    QuotaWindow, RawResponse, RenderHint, Request, ResetKind, Response, Storage, WindowId,
-    WindowPresenter, WindowScope, PROTOCOL_MAGIC, PROTOCOL_VERSION,
+    PollOutcome, PollSchedule, PollTrigger, ProbeError, Prober, ProviderAdapter, QuotaParser,
+    QuotaUnit, QuotaWindow, RawResponse, RenderHint, Request, ResetKind, Response, Storage,
+    WindowId, WindowPresenter, WindowScope, PROTOCOL_MAGIC, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -232,9 +232,14 @@ fn full_ipc_roundtrip() {
                 assert_eq!(statuses[0].windows[0].hint.critical_threshold, 0.95);
                 assert_eq!(statuses[0].last_poll.as_ref().unwrap().id, startup.id);
                 // The successful poll backing those windows is timestamped
-                // separately from `last_poll`, and the cadence is exposed.
+                // separately from `last_poll`, and the schedule is exposed.
                 assert_eq!(statuses[0].last_success, Some(startup.ts));
-                assert_eq!(statuses[0].poll_interval_secs, 3600);
+                assert_eq!(statuses[0].configured_interval_secs, 3600);
+                assert_eq!(polling_secs(&statuses[0].schedule), Some(3600));
+                let next = statuses[0].schedule.next_poll_at().expect("a deadline");
+                let in_secs = (next - chrono::Utc::now()).num_seconds();
+                // 3600 s jittered ±10%.
+                assert!((3200..=3960).contains(&in_secs), "next poll in {in_secs}s");
             }
             other => panic!("expected Status, got {other:?}"),
         }
@@ -359,7 +364,7 @@ fn full_ipc_roundtrip() {
                 assert_eq!(account.account, stub_account().id);
                 assert_eq!(account.consecutive_failures, 0);
                 assert_eq!(account.last_error, None);
-                assert_eq!(account.poll_interval_secs, 3600);
+                assert_eq!(polling_secs(&account.schedule), Some(3600));
                 assert!(account.last_poll_ts.is_some());
             }
             other => panic!("expected Providers, got {other:?}"),
@@ -453,7 +458,10 @@ fn settings_round_trip_and_hot_reload() {
         )
         .await;
         match recv_response(&mut source).await {
-            Response::Status(statuses) => assert_eq!(statuses[0].poll_interval_secs, 30),
+            Response::Status(statuses) => {
+                assert_eq!(statuses[0].configured_interval_secs, 30);
+                assert_eq!(polling_secs(&statuses[0].schedule), Some(30));
+            }
             other => panic!("expected Status, got {other:?}"),
         }
 
@@ -496,7 +504,9 @@ fn settings_round_trip_and_hot_reload() {
         )
         .await;
         match recv_response(&mut source).await {
-            Response::Status(statuses) => assert_eq!(statuses[0].poll_interval_secs, 0),
+            Response::Status(statuses) => {
+                assert_eq!(statuses[0].schedule, PollSchedule::Disabled);
+            }
             other => panic!("expected Status, got {other:?}"),
         }
         send_request(
@@ -989,6 +999,14 @@ fn an_early_rollover_reaches_the_client_with_its_history() {
     });
 }
 
+/// The cadence of a polling schedule; `None` for any other state.
+fn polling_secs(schedule: &PollSchedule) -> Option<u32> {
+    match schedule {
+        PollSchedule::Polling { interval_secs, .. } => Some(*interval_secs),
+        _ => None,
+    }
+}
+
 /// An adapter whose local credential cannot be resolved — the shape of a
 /// Claude Code access token that expired while nobody was using it. The probe
 /// counts its calls so the test can assert it was never reached.
@@ -1051,16 +1069,16 @@ impl ProviderAdapter for StaleCredentialAdapter {
 ///
 /// The whole daemon path rather than the scheduler's arithmetic alone: the
 /// failure reaches the client as an `AuthError` still carrying the adapter's
-/// own remedy, and the cadence published beside it is `0`. That `0` is what
-/// this pins — the account previously advertised a live cadence and kept
-/// polling on it for as long as the token stayed expired, so a client counted
-/// down to polls that could not succeed.
+/// own remedy, and the schedule published beside it is `Paused` with that
+/// same reason. That is what this pins — the account once advertised a live
+/// cadence and kept polling on it for as long as the token stayed expired, and
+/// later reported a bare `0` a client could not tell from a disabled provider.
 ///
 /// The probe counter is a standing guard, not a regression test: resolving the
 /// credential has always gated the probe, and no rearrangement of this path may
 /// quietly put a request on the wire ahead of it.
 #[test]
-fn an_unusable_credential_is_reported_with_no_countdown_to_offer() {
+fn an_unusable_credential_is_reported_as_a_pause_with_its_reason() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1124,10 +1142,18 @@ fn an_unusable_credential_is_reported_with_no_countdown_to_offer() {
         match recv_response(&mut source).await {
             Response::Status(statuses) => {
                 let status = &statuses[0];
-                assert_eq!(
-                    status.poll_interval_secs, 0,
-                    "a paused account promised a countdown it cannot keep"
+                let PollSchedule::Paused {
+                    reason,
+                    next_recheck_at,
+                } = &status.schedule
+                else {
+                    panic!("a paused account did not say so: {:?}", status.schedule);
+                };
+                assert!(
+                    reason.contains("past its expiry"),
+                    "the pause lost the adapter's remedy: {reason}"
                 );
+                assert!(next_recheck_at.is_some(), "no re-check scheduled");
                 assert!(
                     matches!(
                         status.last_poll.as_ref().map(|e| &e.outcome),
@@ -1396,7 +1422,7 @@ fn a_login_after_startup_is_discovered_and_polled() {
                 assert_eq!(statuses.len(), 1);
                 assert_eq!(statuses[0].account, stub_account());
                 assert_eq!(statuses[0].windows.len(), 1);
-                assert_eq!(statuses[0].poll_interval_secs, 10);
+                assert_eq!(polling_secs(&statuses[0].schedule), Some(10));
             }
             other => panic!("expected Status, got {other:?}"),
         }

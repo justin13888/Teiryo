@@ -183,7 +183,11 @@ mod tests {
             ],
             last_poll: Some(event(true)),
             last_success: Some(Utc::now() - Duration::minutes(9)),
-            poll_interval_secs: 60,
+            configured_interval_secs: 60,
+            schedule: teiryo_core::PollSchedule::Polling {
+                interval_secs: 60,
+                next_poll_at: None,
+            },
         }]);
         app.activity = vec![event(false), event(true)];
         app.health = vec![ProviderHealth {
@@ -193,7 +197,10 @@ mod tests {
                 consecutive_failures: 2,
                 last_error: Some("token expired — run `claude` to refresh".into()),
                 last_poll_ts: Some(Utc::now()),
-                poll_interval_secs: 60,
+                schedule: teiryo_core::PollSchedule::Polling {
+                    interval_secs: 60,
+                    next_poll_at: None,
+                },
             }],
             consecutive_failures: 2,
             last_error: Some("token expired".into()),
@@ -337,6 +344,48 @@ mod tests {
             .count()
     }
 
+    /// The header's countdown is the daemon's deadline, not a guess from the
+    /// last poll: a last poll long past plus the cadence would put it in the
+    /// past and drop it, where the real deadline is still minutes out.
+    #[test]
+    fn the_next_poll_countdown_is_the_daemons_deadline() {
+        let mut app = populated();
+        app.statuses[0].schedule = teiryo_core::PollSchedule::Polling {
+            interval_secs: 60,
+            next_poll_at: Some(Utc::now() + Duration::minutes(7) + Duration::seconds(30)),
+        };
+        let frame = rendered(&mut app, 120, 30);
+        assert!(frame.contains("next ~7m"), "{frame}");
+    }
+
+    /// A paused account says it is paused and recovering by itself, offers no
+    /// countdown to a poll that is not coming, and reads differently from a
+    /// disabled one — the two used to render identically.
+    #[test]
+    fn paused_and_disabled_accounts_say_which_they_are() {
+        let mut app = populated();
+        app.statuses[0].schedule = teiryo_core::PollSchedule::Paused {
+            reason: "token endpoint returned 503".into(),
+            next_recheck_at: Some(Utc::now() + Duration::seconds(95)),
+        };
+        let frame = rendered(&mut app, 120, 30);
+        assert!(
+            frame.contains("claude/default  paused, retrying in 1m"),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("next ~"),
+            "a pause offered a countdown:\n{frame}"
+        );
+        assert!(!frame.contains("disabled"), "{frame}");
+
+        app.statuses[0].schedule = teiryo_core::PollSchedule::Disabled;
+        let frame = rendered(&mut app, 120, 30);
+        assert!(frame.contains("claude/default  disabled"), "{frame}");
+        assert!(!frame.contains("paused"), "{frame}");
+        assert!(!frame.contains("next ~"), "{frame}");
+    }
+
     /// A trend pane wide enough that the four rules land in distinct columns.
     const TREND_FRAME: (u16, u16) = (100, 40);
 
@@ -443,7 +492,11 @@ mod tests {
             windows: Vec::new(),
             last_poll: Some(event(true)),
             last_success: None,
-            poll_interval_secs: 60,
+            configured_interval_secs: 60,
+            schedule: teiryo_core::PollSchedule::Polling {
+                interval_secs: 60,
+                next_poll_at: None,
+            },
         }]);
         assert!(rendered(&mut app, 100, 40).contains("no quota data yet"));
 

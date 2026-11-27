@@ -50,9 +50,22 @@ impl From<&str> for WindowId {
 pub struct PollId(pub Ulid);
 
 impl PollId {
-    /// Generate a fresh, time-ordered id.
+    /// Generate a fresh id, strictly greater than every id this process
+    /// generated before it.
+    ///
+    /// A plain `Ulid::new()` is ordered only across milliseconds: two made
+    /// inside one compare at random, and clients compare ids to tell a newer
+    /// poll from an older one. So ids come from one monotonic generator; if
+    /// it ever overflows a millisecond's random space, the id is taken fresh
+    /// instead, which is ordered by time again a millisecond later.
     pub fn generate() -> Self {
-        Self(Ulid::new())
+        static GENERATOR: std::sync::Mutex<ulid::Generator> =
+            std::sync::Mutex::new(ulid::Generator::new());
+        let next = GENERATOR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generate();
+        Self(next.unwrap_or_else(|_| Ulid::new()))
     }
 
     /// The zero id — sorts before every generated id. Useful as an
@@ -279,6 +292,14 @@ impl QuotaSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clients compare poll ids to tell a newer poll from an older one, so
+    /// ids made in the same millisecond must still come out in order.
+    #[test]
+    fn poll_ids_are_strictly_increasing_within_a_millisecond() {
+        let ids: Vec<PollId> = (0..1000).map(|_| PollId::generate()).collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
+    }
 
     fn snapshot(unit: QuotaUnit, used: f64, limit: Option<f64>) -> QuotaSnapshot {
         QuotaSnapshot {

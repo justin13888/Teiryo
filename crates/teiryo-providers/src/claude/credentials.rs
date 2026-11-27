@@ -1,4 +1,4 @@
-//! Claude Code local credential discovery.
+//! Claude Code local credential discovery, and writing a renewed login back.
 //!
 //! Claude Code keeps its OAuth tokens in one of two places, as the same
 //! `{"claudeAiOauth": {...}}` JSON either way:
@@ -30,6 +30,8 @@ pub(crate) struct ClaudeCredentials {
     pub access_token: SecretString,
     /// Access-token expiry, unix epoch milliseconds.
     pub expires_at_ms: i64,
+    /// OAuth refresh token, when the store holds one.
+    pub refresh_token: Option<SecretString>,
 }
 
 impl ClaudeCredentials {
@@ -53,6 +55,8 @@ struct OauthSection {
     access_token: Option<String>,
     #[serde(rename = "expiresAt", default)]
     expires_at: Option<i64>,
+    #[serde(rename = "refreshToken", default)]
+    refresh_token: Option<String>,
 }
 
 /// Default credentials path: `~/.claude/.credentials.json`.
@@ -94,7 +98,106 @@ fn parse(bytes: &[u8], origin: &str) -> Result<ClaudeCredentials, AuthError> {
         // Missing expiry: treat as already expired so the user is told to
         // refresh rather than us sending a stale token.
         expires_at_ms: oauth.expires_at.unwrap_or(0),
+        refresh_token: oauth
+            .refresh_token
+            .filter(|t| !t.is_empty())
+            .map(SecretString::from),
     })
+}
+
+/// A token pair the OAuth server just issued, ready to be written back.
+/// Secret material only inside [`SecretString`]; deliberately no `Debug`.
+pub(crate) struct Renewed {
+    /// The new access token.
+    pub access_token: SecretString,
+    /// The rotated refresh token; `None` when the server kept the old one.
+    pub refresh_token: Option<SecretString>,
+    /// When the new access token expires, unix epoch milliseconds.
+    pub expires_at_ms: i64,
+}
+
+/// What [`store_renewed`] did.
+pub(crate) enum Stored {
+    /// The file now holds the renewed pair.
+    Written,
+    /// The file's refresh token was no longer the one the renewal spent:
+    /// something else (Claude Code) rotated it meanwhile, and its pair was
+    /// left in place.
+    Superseded,
+}
+
+/// Write `renewed` into the credentials file at `path`, provided the file
+/// still holds `spent` — the refresh token the renewal used.
+///
+/// Only `claudeAiOauth.{accessToken, refreshToken, expiresAt}` change; every
+/// other field, inside the section or beside it, is written back as read,
+/// because the file is Claude Code's and teiryo knows only some of it. The
+/// write is atomic — a private temporary file in the same directory, synced,
+/// then renamed over the original — so Claude Code never reads half a file,
+/// and a crash leaves either the old login or the new one.
+pub(crate) fn store_renewed(
+    path: &Path,
+    renewed: &Renewed,
+    spent: &SecretString,
+) -> Result<Stored, AuthError> {
+    let origin = path.display().to_string();
+    let bytes =
+        std::fs::read(path).map_err(|e| AuthError::Store(format!("re-reading {origin}: {e}")))?;
+    let mut doc: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| AuthError::Store(format!("parsing {origin}: {e}")))?;
+    let oauth = doc
+        .get_mut("claudeAiOauth")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| AuthError::NotLoggedIn(format!("{origin} has no claudeAiOauth section")))?;
+    let current = oauth
+        .get("refreshToken")
+        .and_then(serde_json::Value::as_str);
+    if current != Some(spent.expose_secret()) {
+        return Ok(Stored::Superseded);
+    }
+    oauth.insert(
+        "accessToken".into(),
+        renewed.access_token.expose_secret().into(),
+    );
+    if let Some(refresh) = &renewed.refresh_token {
+        oauth.insert("refreshToken".into(), refresh.expose_secret().into());
+    }
+    oauth.insert("expiresAt".into(), renewed.expires_at_ms.into());
+    let out = serde_json::to_vec(&doc)
+        .map_err(|e| AuthError::Store(format!("serializing {origin}: {e}")))?;
+    write_atomically(path, &out).map_err(|e| AuthError::Store(format!("writing {origin}: {e}")))?;
+    Ok(Stored::Written)
+}
+
+/// Replace `path` with `contents`, readable by its owner alone, without a
+/// moment in which it is missing or partly written.
+fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().map_or_else(
+        || ".credentials.json".into(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let tmp = dir.join(format!(".{name}.teiryo-{}.tmp", std::process::id()));
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        // The rename is only durable once the directory entry is.
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// The generic-password service Claude Code stores its login under.

@@ -15,7 +15,7 @@ use crate::error::HandshakeError;
 /// Magic bytes opening every connection.
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"TEIR";
 /// Current wire protocol version (little-endian u16 on the wire).
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 /// Daemon reply: handshake accepted. Since v9 the daemon's build commit
 /// follows, then bincode frames may follow.
 pub const HELLO_ACCEPTED: u8 = 0x00;
@@ -247,7 +247,7 @@ mod tests {
     /// a revert nobody meant.
     #[test]
     fn the_hello_bytes_are_recorded_not_recomputed() {
-        assert_eq!(Hello::current().to_bytes(), [b'T', b'E', b'I', b'R', 9, 0]);
+        assert_eq!(Hello::current().to_bytes(), [b'T', b'E', b'I', b'R', 10, 0]);
     }
 
     /// The whole v9 opening and the accept reply, recorded the same way: the
@@ -256,7 +256,7 @@ mod tests {
     fn the_commit_bytes_are_recorded_not_recomputed() {
         assert_eq!(
             hello_message("abc"),
-            [b'T', b'E', b'I', b'R', 9, 0, 3, 0, b'a', b'b', b'c']
+            [b'T', b'E', b'I', b'R', 10, 0, 3, 0, b'a', b'b', b'c']
         );
         assert_eq!(encode_commit(""), [0, 0]);
     }
